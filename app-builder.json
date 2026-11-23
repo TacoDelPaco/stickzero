@@ -15,7 +15,7 @@
       "screenshots/04-controller.png"
     ],
     "icon": "assets/stickzero_100.png",
-    "license": "MIT",
+    "license": "GPL-3.0-or-later",
     "source_repo": "https://github.com/TacoDelPaco/stickzero",
     "author": {
       "github": "TacoDelPaco",
