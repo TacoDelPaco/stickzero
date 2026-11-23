@@ -330,6 +330,7 @@ pub struct Config {
     pub detail_high: bool,
     pub sky_detail: bool,
     pub analog_filter: bool,
+    pub sound_on: bool,
     pub fov_deg: u8,
     pub game_mode: GameMode,
     pub track_index: usize,
@@ -363,6 +364,7 @@ impl Default for Config {
             detail_high: true,
             sky_detail: true,
             analog_filter: true,
+            sound_on: true,
             fov_deg: 90,
             game_mode: GameMode::Freestyle,
             track_index: 0,
@@ -453,6 +455,7 @@ impl Config {
                 "detail_high" => cfg.detail_high = v != "0",
                 "sky_detail" => cfg.sky_detail = v != "0",
                 "analog_filter" => cfg.analog_filter = v != "0",
+                "sound_on" => cfg.sound_on = v != "0",
                 "fov_deg" => if let Ok(f) = v.parse::<u8>() { cfg.fov_deg = f.clamp(70, 115); },
                 "game_mode" => cfg.game_mode = if v == "race" { GameMode::Race } else { GameMode::Freestyle },
                 "track" => if let Ok(i) = v.parse::<usize>() { cfg.track_index = i.min(3); },
@@ -526,7 +529,7 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
             self.prop_wash as u8,
             self.rate_center,
             self.rate_max,
@@ -535,6 +538,7 @@ impl Config {
             self.detail_high as u8,
             self.sky_detail as u8,
             self.analog_filter as u8,
+            self.sound_on as u8,
             self.fov_deg,
             self.track_index,
             self.invert_pitch as u8,

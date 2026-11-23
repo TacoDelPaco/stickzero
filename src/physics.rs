@@ -37,6 +37,7 @@ pub struct QuadState {
     pub inverted: bool,
     pub hit_flash: f32,
     pub prop_wash_phase: f32,
+    pub prop_wash_level: f32,
 
     // Battery simulation
     pub cell_voltage: f32,
@@ -72,6 +73,7 @@ impl QuadState {
             inverted: false,
             hit_flash: 0.0,
             prop_wash_phase: 0.0,
+            prop_wash_level: 0.0,
             cell_voltage: 4.35, // 1S LiHV fresh charge (4.35V)
             mah_used: 0.0,
             battery_empty: false,
@@ -211,12 +213,13 @@ impl QuadState {
 
         // 4b. Realistic Stock Prop Wash (descending through own dirty air / dive pullout)
         let mut wash_thrust_loss = 1.0_f32;
+        self.prop_wash_level = 0.0;
         if cfg.prop_wash && !self.on_ground && self.vel.y < -1.8 && up.y > 0.25 {
             let horiz_speed = (self.vel.x * self.vel.x + self.vel.z * self.vel.z).sqrt();
-            // Strongest when descending vertically with low forward airspeed & punching throttle
             let descent = ((-self.vel.y - 1.8) / 8.0).clamp(0.0, 1.0);
             let slow_factor = (1.0 - horiz_speed / 16.0).clamp(0.15, 1.0);
             let intensity = descent * slow_factor * (0.35 + 0.65 * self.motor_thr);
+            self.prop_wash_level = intensity;
             self.prop_wash_phase += dt * 115.0; // ~18 Hz prop wash wobble
             let wobble_p = self.prop_wash_phase.sin() * intensity * 0.42;
             let wobble_r = (self.prop_wash_phase * 1.37).cos() * intensity * 0.55;

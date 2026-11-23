@@ -976,11 +976,12 @@ impl Renderer {
     }
 
     pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize) {
-        let rows: [(&str, String); 15] = [
+        let rows: [(&str, String); 16] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", cfg.flight_mode.name().to_string()),
             ("Battery", cfg.battery_pack.name().to_string()),
             ("Prop Wash", if cfg.prop_wash { "Stock" } else { "Off" }.to_string()),
+            ("Sound", if cfg.sound_on { "On (Whoop Audio)" } else { "Off" }.to_string()),
             ("Rate Preset", cfg.rates.name().to_string()),
             ("Center Sens", format!("{} deg/s", cfg.rate_center)),
             ("Max Rate", format!("{} deg/s", cfg.rate_max)),

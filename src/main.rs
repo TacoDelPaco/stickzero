@@ -3,6 +3,7 @@
 //! Designed for low-latency flight on CardputerZero's Raspberry Pi CM0 (Quad Cortex-A53 @ 1GHz)
 //! and 320x170 ST7789v3 LCD over Linux fbdev, with Bluetooth & USB-C controller support.
 
+mod audio;
 mod config;
 mod display;
 mod font;
@@ -14,7 +15,8 @@ mod png;
 mod renderer;
 mod tracks;
 
-use config::{Config, RatesPreset, ThrottleMode, VisualTheme};
+use audio::AudioEngine;
+use config::{BatteryPack, Config, RatesPreset, ThrottleMode, VisualTheme};
 use display::{FbDisplay, SCREEN_H, SCREEN_W};
 use input::InputManager;
 use linux_sys::{signal, SIGINT, SIGTERM};
@@ -194,6 +196,7 @@ fn main() {
     };
 
     let mut cfg = Config::load();
+    let audio = AudioEngine::start(cfg.sound_on);
     let mut input = InputManager::new();
     let mut renderer = Renderer::new();
     let mut screen = AppScreen::MainMenu;
@@ -216,6 +219,7 @@ fn main() {
         last_frame = frame_start;
 
         let in_menu = screen != AppScreen::Flying;
+        audio.set_flying(!in_menu, cfg.analog_filter);
         input.poll(dt, in_menu, &cfg);
         let act = input.take_menu_actions();
 
@@ -232,6 +236,7 @@ fn main() {
                         0 if act.select => {
                             quad = QuadState::spawn(&TRACKS[cfg.track_index]);
                             phys_accum = 0.0;
+                            audio.trigger_arm();
                             screen = AppScreen::Flying;
                         }
                         1 => {
@@ -275,13 +280,31 @@ fn main() {
                     let track = &TRACKS[cfg.track_index];
                     if act.respawn {
                         quad.respawn_at_start(track);
+                        audio.trigger_arm();
                     }
                     let sticks = input.flight_sticks(&cfg);
+                    let prev_score = quad.score;
+                    let prev_hit = quad.hit_flash;
                     phys_accum += dt;
                     while phys_accum >= PHYSICS_DT {
                         quad.step(sticks, &mut cfg, track);
                         phys_accum -= PHYSICS_DT;
                     }
+                    if quad.score > prev_score {
+                        audio.trigger_gate();
+                    }
+                    if quad.hit_flash > prev_hit + 0.10 {
+                        audio.trigger_hit();
+                    }
+                    let low_batt = cfg.battery_pack != BatteryPack::Off && quad.cell_voltage < 3.45;
+                    audio.update_telemetry(
+                        quad.motor_thr,
+                        quad.vel.len(),
+                        quad.prop_wash_level,
+                        sticks.pitch,
+                        sticks.roll,
+                        low_batt,
+                    );
                     let r0 = Instant::now();
                     renderer.render_flight(&quad, &cfg, track, sticks, fps_display, last_render_ms);
                     last_render_ms = r0.elapsed().as_secs_f32() * 1000.0;
@@ -300,6 +323,7 @@ fn main() {
                             0 => screen = AppScreen::Flying,
                             1 => {
                                 quad.respawn_at_start(track);
+                                audio.trigger_arm();
                                 screen = AppScreen::Flying;
                             }
                             2 => {
@@ -317,7 +341,7 @@ fn main() {
                 renderer.render_pause_menu(pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 15;
+                const NUM_SETTINGS: usize = 16;
                 if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
@@ -331,10 +355,14 @@ fn main() {
                             2 => cfg.battery_pack = cfg.battery_pack.next(),
                             3 => cfg.prop_wash = !cfg.prop_wash,
                             4 => {
+                                cfg.sound_on = !cfg.sound_on;
+                                audio.set_enabled(cfg.sound_on);
+                            }
+                            5 => {
                                 let next = cfg.rates.next_preset();
                                 cfg.apply_rate_preset(next);
                             }
-                            5 => {
+                            6 => {
                                 cfg.rate_center = if act.left {
                                     cfg.rate_center.saturating_sub(10).max(50)
                                 } else {
@@ -342,7 +370,7 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            6 => {
+                            7 => {
                                 cfg.rate_max = if act.left {
                                     cfg.rate_max.saturating_sub(20).max(300)
                                 } else {
@@ -350,7 +378,7 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            7 => {
+                            8 => {
                                 cfg.rate_expo = if act.left {
                                     cfg.rate_expo.saturating_sub(5)
                                 } else {
@@ -358,25 +386,25 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            8 => {
+                            9 => {
                                 if act.left {
                                     cfg.camera_tilt_deg = cfg.camera_tilt_deg.saturating_sub(5);
                                 } else {
                                     cfg.camera_tilt_deg = (cfg.camera_tilt_deg + 5).min(50);
                                 }
                             }
-                            9 => {
+                            10 => {
                                 cfg.fov_deg = if act.left {
                                     cfg.fov_deg.saturating_sub(5).max(75)
                                 } else {
                                     (cfg.fov_deg + 5).min(105)
                                 };
                             }
-                            10 => cfg.analog_filter = !cfg.analog_filter,
-                            11 => cfg.detail_high = !cfg.detail_high,
-                            12 => cfg.sky_detail = !cfg.sky_detail,
-                            13 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            14 => {
+                            11 => cfg.analog_filter = !cfg.analog_filter,
+                            12 => cfg.detail_high = !cfg.detail_high,
+                            13 => cfg.sky_detail = !cfg.sky_detail,
+                            14 => cfg.stick_mode = cfg.stick_mode.toggle(),
+                            15 => {
                                 if act.left {
                                     cfg.throttle_mode = cfg.throttle_mode.toggle();
                                 } else {
