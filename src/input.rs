@@ -3,8 +3,12 @@
 //! - USB-C Host controllers (EdgeTX/OpenTX USB Joystick, generic HID gamepads)
 //! - CardputerZero built-in TCA8418 keyboard (`/dev/input/by-path/platform-3f804000.i2c-event`)
 //!
-//! Includes hot-plug detection, automatic axis range calibration via EVIOCGABS,
-//! stick-based menu navigation, and CardputerZero short-Esc / long-Esc exit semantics.
+//! Features:
+//! - Scored evdev controller discovery (skips touchpads, IMUs, and non-gamepad nodes)
+//! - Smart auto-mapping for Xbox/PS/Switch/8BitDo/BLE/EdgeTX/ELRS axis layouts
+//! - Interactive 4-step "Detect Sticks" calibration wizard (detects axis codes + polarity)
+//! - Edge-triggered stick menu navigation (never spams Down when throttle rests at bottom!)
+//! - CardputerZero short-Esc / long-Esc exit semantics
 
 use crate::config::{Config, StickMode, ThrottleMode};
 use crate::linux_sys::*;
@@ -32,7 +36,16 @@ impl AxisCal {
         let span = (self.max - self.min) as f32;
         let v = ((self.value - self.min) as f32 / span) * 2.0 - 1.0;
         let v = clampf(v, -1.0, 1.0);
-        if v.abs() < 0.03 { 0.0 } else { v }
+        if v.abs() < 0.04 { 0.0 } else { v }
+    }
+
+    /// Raw normalized value without deadzone (used for calibration delta detection).
+    pub fn raw_norm(&self) -> f32 {
+        if !self.present || self.max <= self.min {
+            return 0.0;
+        }
+        let span = (self.max - self.min) as f32;
+        clampf(((self.value - self.min) as f32 / span) * 2.0 - 1.0, -1.0, 1.0)
     }
 }
 
@@ -53,7 +66,6 @@ pub struct GamepadDevice {
     pub btn_east: bool,
     pub btn_start: bool,
     pub btn_select: bool,
-    pub btn_tl: bool,
     pub btn_tr: bool,
 }
 
@@ -74,13 +86,44 @@ pub struct MenuActions {
     pub select: bool,
     pub back: bool,
     pub respawn: bool,
+    pub calibrate: bool,
+    pub next_device: bool,
     pub exit_app: bool,
+}
+
+/// Interactive 4-step stick calibration wizard.
+#[derive(Clone, Debug)]
+pub struct CalibWizard {
+    /// 0 = Throttle UP, 1 = Yaw RIGHT, 2 = Pitch FORWARD, 3 = Roll RIGHT
+    pub step: usize,
+    pub baseline: [f32; ABS_MAX + 1],
+    pub used_axes: [Option<u16>; 4],
+    pub step_started: Instant,
+    pub message: String,
+}
+
+impl CalibWizard {
+    pub fn step_prompt(&self) -> &'static str {
+        match self.step {
+            0 => "1/4: MOVE THROTTLE UP",
+            1 => "2/4: MOVE YAW RIGHT",
+            2 => "3/4: MOVE PITCH FORWARD",
+            _ => "4/4: MOVE ROLL RIGHT",
+        }
+    }
+}
+
+fn is_hat_axis(code: usize) -> bool {
+    code == ABS_HAT0X as usize || code == ABS_HAT0Y as usize
 }
 
 pub struct InputManager {
     pub gamepad: Option<GamepadDevice>,
     keyboards: Vec<(i32, String)>,
     last_scan: Instant,
+    device_skip_idx: usize,
+    pub candidate_count: usize,
+    pub calib: Option<CalibWizard>,
 
     // Keyboard flight state
     kb_w: bool,
@@ -97,9 +140,10 @@ pub struct InputManager {
     esc_down_at: Option<Instant>,
     esc_long_fired: bool,
 
-    // Edge-triggered menu actions
+    // Edge-triggered menu actions & stick nav latch (prevents stuck-axis spam!)
     pending: MenuActions,
-    stick_nav_cooldown: Instant,
+    stick_nav_latched_x: bool,
+    stick_nav_latched_y: bool,
 }
 
 impl InputManager {
@@ -108,6 +152,9 @@ impl InputManager {
             gamepad: None,
             keyboards: Vec::new(),
             last_scan: Instant::now() - Duration::from_secs(10),
+            device_skip_idx: 0,
+            candidate_count: 0,
+            calib: None,
             kb_w: false,
             kb_s: false,
             kb_a: false,
@@ -120,7 +167,8 @@ impl InputManager {
             esc_down_at: None,
             esc_long_fired: false,
             pending: MenuActions::default(),
-            stick_nav_cooldown: Instant::now(),
+            stick_nav_latched_x: false,
+            stick_nav_latched_y: false,
         };
         mgr.scan_devices();
         mgr
@@ -140,6 +188,122 @@ impl InputManager {
         }
     }
 
+    /// Cycle to the next detected evdev controller (useful if a BT pad exposes multiple nodes).
+    pub fn cycle_device(&mut self) {
+        self.device_skip_idx = self.device_skip_idx.wrapping_add(1);
+        self.gamepad = None;
+        self.scan_devices();
+    }
+
+    /// Start the interactive 4-step stick calibration wizard.
+    pub fn start_calibration(&mut self) {
+        let Some(ref gp) = self.gamepad else { return };
+        let mut baseline = [0.0f32; ABS_MAX + 1];
+        for i in 0..=ABS_MAX {
+            baseline[i] = gp.axes[i].raw_norm();
+        }
+        self.calib = Some(CalibWizard {
+            step: 0,
+            baseline,
+            used_axes: [None; 4],
+            step_started: Instant::now(),
+            message: "Hold sticks still, then push target axis!".to_string(),
+        });
+    }
+
+    /// Update calibration wizard; returns true when all 4 axes are calibrated and saved.
+    pub fn update_calibration(&mut self, cfg: &mut Config) -> bool {
+        let Some(ref mut wiz) = self.calib else { return false };
+        let Some(ref gp) = self.gamepad else {
+            self.calib = None;
+            return false;
+        };
+
+        // Brief settle period between steps so user can release stick
+        if wiz.step_started.elapsed() < Duration::from_millis(450) {
+            for i in 0..=ABS_MAX {
+                wiz.baseline[i] = gp.axes[i].raw_norm();
+            }
+            return false;
+        }
+
+        // Find the non-hat axis with the largest deflection from baseline
+        let mut best_code: Option<usize> = None;
+        let mut best_delta = 0.0f32;
+        for code in 0..=ABS_MAX {
+            if !gp.axes[code].present || is_hat_axis(code) {
+                continue;
+            }
+            if wiz.used_axes.iter().any(|&u| u == Some(code as u16)) {
+                continue;
+            }
+            let delta = gp.axes[code].raw_norm() - wiz.baseline[code];
+            if delta.abs() > best_delta.abs() {
+                best_delta = delta;
+                best_code = Some(code);
+            }
+        }
+
+        if let Some(code) = best_code {
+            if best_delta.abs() >= 0.45 {
+                let inverted = best_delta < 0.0;
+                wiz.used_axes[wiz.step] = Some(code as u16);
+                match wiz.step {
+                    0 => {
+                        cfg.axis_thr = Some(code as u16);
+                        cfg.invert_throttle = inverted;
+                        wiz.message = format!("THR -> ABS_{code} (inv:{})", inverted as u8);
+                    }
+                    1 => {
+                        cfg.axis_yaw = Some(code as u16);
+                        cfg.invert_yaw = inverted;
+                        wiz.message = format!("YAW -> ABS_{code} (inv:{})", inverted as u8);
+                    }
+                    2 => {
+                        cfg.axis_pit = Some(code as u16);
+                        cfg.invert_pitch = inverted;
+                        wiz.message = format!("PIT -> ABS_{code} (inv:{})", inverted as u8);
+                    }
+                    _ => {
+                        cfg.axis_rol = Some(code as u16);
+                        cfg.invert_roll = inverted;
+                        cfg.save();
+                        self.calib = None;
+                        return true;
+                    }
+                }
+                wiz.step += 1;
+                wiz.step_started = Instant::now();
+                for i in 0..=ABS_MAX {
+                    wiz.baseline[i] = gp.axes[i].raw_norm();
+                }
+            }
+        }
+        false
+    }
+
+    /// Compact live string of all active non-hat EV_ABS axes for diagnostics on Controller screen.
+    pub fn raw_axes_summary(&self) -> String {
+        let Some(ref gp) = self.gamepad else {
+            return "No evdev ABS axes".to_string();
+        };
+        let mut parts = Vec::new();
+        for code in 0..=ABS_MAX {
+            if gp.axes[code].present && !is_hat_axis(code) {
+                let v = gp.axes[code].raw_norm();
+                parts.push(format!("{code}:{v:+.1}"));
+                if parts.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        if parts.is_empty() {
+            "No ABS axes".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+
     /// Scan `/dev/input/event*` for gamepads/RC radios and CardputerZero keyboard.
     pub fn scan_devices(&mut self) {
         self.last_scan = Instant::now();
@@ -154,7 +318,7 @@ impl InputManager {
             }
         }
 
-        // 2. Scan /dev/input/event*
+        // 2. Scan /dev/input/event* and score all candidate controllers
         let Ok(entries) = fs::read_dir("/dev/input") else { return };
         let mut paths: Vec<String> = entries
             .flatten()
@@ -169,8 +333,18 @@ impl InputManager {
             .collect();
         paths.sort();
 
+        struct Candidate {
+            score: i32,
+            fd: i32,
+            path: String,
+            name: String,
+            kind: ControllerKind,
+            axes: [AxisCal; ABS_MAX + 1],
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+
         for path in paths {
-            // Skip already-open gamepad
             if let Some(ref gp) = self.gamepad {
                 if gp.path == path {
                     continue;
@@ -179,7 +353,6 @@ impl InputManager {
 
             let Some(fd) = Self::open_nonblock(&path) else { continue };
 
-            // Query device name
             let mut name_buf = [0u8; 128];
             let r = unsafe { ioctl(fd, eviocgname(name_buf.len()), name_buf.as_mut_ptr()) };
             let name = if r > 0 {
@@ -189,17 +362,27 @@ impl InputManager {
                 path.clone()
             };
 
-            // Check capabilities: EV_ABS + EV_KEY
             let mut ev_bits = [0u8; 4];
             let _ = unsafe { ioctl(fd, eviocgbit(0, ev_bits.len()), ev_bits.as_mut_ptr()) };
             let has_abs = (ev_bits[0] & (1 << EV_ABS)) != 0;
             let has_key = (ev_bits[0] & (1 << EV_KEY)) != 0;
 
-            if has_abs && self.gamepad.is_none() {
+            let lower = name.to_ascii_lowercase();
+            let is_ignored = lower.contains("imu")
+                || lower.contains("accel")
+                || lower.contains("gyro")
+                || lower.contains("bmi270")
+                || lower.contains("touchpad")
+                || lower.contains("motion")
+                || lower.contains("sensor")
+                || lower.contains("mouse")
+                || lower.contains("tca8418");
+
+            if has_abs && !is_ignored && self.gamepad.is_none() {
                 let mut abs_bits = [0u8; 8];
                 let _ = unsafe { ioctl(fd, eviocgbit(EV_ABS as u32, abs_bits.len()), abs_bits.as_mut_ptr()) };
                 let mut axes = [AxisCal::default(); ABS_MAX + 1];
-                let mut axis_count = 0usize;
+                let mut stick_axes = 0i32;
                 for code in 0..=ABS_MAX {
                     if (abs_bits[code / 8] & (1 << (code % 8))) != 0 {
                         let mut info = InputAbsInfo::default();
@@ -211,16 +394,15 @@ impl InputManager {
                                     max: info.maximum,
                                     value: info.value,
                                 };
-                                axis_count += 1;
+                                if !is_hat_axis(code) {
+                                    stick_axes += 1;
+                                }
                             }
                         }
                     }
                 }
 
-                // Require at least 2 axes and ignore IMU / accelerometer devices
-                let lower = name.to_ascii_lowercase();
-                let is_imu = lower.contains("imu") || lower.contains("accel") || lower.contains("bmi270") || lower.contains("touch");
-                if axis_count >= 2 && !is_imu {
+                if stick_axes >= 2 {
                     let is_rc = lower.contains("edgetx")
                         || lower.contains("opentx")
                         || lower.contains("radiomaster")
@@ -229,27 +411,35 @@ impl InputManager {
                         || lower.contains("frsky")
                         || lower.contains("jumper")
                         || lower.contains("tbs")
+                        || lower.contains("betaflight");
+                    let is_pad = lower.contains("xbox")
+                        || lower.contains("wireless controller")
+                        || lower.contains("dualsense")
+                        || lower.contains("dualshock")
+                        || lower.contains("8bitdo")
+                        || lower.contains("pro controller")
+                        || lower.contains("gamepad")
                         || lower.contains("joystick");
-                    self.gamepad = Some(GamepadDevice {
+
+                    let mut score = stick_axes * 10;
+                    if stick_axes >= 4 { score += 50; }
+                    if is_rc || is_pad { score += 40; }
+                    if has_key { score += 15; }
+
+                    candidates.push(Candidate {
+                        score,
                         fd,
                         path,
                         name,
                         kind: if is_rc { ControllerKind::RcRadio } else { ControllerKind::Gamepad },
                         axes,
-                        btn_south: false,
-                        btn_east: false,
-                        btn_start: false,
-                        btn_select: false,
-                        btn_tl: false,
-                        btn_tr: false,
                     });
                     continue;
                 }
             }
 
-            // Fallback: open any keyboard if we didn't find CardputerZero's dedicated i2c-event path
+            // Fallback: open any keyboard if CardputerZero's dedicated i2c-event path wasn't found
             if has_key && self.keyboards.is_empty() {
-                let lower = name.to_ascii_lowercase();
                 if lower.contains("keyboard") || lower.contains("keypad") || lower.contains("tca8418") {
                     self.keyboards.push((fd, path));
                     continue;
@@ -257,6 +447,29 @@ impl InputManager {
             }
 
             unsafe { close(fd) };
+        }
+
+        if self.gamepad.is_none() && !candidates.is_empty() {
+            candidates.sort_by(|a, b| b.score.cmp(&a.score));
+            self.candidate_count = candidates.len();
+            let pick = self.device_skip_idx % candidates.len();
+            let chosen = candidates.swap_remove(pick);
+            // Close all unchosen candidate fds
+            for c in candidates {
+                unsafe { close(c.fd) };
+            }
+            self.gamepad = Some(GamepadDevice {
+                fd: chosen.fd,
+                path: chosen.path,
+                name: chosen.name,
+                kind: chosen.kind,
+                axes: chosen.axes,
+                btn_south: false,
+                btn_east: false,
+                btn_start: false,
+                btn_select: false,
+                btn_tr: false,
+            });
         }
     }
 
@@ -267,10 +480,9 @@ impl InputManager {
     }
 
     /// Poll all input devices; call once per frame.
-    pub fn poll(&mut self, dt: f32, in_menu: bool) {
+    pub fn poll(&mut self, dt: f32, in_menu: bool, cfg: &Config) {
         self.pending = MenuActions::default();
 
-        // Periodically hot-plug scan if no controller is connected
         if self.gamepad.is_none() && self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan_devices();
         }
@@ -294,7 +506,6 @@ impl InputManager {
                                     gp.axes[c].max = 32767;
                                 }
                             }
-                            // D-pad hat navigation
                             if ev.code == ABS_HAT0Y {
                                 if ev.value < 0 { self.pending.up = true; }
                                 if ev.value > 0 { self.pending.down = true; }
@@ -335,13 +546,13 @@ impl InputManager {
                     disconnect = true;
                     break;
                 } else {
-                    // EAGAIN or error
                     break;
                 }
             }
         }
         if disconnect {
             self.gamepad = None;
+            self.calib = None;
         }
 
         // 2. Poll keyboards
@@ -417,11 +628,17 @@ impl InputManager {
                 KEY_R => {
                     if pressed { self.pending.respawn = true; }
                 }
+                KEY_C => {
+                    if pressed { self.pending.calibrate = true; }
+                }
+                KEY_N => {
+                    if pressed { self.pending.next_device = true; }
+                }
                 _ => {}
             }
         }
 
-        // Check CardputerZero long-Esc (>= 700ms) for clean exit to APPLaunch
+        // CardputerZero long-Esc (>= 700ms) for clean exit to APPLaunch
         if let Some(t0) = self.esc_down_at {
             if !self.esc_long_fired && t0.elapsed() >= Duration::from_millis(700) {
                 self.esc_long_fired = true;
@@ -429,31 +646,36 @@ impl InputManager {
             }
         }
 
-        // Update keyboard throttle smoothly
+        // Keyboard throttle
         if self.kb_w {
             self.kb_throttle = (self.kb_throttle + 1.1 * dt).min(1.0);
         } else if self.kb_s {
             self.kb_throttle = (self.kb_throttle - 1.3 * dt).max(0.0);
         }
 
-        // Stick-based menu navigation (so user can navigate menus purely with BT/USB controller!)
-        if in_menu && self.stick_nav_cooldown.elapsed() > Duration::from_millis(180) {
-            if let Some(ref gp) = self.gamepad {
-                let (lx, ly, rx, ry) = Self::extract_raw_sticks(gp);
-                let nav_y = if ry.abs() > ly.abs() { ry } else { ly };
-                let nav_x = if rx.abs() > lx.abs() { rx } else { lx };
-                if nav_y > 0.65 {
+        // Edge-triggered RIGHT-STICK ONLY menu navigation (never uses throttle, never spams!)
+        if in_menu && self.calib.is_none() && self.gamepad.is_some() {
+            let sticks = self.flight_sticks(cfg);
+            if sticks.pitch.abs() < 0.35 {
+                self.stick_nav_latched_y = false;
+            } else if !self.stick_nav_latched_y {
+                if sticks.pitch > 0.70 {
                     self.pending.up = true;
-                    self.stick_nav_cooldown = Instant::now();
-                } else if nav_y < -0.65 {
+                    self.stick_nav_latched_y = true;
+                } else if sticks.pitch < -0.70 {
                     self.pending.down = true;
-                    self.stick_nav_cooldown = Instant::now();
-                } else if nav_x > 0.65 {
+                    self.stick_nav_latched_y = true;
+                }
+            }
+            if sticks.roll.abs() < 0.35 {
+                self.stick_nav_latched_x = false;
+            } else if !self.stick_nav_latched_x {
+                if sticks.roll > 0.70 {
                     self.pending.right = true;
-                    self.stick_nav_cooldown = Instant::now();
-                } else if nav_x < -0.65 {
+                    self.stick_nav_latched_x = true;
+                } else if sticks.roll < -0.70 {
                     self.pending.left = true;
-                    self.stick_nav_cooldown = Instant::now();
+                    self.stick_nav_latched_x = true;
                 }
             }
         }
@@ -465,62 +687,88 @@ impl InputManager {
         a
     }
 
-    /// Extract (left_x, left_y, right_x, right_y) in -1..+1 (up = +1, right = +1).
-    pub fn extract_raw_sticks(gp: &GamepadDevice) -> (f32, f32, f32, f32) {
-        match gp.kind {
-            ControllerKind::RcRadio => {
-                // EdgeTX / ELRS standard AETR mapping:
-                // ABS_X = Aileron (right X), ABS_Y = Elevator (right Y),
-                // ABS_Z / ABS_THROTTLE = Throttle (left Y), ABS_RX / ABS_RUDDER = Rudder (left X)
-                let rx = gp.axes[ABS_X as usize].norm();
-                let ry = gp.axes[ABS_Y as usize].norm();
-                let ly = if gp.axes[ABS_THROTTLE as usize].present {
-                    gp.axes[ABS_THROTTLE as usize].norm()
-                } else {
-                    gp.axes[ABS_Z as usize].norm()
-                };
-                let lx = if gp.axes[ABS_RUDDER as usize].present {
-                    gp.axes[ABS_RUDDER as usize].norm()
-                } else if gp.axes[ABS_RX as usize].present {
-                    gp.axes[ABS_RX as usize].norm()
-                } else {
-                    gp.axes[ABS_RZ as usize].norm()
-                };
-                (lx, ly, rx, ry)
-            }
-            _ => {
-                // Standard Bluetooth/USB Gamepad (Xbox, PS, Switch Pro, 8BitDo):
-                // Left stick = ABS_X, ABS_Y (inverted Y: up is negative on Linux evdev!)
-                // Right stick = ABS_RX, ABS_RY (or ABS_Z, ABS_RZ on some controllers)
-                let lx = gp.axes[ABS_X as usize].norm();
-                let ly = -gp.axes[ABS_Y as usize].norm();
-                let (rx, ry) = if gp.axes[ABS_RX as usize].present && gp.axes[ABS_RY as usize].present {
-                    (gp.axes[ABS_RX as usize].norm(), -gp.axes[ABS_RY as usize].norm())
-                } else {
-                    (gp.axes[ABS_Z as usize].norm(), -gp.axes[ABS_RZ as usize].norm())
-                };
-                (lx, ly, rx, ry)
+    /// Auto-resolve (thr, yaw, pit, rol) axis codes and default Y-inversions for a controller.
+    fn resolve_auto_axes(gp: &GamepadDevice) -> ([usize; 4], [bool; 4]) {
+        let has = |c: u16| gp.axes[c as usize].present;
+
+        if gp.kind == ControllerKind::RcRadio {
+            // EdgeTX / OpenTX / ELRS AETR layout
+            let rol = ABS_X as usize;
+            let pit = ABS_Y as usize;
+            let thr = if has(ABS_THROTTLE) { ABS_THROTTLE as usize } else { ABS_Z as usize };
+            let yaw = if has(ABS_RUDDER) {
+                ABS_RUDDER as usize
+            } else if has(ABS_RX) {
+                ABS_RX as usize
+            } else {
+                ABS_RZ as usize
+            };
+            return ([thr, yaw, pit, rol], [false, false, false, false]);
+        }
+
+        // Standard Linux Gamepad: Left Stick = (X, Y), Right Stick = (RX, RY)
+        if has(ABS_X) && has(ABS_Y) && has(ABS_RX) && has(ABS_RY) {
+            return (
+                [ABS_Y as usize, ABS_X as usize, ABS_RY as usize, ABS_RX as usize],
+                [true, false, true, false], // Linux evdev Y axes are negative-up!
+            );
+        }
+
+        // Bluetooth HID / Xbox BLE / Android-mode Gamepad: Left = (X, Y), Right = (Z, RZ)
+        if has(ABS_X) && has(ABS_Y) && has(ABS_Z) && has(ABS_RZ) {
+            return (
+                [ABS_Y as usize, ABS_X as usize, ABS_RZ as usize, ABS_Z as usize],
+                [true, false, true, false],
+            );
+        }
+
+        // Generic fallback: first 4 present non-hat EV_ABS axes
+        let mut found = [0usize; 4];
+        let mut count = 0usize;
+        for c in 0..=ABS_MAX {
+            if gp.axes[c].present && !is_hat_axis(c) {
+                found[count] = c;
+                count += 1;
+                if count == 4 {
+                    break;
+                }
             }
         }
+        // Assume (lx, ly, rx, ry) order
+        ([found[1], found[0], found[3], found[2]], [true, false, true, false])
     }
 
     /// Compute normalized FPV flight stick input from controller or keyboard fallback.
     pub fn flight_sticks(&self, cfg: &Config) -> StickInput {
         if let Some(ref gp) = self.gamepad {
-            let (lx, ly, rx, ry) = Self::extract_raw_sticks(gp);
-            let (raw_thr, yaw, mut pitch, roll) = match cfg.stick_mode {
-                StickMode::Mode2 => (ly, lx, ry, rx),
-                StickMode::Mode1 => (ry, lx, ly, rx),
+            let (auto_codes, auto_inv) = Self::resolve_auto_axes(gp);
+            let manual = cfg.axis_thr.is_some()
+                || cfg.axis_yaw.is_some()
+                || cfg.axis_pit.is_some()
+                || cfg.axis_rol.is_some();
+
+            let read_axis = |opt: Option<u16>, fallback: usize, default_inv: bool, user_inv: bool| -> f32 {
+                let code = opt.map(|c| c as usize).unwrap_or(fallback).min(ABS_MAX);
+                let mut v = gp.axes[code].norm();
+                let inv = if manual { user_inv } else { default_inv ^ user_inv };
+                if inv {
+                    v = -v;
+                }
+                v
             };
-            let raw_thr = if cfg.invert_throttle { -raw_thr } else { raw_thr };
-            if cfg.invert_pitch {
-                pitch = -pitch;
+
+            let mut raw_thr = read_axis(cfg.axis_thr, auto_codes[0], auto_inv[0], cfg.invert_throttle);
+            let yaw = read_axis(cfg.axis_yaw, auto_codes[1], auto_inv[1], cfg.invert_yaw);
+            let mut pitch = read_axis(cfg.axis_pit, auto_codes[2], auto_inv[2], cfg.invert_pitch);
+            let roll = read_axis(cfg.axis_rol, auto_codes[3], auto_inv[3], cfg.invert_roll);
+
+            if !manual && cfg.stick_mode == StickMode::Mode1 {
+                std::mem::swap(&mut raw_thr, &mut pitch);
             }
+
             let throttle = match cfg.throttle_mode {
                 ThrottleMode::RcFull => clampf((raw_thr + 1.0) * 0.5, 0.0, 1.0),
                 ThrottleMode::GamepadCenter => {
-                    // Spring-centered gamepad stick: center (0) = ~0.34 hover throttle,
-                    // pushing up goes smoothly to 1.0, pulling down goes to 0.0!
                     if raw_thr >= 0.0 {
                         0.34 + raw_thr * 0.66
                     } else {
@@ -530,7 +778,6 @@ impl InputManager {
             };
             StickInput { throttle, yaw, pitch, roll }
         } else {
-            // CardputerZero built-in keyboard flight fallback
             let yaw = (self.kb_d as i32 - self.kb_a as i32) as f32 * 0.75;
             let pitch = (self.kb_up as i32 - self.kb_down as i32) as f32 * 0.75;
             let roll = (self.kb_right as i32 - self.kb_left as i32) as f32 * 0.75;

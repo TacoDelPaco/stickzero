@@ -864,44 +864,67 @@ impl Renderer {
     pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {
         self.draw_header("CONTROLLER", "BT / USB-C");
 
-        let name: String = input.controller_name().chars().take(42).collect();
-        let kind_str = match input.controller_kind() {
-            ControllerKind::RcRadio => "Type: RC Radio (EdgeTX / ELRS)",
-            ControllerKind::Gamepad => "Type: Gamepad (BT / USB HID)",
-            ControllerKind::None => "Type: None (Using Keyboard Fallback)",
+        let name: String = input.controller_name().chars().take(36).collect();
+        let dev_tag = if input.candidate_count > 1 {
+            format!("{name} [{} devs]", input.candidate_count)
+        } else {
+            name
         };
-        self.draw_text(10, 28, &name, rgb565(255, 230, 80), 1, false);
-        self.draw_text(10, 40, kind_str, rgb565(150, 215, 255), 1, false);
+        let kind_str = match input.controller_kind() {
+            ControllerKind::RcRadio => "RC Radio | Thr:",
+            ControllerKind::Gamepad => "Gamepad  | Thr:",
+            ControllerKind::None => "No Pad   | Thr:",
+        };
+        let mapped_tag = if cfg.axis_thr.is_some() { "CUSTOM" } else { "AUTO" };
+        let sub = format!("{kind_str}{} ({mapped_tag})", cfg.throttle_mode.name());
 
-        let sticks = input.flight_sticks(cfg);
-        let bars: [(&str, f32); 4] = [
-            ("THR", sticks.throttle * 2.0 - 1.0),
-            ("YAW", sticks.yaw),
-            ("PIT", sticks.pitch),
-            ("ROL", sticks.roll),
-        ];
+        self.draw_text(8, 26, &dev_tag, rgb565(255, 230, 80), 1, false);
+        self.draw_text(8, 36, &sub, rgb565(150, 215, 255), 1, false);
 
-        for (i, (lbl, val)) in bars.iter().enumerate() {
-            let y = 58 + (i as i32) * 18;
-            self.draw_text(10, y + 2, lbl, rgb565(210, 220, 230), 1, false);
-            let bx = 42;
-            let bw = 150;
-            self.fill_rect(bx, y, bw, 11, rgb565(24, 30, 44));
-            self.draw_rect(bx, y, bw, 11, rgb565(75, 95, 125));
-            let mid = bx + bw / 2;
-            self.draw_vline(mid, y + 1, y + 9, rgb565(90, 105, 130));
-            let pos = bx + ((clampf(*val, -1.0, 1.0) + 1.0) * 0.5 * (bw - 4) as f32) as i32;
-            self.fill_rect(pos, y + 2, 4, 7, rgb565(80, 255, 140));
+        if let Some(ref wiz) = input.calib {
+            // Interactive 4-step calibration overlay
+            self.fill_rect(10, 50, W - 20, 72, rgb565(20, 34, 62));
+            self.draw_rect(10, 50, W - 20, 72, rgb565(90, 220, 255));
+            self.draw_text(18, 58, "CALIBRATE STICKS", rgb565(120, 225, 255), 1, false);
+            self.draw_text(18, 74, wiz.step_prompt(), rgb565(255, 235, 70), 1, false);
+            let msg: String = wiz.message.chars().take(44).collect();
+            self.draw_text(18, 92, &msg, rgb565(190, 240, 190), 1, false);
+            self.draw_text(18, 108, "Esc: Cancel Calibration", rgb565(160, 175, 195), 1, false);
+        } else {
+            let sticks = input.flight_sticks(cfg);
+            let bars: [(&str, f32); 4] = [
+                ("THR", sticks.throttle * 2.0 - 1.0),
+                ("YAW", sticks.yaw),
+                ("PIT", sticks.pitch),
+                ("ROL", sticks.roll),
+            ];
+
+            for (i, (lbl, val)) in bars.iter().enumerate() {
+                let y = 50 + (i as i32) * 16;
+                self.draw_text(8, y + 2, lbl, rgb565(210, 220, 230), 1, false);
+                let bx = 38;
+                let bw = 152;
+                self.fill_rect(bx, y, bw, 10, rgb565(24, 30, 44));
+                self.draw_rect(bx, y, bw, 10, rgb565(75, 95, 125));
+                let mid = bx + bw / 2;
+                self.draw_vline(mid, y + 1, y + 8, rgb565(90, 105, 130));
+                let pos = bx + ((clampf(*val, -1.0, 1.0) + 1.0) * 0.5 * (bw - 4) as f32) as i32;
+                self.fill_rect(pos, y + 2, 4, 6, rgb565(80, 255, 140));
+            }
+
+            // Live dual gimbal preview on the right
+            self.draw_stick_box(204, 52, 46, sticks.yaw, sticks.throttle * 2.0 - 1.0);
+            self.draw_stick_box(260, 52, 46, sticks.roll, sticks.pitch);
+            self.draw_text(214, 102, "L-STK", rgb565(160, 175, 195), 1, false);
+            self.draw_text(270, 102, "R-STK", rgb565(160, 175, 195), 1, false);
         }
 
-        // Live dual gimbal preview on the right
-        self.draw_stick_box(208, 62, 46, sticks.yaw, sticks.throttle * 2.0 - 1.0);
-        self.draw_stick_box(262, 62, 46, sticks.roll, sticks.pitch);
-        self.draw_text(218, 112, "L-STK", rgb565(160, 175, 195), 1, false);
-        self.draw_text(272, 112, "R-STK", rgb565(160, 175, 195), 1, false);
+        // Live raw EV_ABS axes diagnostic strip
+        let raw = format!("ABS {}", input.raw_axes_summary());
+        let raw_trim: String = raw.chars().take(50).collect();
+        self.draw_text(8, 128, &raw_trim, rgb565(120, 210, 150), 1, false);
 
-        let thr_hint = format!("Throttle: {}  (Enter: Toggle RC/Pad)", cfg.throttle_mode.name());
-        self.draw_text(10, 136, &thr_hint, rgb565(255, 255, 255), 1, false);
-        self.draw_text(10, 152, "Esc/B: Back | R: Rescan USB-C & Bluetooth", rgb565(145, 160, 180), 1, false);
+        self.draw_text(8, 142, "C:Detect Sticks | Ent:RC/Pad | N:NextDev", rgb565(255, 255, 255), 1, false);
+        self.draw_text(8, 155, "R:Rescan+Auto | Esc:Back", rgb565(145, 160, 180), 1, false);
     }
 }

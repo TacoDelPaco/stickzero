@@ -216,7 +216,7 @@ fn main() {
         last_frame = frame_start;
 
         let in_menu = screen != AppScreen::Flying;
-        input.poll(dt, in_menu);
+        input.poll(dt, in_menu, &cfg);
         let act = input.take_menu_actions();
 
         if act.exit_app {
@@ -353,13 +353,32 @@ fn main() {
                 renderer.render_settings_menu(&cfg, settings_idx);
             }
             AppScreen::Controller => {
-                if act.back {
+                if input.calib.is_some() {
+                    if act.back {
+                        input.calib = None;
+                    } else {
+                        input.update_calibration(&mut cfg);
+                    }
+                } else if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
+                } else if act.calibrate {
+                    input.start_calibration();
+                } else if act.next_device {
+                    input.cycle_device();
                 } else if act.select || act.left || act.right {
                     cfg.throttle_mode = cfg.throttle_mode.toggle();
                     cfg.save();
                 } else if act.respawn {
+                    cfg.axis_thr = None;
+                    cfg.axis_yaw = None;
+                    cfg.axis_pit = None;
+                    cfg.axis_rol = None;
+                    cfg.invert_throttle = false;
+                    cfg.invert_yaw = false;
+                    cfg.invert_pitch = false;
+                    cfg.invert_roll = false;
+                    cfg.save();
                     input.scan_devices();
                 }
                 renderer.render_controller_screen(&cfg, &input);
