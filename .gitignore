@@ -1,5 +1,6 @@
 /target/
 /build/
-/dist/
+/dist/*
+!/dist/*.deb
 *.swp
 .DS_Store

@@ -54,7 +54,7 @@ bash ./package.sh
 ### Option A: One-line install directly on CardputerZero (over Wi-Fi)
 
 ```bash
-curl -fLO https://github.com/TacoDelPaco/stickzero/releases/download/v0.1.0/stickzero_0.1.0_arm64.deb \
+curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.0_arm64.deb \
   && sudo dpkg -i stickzero_0.1.0_arm64.deb \
   && sudo systemctl restart APPLaunch.service
 ```
