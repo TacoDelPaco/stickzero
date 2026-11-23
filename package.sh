@@ -5,7 +5,7 @@ VERSION="0.1.0"
 PKG_NAME="stickzero"
 ARCH="arm64"
 BIN="target/aarch64-unknown-linux-musl/release/stickzero"
-ICON="assets/stickzero.png"
+ICON="assets/stickzero_100.png"
 STAGE="build/deb/${PKG_NAME}_${VERSION}_${ARCH}"
 
 if [ ! -f "$BIN" ]; then
@@ -13,32 +13,28 @@ if [ ! -f "$BIN" ]; then
     cargo build --release --target aarch64-unknown-linux-musl
 fi
 
-if [ ! -f "$ICON" ]; then
-    cargo run --release -- --screenshot screenshots
-fi
-
 rm -rf "$STAGE"
 mkdir -p \
     "$STAGE/DEBIAN" \
     "$STAGE/usr/share/APPLaunch/applications" \
     "$STAGE/usr/share/APPLaunch/bin" \
-    "$STAGE/usr/share/APPLaunch/share/icons" \
+    "$STAGE/usr/share/APPLaunch/share/images" \
     "dist"
 
 cp "$BIN" "$STAGE/usr/share/APPLaunch/bin/stickzero"
 chmod 755 "$STAGE/usr/share/APPLaunch/bin/stickzero"
 
-cp "$ICON" "$STAGE/usr/share/APPLaunch/share/icons/stickzero.png"
-chmod 644 "$STAGE/usr/share/APPLaunch/share/icons/stickzero.png"
+cp "$ICON" "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
+chmod 644 "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 
 cat > "$STAGE/usr/share/APPLaunch/applications/stickzero.desktop" <<'EOF'
 [Desktop Entry]
-Type=Application
 Name=StickZero
 Comment=Minimal native Rust 3D FPV quadcopter simulator for CardputerZero
 Exec=/usr/share/APPLaunch/bin/stickzero
-Icon=share/icons/stickzero.png
 Terminal=false
+Icon=share/images/stickzero_100.png
+Type=Application
 EOF
 
 cat > "$STAGE/DEBIAN/control" <<EOF
