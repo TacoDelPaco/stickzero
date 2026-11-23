@@ -1,16 +1,17 @@
 //! Zero-dependency Linux evdev input manager for:
+//! - USB-C Host RC radios (EdgeTX/OpenTX, RadioMaster Pocket, ELRS USB Joystick)
 //! - Bluetooth controllers (Xbox, PlayStation, Switch Pro, 8BitDo, ELRS BLE Joystick)
-//! - USB-C Host controllers (EdgeTX/OpenTX USB Joystick, generic HID gamepads)
 //! - CardputerZero built-in TCA8418 keyboard (`/dev/input/by-path/platform-3f804000.i2c-event`)
 //!
 //! Features:
 //! - Scored evdev controller discovery (skips touchpads, IMUs, and non-gamepad nodes)
-//! - Smart auto-mapping for Xbox/PS/Switch/8BitDo/BLE/EdgeTX/ELRS axis layouts
-//! - Interactive 4-step "Detect Sticks" calibration wizard (detects axis codes + polarity)
-//! - Edge-triggered stick menu navigation (never spams Down when throttle rests at bottom!)
+//! - Interactive 4-step "Detect Sticks" calibration wizard (`C`)
+//! - Interactive 3-step "Bind AUX Switches/Buttons" wizard (`B`) for Arm/Disarm, Flight Mode, and Turtle Mode
+//!   supporting BOTH EV_ABS switch channels (EdgeTX CH5-CH8) AND EV_KEY buttons!
+//! - Fn-free menu navigation (F/X/Z/C, ;/./,//, WASD, Arrows, Right-Stick)
 //! - CardputerZero short-Esc / long-Esc exit semantics
 
-use crate::config::{Config, StickMode, ThrottleMode};
+use crate::config::{AuxBinding, Config, StickMode, ThrottleMode};
 use crate::linux_sys::*;
 use crate::math::clampf;
 use crate::physics::StickInput;
@@ -28,7 +29,7 @@ pub struct AxisCal {
 }
 
 impl AxisCal {
-    /// Returns normalized value in -1.0 ..= +1.0
+    /// Returns normalized value in -1.0 ..= +1.0 with 4% center deadzone.
     pub fn norm(&self) -> f32 {
         if !self.present || self.max <= self.min {
             return 0.0;
@@ -39,7 +40,7 @@ impl AxisCal {
         if v.abs() < 0.04 { 0.0 } else { v }
     }
 
-    /// Raw normalized value without deadzone (used for calibration delta detection).
+    /// Raw normalized value without deadzone (used for calibration & switch detection).
     pub fn raw_norm(&self) -> f32 {
         if !self.present || self.max <= self.min {
             return 0.0;
@@ -56,17 +57,44 @@ pub enum ControllerKind {
     Gamepad, // Xbox / PS / Switch / 8BitDo / Generic
 }
 
+const MAX_KEY_CODE: usize = 768; // Covers keyboard, BTN_JOYSTICK (0x120..), BTN_GAMEPAD (0x130..), BTN_TRIGGER_HAPPY (0x2c0..)
+
 pub struct GamepadDevice {
     fd: i32,
     pub path: String,
     pub name: String,
     pub kind: ControllerKind,
     pub axes: [AxisCal; ABS_MAX + 1],
-    pub btn_south: bool,
-    pub btn_east: bool,
-    pub btn_start: bool,
-    pub btn_select: bool,
-    pub btn_tr: bool,
+    /// Bitset of currently held EV_KEY button codes (0..768)
+    pub keys_down: [u64; MAX_KEY_CODE / 64],
+    /// Most recent EV_KEY button pressed this frame (edge-triggered)
+    pub frame_btn_pressed: Option<u16>,
+    /// Last button code ever pressed (for live diagnostics on Controller screen)
+    pub last_btn_seen: Option<u16>,
+}
+
+impl GamepadDevice {
+    #[inline]
+    pub fn set_key(&mut self, code: u16, down: bool) {
+        let idx = code as usize;
+        if idx < MAX_KEY_CODE {
+            if down {
+                self.keys_down[idx / 64] |= 1u64 << (idx % 64);
+            } else {
+                self.keys_down[idx / 64] &= !(1u64 << (idx % 64));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn is_key_down(&self, code: u16) -> bool {
+        let idx = code as usize;
+        if idx < MAX_KEY_CODE {
+            (self.keys_down[idx / 64] & (1u64 << (idx % 64))) != 0
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for GamepadDevice {
@@ -87,8 +115,26 @@ pub struct MenuActions {
     pub back: bool,
     pub respawn: bool,
     pub calibrate: bool,
+    pub bind_aux: bool,
     pub next_device: bool,
     pub exit_app: bool,
+}
+
+/// Live radio AUX switch and button inputs evaluated every frame during flight.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AuxInputs {
+    /// Latched ARM switch state (Some(true)=ARM, Some(false)=DISARM) if bound to an EV_ABS switch.
+    pub arm_switch: Option<bool>,
+    /// Edge-triggered toggle for ARM (bound EV_KEY button or keyboard Tab).
+    pub arm_toggle: bool,
+    /// Latched FLIGHT MODE switch state (Some(true)=ANGLE, Some(false)=ACRO) if bound to an EV_ABS switch.
+    pub mode_switch_angle: Option<bool>,
+    /// Edge-triggered toggle for Flight Mode (bound EV_KEY button or keyboard M).
+    pub mode_toggle: bool,
+    /// Latched TURTLE switch state (Some(true)=TURTLE ON) if bound to an EV_ABS switch.
+    pub turtle_switch: Option<bool>,
+    /// Edge-triggered toggle for Turtle Mode (bound EV_KEY button or keyboard T).
+    pub turtle_toggle: bool,
 }
 
 /// Interactive 4-step stick calibration wizard.
@@ -113,6 +159,27 @@ impl CalibWizard {
     }
 }
 
+/// Interactive 3-step AUX switch/button binding wizard (Arm, Mode, Turtle).
+#[derive(Clone, Debug)]
+pub struct AuxWizard {
+    /// 0 = ARM/DISARM, 1 = FLIGHT MODE (Acro/Angle), 2 = TURTLE MODE
+    pub step: usize,
+    pub baseline: [f32; ABS_MAX + 1],
+    pub stick_axes: [usize; 4],
+    pub step_started: Instant,
+    pub message: String,
+}
+
+impl AuxWizard {
+    pub fn step_prompt(&self) -> &'static str {
+        match self.step {
+            0 => "1/3: FLIP ARM SWITCH OR BTN",
+            1 => "2/3: FLIP MODE SWITCH OR BTN",
+            _ => "3/3: FLIP TURTLE SWITCH/BTN",
+        }
+    }
+}
+
 fn is_hat_axis(code: usize) -> bool {
     code == ABS_HAT0X as usize || code == ABS_HAT0Y as usize
 }
@@ -124,6 +191,7 @@ pub struct InputManager {
     device_skip_idx: usize,
     pub candidate_count: usize,
     pub calib: Option<CalibWizard>,
+    pub aux_wiz: Option<AuxWizard>,
 
     // Keyboard flight state
     kb_w: bool,
@@ -136,11 +204,16 @@ pub struct InputManager {
     kb_right: bool,
     kb_throttle: f32,
 
+    // Keyboard edge-triggered AUX toggles
+    kb_arm_toggle: bool,
+    kb_mode_toggle: bool,
+    kb_turtle_toggle: bool,
+
     // CardputerZero Esc short/long press tracking
     esc_down_at: Option<Instant>,
     esc_long_fired: bool,
 
-    // Edge-triggered menu actions & stick nav latch (prevents stuck-axis spam!)
+    // Edge-triggered menu actions & stick nav latch
     pending: MenuActions,
     stick_nav_latched_x: bool,
     stick_nav_latched_y: bool,
@@ -155,6 +228,7 @@ impl InputManager {
             device_skip_idx: 0,
             candidate_count: 0,
             calib: None,
+            aux_wiz: None,
             kb_w: false,
             kb_s: false,
             kb_a: false,
@@ -164,6 +238,9 @@ impl InputManager {
             kb_left: false,
             kb_right: false,
             kb_throttle: 0.0,
+            kb_arm_toggle: false,
+            kb_mode_toggle: false,
+            kb_turtle_toggle: false,
             esc_down_at: None,
             esc_long_fired: false,
             pending: MenuActions::default(),
@@ -215,7 +292,7 @@ impl InputManager {
         }
     }
 
-    /// Cycle to the next detected evdev controller (useful if a BT pad exposes multiple nodes).
+    /// Cycle to the next detected evdev controller.
     pub fn cycle_device(&mut self) {
         self.device_skip_idx = self.device_skip_idx.wrapping_add(1);
         self.gamepad = None;
@@ -225,6 +302,7 @@ impl InputManager {
     /// Start the interactive 4-step stick calibration wizard.
     pub fn start_calibration(&mut self) {
         let Some(ref gp) = self.gamepad else { return };
+        self.aux_wiz = None;
         let mut baseline = [0.0f32; ABS_MAX + 1];
         for i in 0..=ABS_MAX {
             baseline[i] = gp.axes[i].raw_norm();
@@ -238,7 +316,31 @@ impl InputManager {
         });
     }
 
-    /// Update calibration wizard; returns true when all 4 axes are calibrated and saved.
+    /// Start the interactive 3-step AUX switch/button binding wizard (Arm, Mode, Turtle).
+    pub fn start_aux_wizard(&mut self, cfg: &Config) {
+        let Some(ref gp) = self.gamepad else { return };
+        self.calib = None;
+        let (auto_codes, _) = Self::resolve_auto_axes(gp);
+        let stick_axes = [
+            cfg.axis_thr.map(|c| c as usize).unwrap_or(auto_codes[0]),
+            cfg.axis_yaw.map(|c| c as usize).unwrap_or(auto_codes[1]),
+            cfg.axis_pit.map(|c| c as usize).unwrap_or(auto_codes[2]),
+            cfg.axis_rol.map(|c| c as usize).unwrap_or(auto_codes[3]),
+        ];
+        let mut baseline = [0.0f32; ABS_MAX + 1];
+        for i in 0..=ABS_MAX {
+            baseline[i] = gp.axes[i].raw_norm();
+        }
+        self.aux_wiz = Some(AuxWizard {
+            step: 0,
+            baseline,
+            stick_axes,
+            step_started: Instant::now(),
+            message: "Flip switch to ON, press btn, or Enter=Skip".to_string(),
+        });
+    }
+
+    /// Update 4-step stick calibration wizard.
     pub fn update_calibration(&mut self, cfg: &mut Config) -> bool {
         let Some(ref mut wiz) = self.calib else { return false };
         let Some(ref gp) = self.gamepad else {
@@ -246,7 +348,6 @@ impl InputManager {
             return false;
         };
 
-        // Brief settle period between steps so user can release stick
         if wiz.step_started.elapsed() < Duration::from_millis(450) {
             for i in 0..=ABS_MAX {
                 wiz.baseline[i] = gp.axes[i].raw_norm();
@@ -254,7 +355,6 @@ impl InputManager {
             return false;
         }
 
-        // Find the non-hat axis with the largest deflection from baseline
         let mut best_code: Option<usize> = None;
         let mut best_delta = 0.0f32;
         for code in 0..=ABS_MAX {
@@ -309,7 +409,105 @@ impl InputManager {
         false
     }
 
-    /// Compact live string of all active non-hat EV_ABS axes for diagnostics on Controller screen.
+    /// Update 3-step AUX switch/button binding wizard. Pass `skip=true` when user presses Enter to skip a step.
+    pub fn update_aux_wizard(&mut self, cfg: &mut Config, skip: bool) -> bool {
+        let Some(ref mut wiz) = self.aux_wiz else { return false };
+        let Some(ref gp) = self.gamepad else {
+            self.aux_wiz = None;
+            return false;
+        };
+
+        if skip {
+            match wiz.step {
+                0 => {
+                    cfg.aux_arm = AuxBinding::None;
+                    wiz.message = "ARM skipped (Auto-Arm)".to_string();
+                }
+                1 => {
+                    cfg.aux_mode = AuxBinding::None;
+                    wiz.message = "MODE switch skipped".to_string();
+                }
+                _ => {
+                    cfg.aux_turtle = AuxBinding::None;
+                    cfg.save();
+                    self.aux_wiz = None;
+                    return true;
+                }
+            }
+            wiz.step += 1;
+            wiz.step_started = Instant::now();
+            for i in 0..=ABS_MAX {
+                wiz.baseline[i] = gp.axes[i].raw_norm();
+            }
+            return false;
+        }
+
+        if wiz.step_started.elapsed() < Duration::from_millis(400) {
+            for i in 0..=ABS_MAX {
+                wiz.baseline[i] = gp.axes[i].raw_norm();
+            }
+            return false;
+        }
+
+        let mut detected: Option<AuxBinding> = None;
+
+        // 1. Check any EV_KEY button pressed on the controller
+        if let Some(btn) = gp.frame_btn_pressed {
+            detected = Some(AuxBinding::Button { code: btn });
+        }
+
+        // 2. Check any non-stick EV_ABS switch axis deflected by >= 0.45
+        if detected.is_none() {
+            let mut best_code: Option<usize> = None;
+            let mut best_delta = 0.0f32;
+            for code in 0..=ABS_MAX {
+                if !gp.axes[code].present || is_hat_axis(code) || wiz.stick_axes.contains(&code) {
+                    continue;
+                }
+                let delta = gp.axes[code].raw_norm() - wiz.baseline[code];
+                if delta.abs() > best_delta.abs() {
+                    best_delta = delta;
+                    best_code = Some(code);
+                }
+            }
+            if let Some(code) = best_code {
+                if best_delta.abs() >= 0.45 {
+                    let invert = best_delta < 0.0;
+                    detected = Some(AuxBinding::Axis {
+                        code: code as u16,
+                        invert,
+                    });
+                }
+            }
+        }
+
+        if let Some(binding) = detected {
+            match wiz.step {
+                0 => {
+                    cfg.aux_arm = binding;
+                    wiz.message = format!("ARM -> {}", binding.short_label());
+                }
+                1 => {
+                    cfg.aux_mode = binding;
+                    wiz.message = format!("MODE -> {}", binding.short_label());
+                }
+                _ => {
+                    cfg.aux_turtle = binding;
+                    cfg.save();
+                    self.aux_wiz = None;
+                    return true;
+                }
+            }
+            wiz.step += 1;
+            wiz.step_started = Instant::now();
+            for i in 0..=ABS_MAX {
+                wiz.baseline[i] = gp.axes[i].raw_norm();
+            }
+        }
+        false
+    }
+
+    /// Compact live string of active non-hat EV_ABS axes + last pressed button for Controller diagnostics.
     pub fn raw_axes_summary(&self) -> String {
         let Some(ref gp) = self.gamepad else {
             return "No evdev ABS axes".to_string();
@@ -324,6 +522,9 @@ impl InputManager {
                 }
             }
         }
+        if let Some(b) = gp.last_btn_seen {
+            parts.push(format!("B{b}"));
+        }
         if parts.is_empty() {
             "No ABS axes".to_string()
         } else {
@@ -335,7 +536,6 @@ impl InputManager {
     pub fn scan_devices(&mut self) {
         self.last_scan = Instant::now();
 
-        // 1. Open CardputerZero built-in keyboard if we don't have keyboards yet
         if self.keyboards.is_empty() {
             let cardputer_kb = "/dev/input/by-path/platform-3f804000.i2c-event";
             if Path::new(cardputer_kb).exists() {
@@ -345,7 +545,6 @@ impl InputManager {
             }
         }
 
-        // 2. Scan /dev/input/event* and score all candidate controllers
         let Ok(entries) = fs::read_dir("/dev/input") else { return };
         let mut paths: Vec<String> = entries
             .flatten()
@@ -465,7 +664,6 @@ impl InputManager {
                 }
             }
 
-            // Fallback: open any keyboard if CardputerZero's dedicated i2c-event path wasn't found
             if has_key && self.keyboards.is_empty() {
                 if lower.contains("keyboard") || lower.contains("keypad") || lower.contains("tca8418") {
                     self.keyboards.push((fd, path));
@@ -481,7 +679,6 @@ impl InputManager {
             self.candidate_count = candidates.len();
             let pick = self.device_skip_idx % candidates.len();
             let chosen = candidates.swap_remove(pick);
-            // Close all unchosen candidate fds
             for c in candidates {
                 unsafe { close(c.fd) };
             }
@@ -491,11 +688,9 @@ impl InputManager {
                 name: chosen.name,
                 kind: chosen.kind,
                 axes: chosen.axes,
-                btn_south: false,
-                btn_east: false,
-                btn_start: false,
-                btn_select: false,
-                btn_tr: false,
+                keys_down: [0u64; MAX_KEY_CODE / 64],
+                frame_btn_pressed: None,
+                last_btn_seen: None,
             });
         }
     }
@@ -506,17 +701,29 @@ impl InputManager {
         if fd >= 0 { Some(fd) } else { None }
     }
 
+    fn is_bound_button(cfg: &Config, code: u16) -> bool {
+        matches!(cfg.aux_arm, AuxBinding::Button { code: c } if c == code)
+            || matches!(cfg.aux_mode, AuxBinding::Button { code: c } if c == code)
+            || matches!(cfg.aux_turtle, AuxBinding::Button { code: c } if c == code)
+    }
+
     /// Poll all input devices; call once per frame.
     pub fn poll(&mut self, dt: f32, in_menu: bool, cfg: &Config) {
         self.pending = MenuActions::default();
+        self.kb_arm_toggle = false;
+        self.kb_mode_toggle = false;
+        self.kb_turtle_toggle = false;
 
         if self.gamepad.is_none() && self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan_devices();
         }
 
+        let wizard_active = self.calib.is_some() || self.aux_wiz.is_some();
+
         // 1. Poll gamepad / RC controller
         let mut disconnect = false;
         if let Some(ref mut gp) = self.gamepad {
+            gp.frame_btn_pressed = None;
             let mut ev = InputEvent::default();
             let ev_size = std::mem::size_of::<InputEvent>();
             loop {
@@ -533,38 +740,33 @@ impl InputManager {
                                     gp.axes[c].max = 32767;
                                 }
                             }
-                            if ev.code == ABS_HAT0Y {
-                                if ev.value < 0 { self.pending.up = true; }
-                                if ev.value > 0 { self.pending.down = true; }
-                            } else if ev.code == ABS_HAT0X {
-                                if ev.value < 0 { self.pending.left = true; }
-                                if ev.value > 0 { self.pending.right = true; }
+                            if in_menu && !wizard_active {
+                                if ev.code == ABS_HAT0Y {
+                                    if ev.value < 0 { self.pending.up = true; }
+                                    if ev.value > 0 { self.pending.down = true; }
+                                } else if ev.code == ABS_HAT0X {
+                                    if ev.value < 0 { self.pending.left = true; }
+                                    if ev.value > 0 { self.pending.right = true; }
+                                }
                             }
                         }
                         EV_KEY => {
                             let pressed = ev.value == 1;
                             let held = ev.value != 0;
-                            match ev.code {
-                                BTN_SOUTH | BTN_TRIGGER => {
-                                    gp.btn_south = held;
-                                    if pressed { self.pending.select = true; }
+                            gp.set_key(ev.code, held);
+                            if pressed {
+                                gp.frame_btn_pressed = Some(ev.code);
+                                gp.last_btn_seen = Some(ev.code);
+                            }
+                            // Only map generic menu/respawn shortcuts if button isn't bound to an AUX flight switch
+                            let skip_shortcut = wizard_active || (!in_menu && Self::is_bound_button(cfg, ev.code));
+                            if !skip_shortcut && pressed {
+                                match ev.code {
+                                    BTN_SOUTH | BTN_TRIGGER => if in_menu { self.pending.select = true; },
+                                    BTN_EAST | BTN_THUMB | BTN_START | BTN_MODE => self.pending.back = true,
+                                    BTN_SELECT | BTN_NORTH | BTN_TL => self.pending.respawn = true,
+                                    _ => {}
                                 }
-                                BTN_EAST | BTN_THUMB => {
-                                    gp.btn_east = held;
-                                    if pressed { self.pending.back = true; }
-                                }
-                                BTN_START | BTN_MODE => {
-                                    gp.btn_start = held;
-                                    if pressed { self.pending.back = true; }
-                                }
-                                BTN_SELECT | BTN_NORTH | BTN_TL => {
-                                    gp.btn_select = held;
-                                    if pressed { self.pending.respawn = true; }
-                                }
-                                BTN_TR => {
-                                    gp.btn_tr = held;
-                                }
-                                _ => {}
                             }
                         }
                         _ => {}
@@ -580,6 +782,7 @@ impl InputManager {
         if disconnect {
             self.gamepad = None;
             self.calib = None;
+            self.aux_wiz = None;
         }
 
         // 2. Poll keyboards
@@ -655,6 +858,15 @@ impl InputManager {
                 KEY_R => {
                     if pressed { self.pending.respawn = true; }
                 }
+                KEY_TAB => {
+                    if pressed && !in_menu { self.kb_arm_toggle = true; }
+                }
+                KEY_M => {
+                    if pressed && !in_menu { self.kb_mode_toggle = true; }
+                }
+                KEY_T => {
+                    if pressed && !in_menu { self.kb_turtle_toggle = true; }
+                }
                 KEY_F | KEY_SEMICOLON => {
                     if pressed && in_menu { self.pending.up = true; }
                 }
@@ -672,6 +884,9 @@ impl InputManager {
                         self.pending.calibrate = true;
                         if in_menu { self.pending.right = true; }
                     }
+                }
+                KEY_B => {
+                    if pressed { self.pending.bind_aux = true; }
                 }
                 KEY_N => {
                     if pressed { self.pending.next_device = true; }
@@ -695,8 +910,8 @@ impl InputManager {
             self.kb_throttle = (self.kb_throttle - 1.3 * dt).max(0.0);
         }
 
-        // Edge-triggered RIGHT-STICK ONLY menu navigation (never uses throttle, never spams!)
-        if in_menu && self.calib.is_none() && self.gamepad.is_some() {
+        // Edge-triggered RIGHT-STICK ONLY menu navigation
+        if in_menu && !wizard_active && self.gamepad.is_some() {
             let sticks = self.flight_sticks(cfg);
             if sticks.pitch.abs() < 0.35 {
                 self.stick_nav_latched_y = false;
@@ -729,12 +944,66 @@ impl InputManager {
         a
     }
 
+    /// Evaluate bound radio AUX switches/buttons + keyboard flight shortcuts.
+    pub fn aux_inputs(&self, cfg: &Config) -> AuxInputs {
+        let mut out = AuxInputs {
+            arm_toggle: self.kb_arm_toggle,
+            mode_toggle: self.kb_mode_toggle,
+            turtle_toggle: self.kb_turtle_toggle,
+            ..AuxInputs::default()
+        };
+
+        let Some(ref gp) = self.gamepad else {
+            return out;
+        };
+
+        let eval_axis = |code: u16, invert: bool| -> bool {
+            let c = (code as usize).min(ABS_MAX);
+            if !gp.axes[c].present {
+                return false;
+            }
+            let v = gp.axes[c].raw_norm();
+            if invert { v < -0.25 } else { v > 0.25 }
+        };
+
+        match cfg.aux_arm {
+            AuxBinding::Axis { code, invert } => out.arm_switch = Some(eval_axis(code, invert)),
+            AuxBinding::Button { code } => {
+                if gp.frame_btn_pressed == Some(code) {
+                    out.arm_toggle = true;
+                }
+            }
+            AuxBinding::None => {}
+        }
+
+        match cfg.aux_mode {
+            AuxBinding::Axis { code, invert } => out.mode_switch_angle = Some(eval_axis(code, invert)),
+            AuxBinding::Button { code } => {
+                if gp.frame_btn_pressed == Some(code) {
+                    out.mode_toggle = true;
+                }
+            }
+            AuxBinding::None => {}
+        }
+
+        match cfg.aux_turtle {
+            AuxBinding::Axis { code, invert } => out.turtle_switch = Some(eval_axis(code, invert)),
+            AuxBinding::Button { code } => {
+                if gp.frame_btn_pressed == Some(code) {
+                    out.turtle_toggle = true;
+                }
+            }
+            AuxBinding::None => {}
+        }
+
+        out
+    }
+
     /// Auto-resolve (thr, yaw, pit, rol) axis codes and default Y-inversions for a controller.
     fn resolve_auto_axes(gp: &GamepadDevice) -> ([usize; 4], [bool; 4]) {
         let has = |c: u16| gp.axes[c as usize].present;
 
         if gp.kind == ControllerKind::RcRadio {
-            // EdgeTX / OpenTX / ELRS AETR layout
             let rol = ABS_X as usize;
             let pit = ABS_Y as usize;
             let thr = if has(ABS_THROTTLE) { ABS_THROTTLE as usize } else { ABS_Z as usize };
@@ -748,15 +1017,13 @@ impl InputManager {
             return ([thr, yaw, pit, rol], [false, false, false, false]);
         }
 
-        // Standard Linux Gamepad: Left Stick = (X, Y), Right Stick = (RX, RY)
         if has(ABS_X) && has(ABS_Y) && has(ABS_RX) && has(ABS_RY) {
             return (
                 [ABS_Y as usize, ABS_X as usize, ABS_RY as usize, ABS_RX as usize],
-                [true, false, true, false], // Linux evdev Y axes are negative-up!
+                [true, false, true, false],
             );
         }
 
-        // Bluetooth HID / Xbox BLE / Android-mode Gamepad: Left = (X, Y), Right = (Z, RZ)
         if has(ABS_X) && has(ABS_Y) && has(ABS_Z) && has(ABS_RZ) {
             return (
                 [ABS_Y as usize, ABS_X as usize, ABS_RZ as usize, ABS_Z as usize],
@@ -764,7 +1031,6 @@ impl InputManager {
             );
         }
 
-        // Generic fallback: first 4 present non-hat EV_ABS axes
         let mut found = [0usize; 4];
         let mut count = 0usize;
         for c in 0..=ABS_MAX {
@@ -776,7 +1042,6 @@ impl InputManager {
                 }
             }
         }
-        // Assume (lx, ly, rx, ry) order
         ([found[1], found[0], found[3], found[2]], [true, false, true, false])
     }
 

@@ -1,7 +1,7 @@
 //! StickZero — Minimal native Rust 3D FPV quadcopter simulator for M5Stack CardputerZero.
 //!
 //! Designed for low-latency flight on CardputerZero's Raspberry Pi CM0 (Quad Cortex-A53 @ 1GHz)
-//! and 320x170 ST7789v3 LCD over Linux fbdev, with Bluetooth & USB-C controller support.
+//! and 320x170 ST7789v3 LCD over Linux fbdev, with USB-C & Bluetooth controller support.
 
 mod audio;
 mod config;
@@ -16,7 +16,7 @@ mod renderer;
 mod tracks;
 
 use audio::AudioEngine;
-use config::{BatteryPack, Config, RatesPreset, ThrottleMode, VisualTheme};
+use config::{AuxBinding, BatteryPack, Config, RatesPreset, ThrottleMode, VisualTheme};
 use display::{FbDisplay, SCREEN_H, SCREEN_W};
 use input::InputManager;
 use linux_sys::{signal, SIGINT, SIGTERM};
@@ -47,9 +47,10 @@ fn run_benchmark() {
     let mut cfg = Config::default();
     let mut renderer = Renderer::new();
     let track = &TRACKS[3]; // Bando (heaviest geometry)
-    let mut quad = QuadState::spawn(track);
+    let mut quad = QuadState::spawn(track, &cfg);
     quad.pos = Vec3::new(0.0, 5.0, 10.0);
     quad.vel = Vec3::new(0.0, 0.0, 18.0);
+    quad.on_ground = false;
     let sticks = StickInput { throttle: 0.52, yaw: 0.08, pitch: 0.12, roll: 0.05 };
 
     const FRAMES: usize = 600;
@@ -64,7 +65,7 @@ fn run_benchmark() {
     let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / (FRAMES as f64);
     let fps = 1000.0 / ms_per_frame;
     println!(
-        "StickZero benchmark ({} frames @ 320x170 RGB565 + 240Hz physics): {:.3} ms/frame ({:.0} theoretical FPS)",
+        "StickZero benchmark ({} frames @ 320x170 RGB565 Z-buffered + 240Hz physics): {:.3} ms/frame ({:.0} theoretical FPS)",
         FRAMES, ms_per_frame, fps
     );
 }
@@ -78,38 +79,47 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     renderer.render_main_menu(&cfg, 0, &input);
     png::save_rgb565_png(&dir.join("01-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 2. Summer Meadow Race Flight
+    // 2. Summer Meadow Race Flight (with Analog FX + Betaflight OSD)
     cfg.theme = VisualTheme::Summer;
     cfg.track_index = 0;
+    cfg.game_mode = config::GameMode::Race;
     let track = &TRACKS[0];
-    let mut quad = QuadState::spawn(track);
+    let mut quad = QuadState::spawn(track, &cfg);
     quad.pos = Vec3::new(-1.2, 2.4, 8.0);
-    quad.vel = Vec3::new(1.0, 0.2, 19.5);
+    quad.vel = Vec3::new(1.0, 0.2, 16.5);
+    quad.on_ground = false;
     quad.rot = Quat::from_axis_angle(Vec3::FORWARD, -0.18).mul(Quat::from_axis_angle(Vec3::RIGHT, 0.12));
     quad.lap_time = 12.48;
+    quad.flight_time = 44.0;
+    quad.mah_used = 128.0;
+    quad.throttle_pct = 54;
     quad.cell_voltage = 3.94;
-    let sticks = StickInput { throttle: 0.62, yaw: 0.08, pitch: 0.24, roll: 0.18 };
+    let sticks = StickInput { throttle: 0.54, yaw: 0.08, pitch: 0.24, roll: 0.18 };
     renderer.render_flight(&quad, &cfg, track, sticks, 60, 0.9);
     png::save_rgb565_png(&dir.join("02-meadow-summer.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 3. Night Bando Freestyle
+    // 3. Night Bando Freestyle (Z-buffered concrete ruin + high-contrast night horizon)
     cfg.theme = VisualTheme::Night;
     cfg.track_index = 3;
+    cfg.game_mode = config::GameMode::Freestyle;
     let bando = &TRACKS[3];
-    let mut q2 = QuadState::spawn(bando);
+    let mut q2 = QuadState::spawn(bando, &cfg);
     q2.pos = Vec3::new(0.0, 6.5, 8.0);
-    q2.vel = Vec3::new(0.5, 1.5, 22.0);
+    q2.vel = Vec3::new(0.5, 1.5, 18.0);
+    q2.on_ground = false;
     q2.rot = Quat::from_axis_angle(Vec3::FORWARD, 0.28);
     q2.score = 1450;
+    q2.flight_time = 82.0;
+    q2.mah_used = 245.0;
+    q2.throttle_pct = 62;
     q2.combo_text = "POWER FLIP +250";
     q2.combo_timer = 1.0;
     q2.cell_voltage = 3.78;
-    cfg.game_mode = config::GameMode::Freestyle;
     renderer.render_flight(&q2, &cfg, bando, sticks, 60, 1.1);
     png::save_rgb565_png(&dir.join("03-bando-night.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 4. Controller Monitor screen
-    cfg.throttle_mode = ThrottleMode::GamepadCenter;
+    // 4. Controller Monitor & AUX Switch Binder screen
+    cfg.throttle_mode = ThrottleMode::RcFull;
     renderer.render_controller_screen(&cfg, &input);
     png::save_rgb565_png(&dir.join("04-controller.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
@@ -154,7 +164,7 @@ fn main() {
     let mut menu_idx: usize = 0;
     let mut pause_idx: usize = 0;
     let mut settings_idx: usize = 0;
-    let mut quad = QuadState::spawn(&TRACKS[cfg.track_index]);
+    let mut quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
 
     let target_frame = Duration::from_micros(16_667); // 60 Hz target
     let mut last_frame = Instant::now();
@@ -170,7 +180,7 @@ fn main() {
         last_frame = frame_start;
 
         let in_menu = screen != AppScreen::Flying;
-        audio.set_flying(!in_menu, cfg.analog_filter);
+        audio.set_flying(!in_menu && quad.armed, cfg.analog_filter);
         input.poll(dt, in_menu, &cfg);
         let act = input.take_menu_actions();
 
@@ -185,9 +195,11 @@ fn main() {
                 if act.left || act.right || act.select {
                     match menu_idx {
                         0 if act.select => {
-                            quad = QuadState::spawn(&TRACKS[cfg.track_index]);
+                            quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
                             phys_accum = 0.0;
-                            audio.trigger_arm();
+                            if quad.armed {
+                                audio.trigger_arm();
+                            }
                             screen = AppScreen::Flying;
                         }
                         1 => {
@@ -230,10 +242,17 @@ fn main() {
                 } else {
                     let track = &TRACKS[cfg.track_index];
                     if act.respawn {
-                        quad.respawn_at_start(track);
-                        audio.trigger_arm();
+                        quad.respawn_at_start(track, &cfg);
+                        if quad.armed {
+                            audio.trigger_arm();
+                        }
                     }
                     let sticks = input.flight_sticks(&cfg);
+                    let aux = input.aux_inputs(&cfg);
+                    if quad.apply_aux(aux, sticks, &mut cfg) {
+                        audio.trigger_arm();
+                    }
+
                     let prev_score = quad.score;
                     let prev_hit = quad.hit_flash;
                     phys_accum += dt;
@@ -247,7 +266,7 @@ fn main() {
                     if quad.hit_flash > prev_hit + 0.10 {
                         audio.trigger_hit();
                     }
-                    let low_batt = cfg.battery_pack != BatteryPack::Off && quad.cell_voltage < 3.45;
+                    let low_batt = quad.armed && cfg.battery_pack != BatteryPack::Off && quad.cell_voltage < 3.45;
                     audio.update_telemetry(
                         quad.motor_thr,
                         quad.vel.len(),
@@ -273,8 +292,10 @@ fn main() {
                         match pause_idx {
                             0 => screen = AppScreen::Flying,
                             1 => {
-                                quad.respawn_at_start(track);
-                                audio.trigger_arm();
+                                quad.respawn_at_start(track, &cfg);
+                                if quad.armed {
+                                    audio.trigger_arm();
+                                }
                                 screen = AppScreen::Flying;
                             }
                             2 => {
@@ -292,7 +313,7 @@ fn main() {
                 renderer.render_pause_menu(pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 16;
+                const NUM_SETTINGS: usize = 17;
                 if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
@@ -352,10 +373,11 @@ fn main() {
                                 };
                             }
                             11 => cfg.analog_filter = !cfg.analog_filter,
-                            12 => cfg.detail_high = !cfg.detail_high,
-                            13 => cfg.sky_detail = !cfg.sky_detail,
-                            14 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            15 => {
+                            12 => cfg.debug_osd = !cfg.debug_osd,
+                            13 => cfg.detail_high = !cfg.detail_high,
+                            14 => cfg.sky_detail = !cfg.sky_detail,
+                            15 => cfg.stick_mode = cfg.stick_mode.toggle(),
+                            16 => {
                                 if act.left {
                                     cfg.throttle_mode = cfg.throttle_mode.toggle();
                                 } else {
@@ -376,11 +398,19 @@ fn main() {
                     } else {
                         input.update_calibration(&mut cfg);
                     }
+                } else if input.aux_wiz.is_some() {
+                    if act.back {
+                        input.aux_wiz = None;
+                    } else {
+                        input.update_aux_wizard(&mut cfg, act.select);
+                    }
                 } else if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
                 } else if act.calibrate {
                     input.start_calibration();
+                } else if act.bind_aux {
+                    input.start_aux_wizard(&cfg);
                 } else if act.next_device {
                     input.cycle_device();
                 } else if act.select || act.left || act.right {
@@ -395,6 +425,9 @@ fn main() {
                     cfg.invert_yaw = false;
                     cfg.invert_pitch = false;
                     cfg.invert_roll = false;
+                    cfg.aux_arm = AuxBinding::None;
+                    cfg.aux_mode = AuxBinding::None;
+                    cfg.aux_turtle = AuxBinding::None;
                     cfg.save();
                     input.scan_devices();
                 }

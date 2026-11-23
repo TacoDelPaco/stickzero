@@ -1,6 +1,7 @@
 //! Configuration, BetaFPV whoop & quad presets (Air75 II, Meteor75 Pro II),
 //! Lava II 580mAh / 680mAh battery packs with real weight/TWR physics,
-//! custom Betaflight Actual rates (default 100/480/0.20), prop wash, and analog FX.
+//! custom Betaflight Actual rates (default 100/480/0.20), prop wash,
+//! radio AUX switch/button bindings (Arm, Flight Mode, Turtle Mode), and OSD/graphics settings.
 
 use std::fs;
 use std::path::PathBuf;
@@ -27,6 +28,17 @@ impl QuadClass {
         }
     }
 
+    pub fn craft_name(self) -> &'static str {
+        match self {
+            Self::Air75II => "AIR75 II",
+            Self::Meteor75ProII => "METEOR75",
+            Self::Whoop65 => "WHOOP65",
+            Self::Toothpick3 => "TPICK 3",
+            Self::Freestyle5 => "FREE 5",
+            Self::Racer5 => "RACER 5",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Air75II => Self::Meteor75ProII,
@@ -40,12 +52,12 @@ impl QuadClass {
 
     pub fn params(self) -> QuadParams {
         match self {
-            // BetaFPV Air75 II Freestyle 75mm (ultra-light ~21g dry, 40mm props, realistic 1S ~3.1:1 TWR)
+            // BetaFPV Air75 II Freestyle 75mm (ultra-light ~21g dry, 40mm props, realistic 1S ~3.0:1 TWR)
             Self::Air75II => QuadParams {
-                max_accel: 31.0,
-                drag: 0.032,
+                max_accel: 30.0,
+                drag: 0.030,
                 motor_tau: 0.015,
-                idle_accel: 0.9,
+                idle_accel: 0.7,
                 dry_mass_g: 21.0,
                 ref_batt_g: 13.5,
                 mah: 450.0,
@@ -53,50 +65,50 @@ impl QuadClass {
             },
             // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, heavier carry & momentum)
             Self::Meteor75ProII => QuadParams {
-                max_accel: 28.5,
-                drag: 0.028,
+                max_accel: 27.5,
+                drag: 0.027,
                 motor_tau: 0.017,
-                idle_accel: 0.9,
+                idle_accel: 0.7,
                 dry_mass_g: 31.0,
                 ref_batt_g: 13.5,
                 mah: 550.0,
                 full_amp: 17.5,
             },
             Self::Whoop65 => QuadParams {
-                max_accel: 25.0,
-                drag: 0.042,
+                max_accel: 24.5,
+                drag: 0.040,
                 motor_tau: 0.022,
-                idle_accel: 0.8,
+                idle_accel: 0.6,
                 dry_mass_g: 18.0,
                 ref_batt_g: 8.5,
                 mah: 300.0,
                 full_amp: 12.0,
             },
             Self::Toothpick3 => QuadParams {
-                max_accel: 54.0,
-                drag: 0.048,
+                max_accel: 50.0,
+                drag: 0.042,
                 motor_tau: 0.015,
-                idle_accel: 1.8,
+                idle_accel: 1.4,
                 dry_mass_g: 68.0,
                 ref_batt_g: 36.0,
                 mah: 450.0,
                 full_amp: 28.0,
             },
             Self::Freestyle5 => QuadParams {
-                max_accel: 62.0,
-                drag: 0.040,
+                max_accel: 60.0,
+                drag: 0.036,
                 motor_tau: 0.018,
-                idle_accel: 2.0,
+                idle_accel: 1.8,
                 dry_mass_g: 410.0,
                 ref_batt_g: 220.0,
                 mah: 1300.0,
                 full_amp: 78.0,
             },
             Self::Racer5 => QuadParams {
-                max_accel: 76.0,
-                drag: 0.036,
+                max_accel: 74.0,
+                drag: 0.032,
                 motor_tau: 0.014,
-                idle_accel: 2.2,
+                idle_accel: 2.0,
                 dry_mass_g: 320.0,
                 ref_batt_g: 210.0,
                 mah: 1300.0,
@@ -148,7 +160,7 @@ impl BatteryPack {
     /// Returns (capacity_mah, mass_g, sag_factor) where lower sag_factor = higher C-rating.
     pub fn specs(self, quad: &QuadParams) -> (f32, f32, f32) {
         match self {
-            // BetaFPV LAVA II 1S 580mAh folded cell (~13.5g, high C-rating, very low sag)
+            // BetaFPV LAVA II 1S 580mAh folded cell (~13.5g, high C-rating, low sag)
             Self::LavaII580 => (580.0, 13.5, 0.24),
             // BetaFPV LAVA II 1S 680mAh folded cell (~16.2g, longer flight, slightly heavier)
             Self::LavaII680 => (680.0, 16.2, 0.22),
@@ -311,6 +323,55 @@ impl ThrottleMode {
     }
 }
 
+/// Binding for a radio controller AUX switch (EV_ABS axis) or button (EV_KEY code).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AuxBinding {
+    None,
+    /// Switch on an EV_ABS axis (e.g., EdgeTX CH5..CH8). Active when normalized value > 0.35 (or < -0.35 if inverted).
+    Axis { code: u16, invert: bool },
+    /// Momentary/latching button on an EV_KEY code (EdgeTX HID button or gamepad button).
+    Button { code: u16 },
+}
+
+impl AuxBinding {
+    pub fn short_label(self) -> String {
+        match self {
+            Self::None => "-".to_string(),
+            Self::Axis { code, invert } => {
+                if invert { format!("A{code}-") } else { format!("A{code}+") }
+            }
+            Self::Button { code } => format!("B{code}"),
+        }
+    }
+
+    pub fn serialize(self) -> String {
+        match self {
+            Self::None => "none".to_string(),
+            Self::Axis { code, invert } => format!("axis:{code}:{}", invert as u8),
+            Self::Button { code } => format!("btn:{code}"),
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        let mut parts = s.split(':');
+        match parts.next() {
+            Some("axis") => {
+                if let Some(Ok(code)) = parts.next().map(|x| x.parse::<u16>()) {
+                    let invert = parts.next() == Some("1");
+                    return Self::Axis { code, invert };
+                }
+            }
+            Some("btn") => {
+                if let Some(Ok(code)) = parts.next().map(|x| x.parse::<u16>()) {
+                    return Self::Button { code };
+                }
+            }
+            _ => {}
+        }
+        Self::None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub quad: QuadClass,
@@ -326,11 +387,12 @@ pub struct Config {
     pub rate_expo: u8,
     pub camera_tilt_deg: u8,
     pub theme: VisualTheme,
-    /// Graphics settings
+    /// Graphics & OSD settings
     pub detail_high: bool,
     pub sky_detail: bool,
     pub analog_filter: bool,
     pub sound_on: bool,
+    pub debug_osd: bool,
     pub fov_deg: u8,
     pub game_mode: GameMode,
     pub track_index: usize,
@@ -344,6 +406,10 @@ pub struct Config {
     pub axis_yaw: Option<u16>,
     pub axis_pit: Option<u16>,
     pub axis_rol: Option<u16>,
+    /// Radio AUX switch / button bindings
+    pub aux_arm: AuxBinding,
+    pub aux_mode: AuxBinding,
+    pub aux_turtle: AuxBinding,
     pub show_sticks: bool,
     pub best_laps_ms: [u32; 4],
 }
@@ -365,6 +431,7 @@ impl Default for Config {
             sky_detail: true,
             analog_filter: true,
             sound_on: true,
+            debug_osd: false,
             fov_deg: 90,
             game_mode: GameMode::Freestyle,
             track_index: 0,
@@ -378,6 +445,9 @@ impl Default for Config {
             axis_yaw: None,
             axis_pit: None,
             axis_rol: None,
+            aux_arm: AuxBinding::None,
+            aux_mode: AuxBinding::None,
+            aux_turtle: AuxBinding::None,
             show_sticks: true,
             best_laps_ms: [0; 4],
         }
@@ -456,6 +526,7 @@ impl Config {
                 "sky_detail" => cfg.sky_detail = v != "0",
                 "analog_filter" => cfg.analog_filter = v != "0",
                 "sound_on" => cfg.sound_on = v != "0",
+                "debug_osd" => cfg.debug_osd = v == "1",
                 "fov_deg" => if let Ok(f) = v.parse::<u8>() { cfg.fov_deg = f.clamp(70, 115); },
                 "game_mode" => cfg.game_mode = if v == "race" { GameMode::Race } else { GameMode::Freestyle },
                 "track" => if let Ok(i) = v.parse::<usize>() { cfg.track_index = i.min(3); },
@@ -469,6 +540,9 @@ impl Config {
                 "axis_yaw" => cfg.axis_yaw = v.parse::<u16>().ok(),
                 "axis_pit" => cfg.axis_pit = v.parse::<u16>().ok(),
                 "axis_rol" => cfg.axis_rol = v.parse::<u16>().ok(),
+                "aux_arm" => cfg.aux_arm = AuxBinding::parse(v),
+                "aux_mode" => cfg.aux_mode = AuxBinding::parse(v),
+                "aux_turtle" => cfg.aux_turtle = AuxBinding::parse(v),
                 "show_sticks" => cfg.show_sticks = v != "0",
                 "best0" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[0] = ms; },
                 "best1" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[1] = ms; },
@@ -529,7 +603,7 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
             self.prop_wash as u8,
             self.rate_center,
             self.rate_max,
@@ -539,6 +613,7 @@ impl Config {
             self.sky_detail as u8,
             self.analog_filter as u8,
             self.sound_on as u8,
+            self.debug_osd as u8,
             self.fov_deg,
             self.track_index,
             self.invert_pitch as u8,
@@ -549,6 +624,9 @@ impl Config {
             fmt_opt(self.axis_yaw),
             fmt_opt(self.axis_pit),
             fmt_opt(self.axis_rol),
+            self.aux_arm.serialize(),
+            self.aux_mode.serialize(),
+            self.aux_turtle.serialize(),
             self.show_sticks as u8,
             self.best_laps_ms[0],
             self.best_laps_ms[1],
