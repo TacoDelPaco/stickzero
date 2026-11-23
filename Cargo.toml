@@ -1,0 +1,13 @@
+[package]
+name = "stickzero"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal native Rust 3D FPV quadcopter simulator for M5Stack CardputerZero"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
