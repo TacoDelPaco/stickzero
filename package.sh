@@ -43,11 +43,12 @@ Version: ${VERSION}
 Section: games
 Priority: optional
 Architecture: ${ARCH}
-Maintainer: StickZero Contributors
+Maintainer: omghax.base.eth <262865+TacoDelPaco@users.noreply.github.com>
+Homepage: https://github.com/TacoDelPaco/stickzero
 Description: Minimal native Rust 3D FPV quadcopter simulator for CardputerZero
- Ultra-lightweight 3D FPV drone simulator inspired by StickTime-Pi, written in
+ Ultra-lightweight 3D FPV tinywhoop simulator inspired by StickTime-Pi, written in
  pure Rust with zero external dependencies. Renders directly to CardputerZero's
- 320x170 ST7789v3 RGB565 framebuffer and supports Bluetooth and USB-C controllers.
+ 320x170 ST7789v3 RGB565 framebuffer and supports USB-C and Bluetooth controllers.
 EOF
 
 OUT_DEB="dist/${PKG_NAME}_${VERSION}_${ARCH}.deb"

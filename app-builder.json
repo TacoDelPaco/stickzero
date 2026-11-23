@@ -1,0 +1,34 @@
+{
+  "app_name": "StickZero",
+  "package_name": "stickzero",
+  "version": "0.1.0",
+  "description": "Minimal native Rust 3D FPV quadcopter simulator for CardputerZero",
+
+  "store": {
+    "summary": "Minimal native Rust 3D FPV tinywhoop simulator with USB-C & BT controller support.",
+    "description": "StickZero is a lightweight, zero-dependency 3D FPV quadcopter simulator written in pure Rust for the M5Stack CardputerZero. Inspired by StickTime-Pi, it renders directly to the 320x170 ST7789v3 RGB565 display at 60 FPS with 240 Hz 6-DOF quaternion physics. Features BetaFPV Air75 II (75mm) and Meteor75 Pro II (1S 75mm) presets, Lava II 580mAh/680mAh battery weight & sag physics, custom Betaflight Actual rates, stock prop wash, toggleable NTSC/RF Analog FX, real-time synthesized tinywhoop audio, 4 tracks (Meadow Loop, Figure 8, Dive Tower, Bando), and a 4-step USB-C/Bluetooth controller calibration wizard.",
+    "categories": ["Games"],
+    "screenshots": [
+      "screenshots/01-main-menu.png",
+      "screenshots/02-meadow-summer.png",
+      "screenshots/03-bando-night.png",
+      "screenshots/04-controller.png"
+    ],
+    "icon": "assets/stickzero_100.png",
+    "license": "MIT",
+    "source_repo": "https://github.com/TacoDelPaco/stickzero",
+    "author": {
+      "github": "TacoDelPaco",
+      "display_name": "omghax.base.eth"
+    },
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": false,
+      "additional_hardware": false,
+      "background_service": false,
+      "external_display": false
+    }
+  }
+}
