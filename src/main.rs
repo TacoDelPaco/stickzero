@@ -113,57 +113,8 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     renderer.render_controller_screen(&cfg, &input);
     png::save_rgb565_png(&dir.join("04-controller.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // Also generate a clean 256x256 app icon PNG!
-    generate_app_icon(&dir.join("stickzero-icon.png"))?;
-
-    println!("Saved 4 CardputerZero 320x170 screenshots + 256x256 icon to {}", dir.display());
+    println!("Saved 4 CardputerZero 320x170 screenshots to {}", dir.display());
     Ok(())
-}
-
-fn generate_app_icon(path: &Path) -> Result<(), String> {
-    const S: usize = 256;
-    let mut buf = vec![0u16; S * S];
-    // Deep FPV cockpit gradient background
-    for y in 0..S {
-        let t = y as f32 / S as f32;
-        let r = (14.0 + 18.0 * t) as u8;
-        let g = (24.0 + 36.0 * t) as u8;
-        let b = (48.0 + 52.0 * (1.0 - t)) as u8;
-        let c = renderer::rgb565(r, g, b);
-        for x in 0..S {
-            buf[y * S + x] = c;
-        }
-    }
-    // Draw glowing FPV racing gate in center
-    let gate_col = renderer::rgb565(255, 125, 25);
-    let gate_hi = renderer::rgb565(255, 225, 70);
-    let fill_box = |buf: &mut [u16], x0: usize, y0: usize, w: usize, h: usize, c: u16| {
-        for y in y0..(y0 + h).min(S) {
-            for x in x0..(x0 + w).min(S) {
-                buf[y * S + x] = c;
-            }
-        }
-    };
-    // Outer gate arch
-    fill_box(&mut buf, 42, 48, 22, 160, gate_col);
-    fill_box(&mut buf, 192, 48, 22, 160, gate_col);
-    fill_box(&mut buf, 42, 48, 172, 24, gate_hi);
-    // Perspective ground horizon line
-    fill_box(&mut buf, 0, 176, S, 4, renderer::rgb565(65, 220, 145));
-    // Stylized quadcopter silhouette in gate center
-    let q_col = renderer::rgb565(90, 245, 255);
-    fill_box(&mut buf, 114, 118, 28, 20, q_col); // body
-    fill_box(&mut buf, 86, 102, 28, 8, q_col);   // prop FL
-    fill_box(&mut buf, 142, 102, 28, 8, q_col);  // prop FR
-    fill_box(&mut buf, 86, 146, 28, 8, q_col);   // prop RL
-    fill_box(&mut buf, 142, 146, 28, 8, q_col);  // prop RR
-    // Arms
-    fill_box(&mut buf, 100, 110, 18, 12, renderer::rgb565(220, 235, 255));
-    fill_box(&mut buf, 138, 110, 18, 12, renderer::rgb565(220, 235, 255));
-    fill_box(&mut buf, 100, 134, 18, 12, renderer::rgb565(220, 235, 255));
-    fill_box(&mut buf, 138, 134, 18, 12, renderer::rgb565(220, 235, 255));
-
-    png::save_rgb565_png(path, S, S, &buf)
 }
 
 fn main() {
