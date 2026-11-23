@@ -40,33 +40,33 @@ impl QuadClass {
 
     pub fn params(self) -> QuadParams {
         match self {
-            // BetaFPV Air75 II Freestyle 75mm (ultra-light ~21g dry, 40mm props, nimble 1S)
+            // BetaFPV Air75 II Freestyle 75mm (ultra-light ~21g dry, 40mm props, realistic 1S ~3.1:1 TWR)
             Self::Air75II => QuadParams {
-                max_accel: 43.0,
-                drag: 0.056,
-                motor_tau: 0.014,
-                idle_accel: 1.6,
+                max_accel: 31.0,
+                drag: 0.032,
+                motor_tau: 0.015,
+                idle_accel: 0.9,
                 dry_mass_g: 21.0,
                 ref_batt_g: 13.5,
                 mah: 450.0,
                 full_amp: 15.5,
             },
-            // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, more throw & stability)
+            // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, heavier carry & momentum)
             Self::Meteor75ProII => QuadParams {
-                max_accel: 40.5,
-                drag: 0.051,
-                motor_tau: 0.016,
-                idle_accel: 1.7,
+                max_accel: 28.5,
+                drag: 0.028,
+                motor_tau: 0.017,
+                idle_accel: 0.9,
                 dry_mass_g: 31.0,
                 ref_batt_g: 13.5,
                 mah: 550.0,
                 full_amp: 17.5,
             },
             Self::Whoop65 => QuadParams {
-                max_accel: 34.0,
-                drag: 0.075,
+                max_accel: 25.0,
+                drag: 0.042,
                 motor_tau: 0.022,
-                idle_accel: 1.5,
+                idle_accel: 0.8,
                 dry_mass_g: 18.0,
                 ref_batt_g: 8.5,
                 mah: 300.0,

@@ -167,55 +167,60 @@ impl QuadState {
         let (right, up, forward) = self.rot.basis();
         self.inverted = up.y < 0.20;
 
-        // Turtle mode: if inverted or stuck on side near the ground, push roll or pitch to flip upright!
-        let near_ground = self.on_ground || self.pos.y <= QUAD_RADIUS + 0.35;
-        if near_ground
-            && up.y < 0.35
-            && self.turtle_cooldown <= 0.0
-            && (input.roll.abs() > 0.55 || input.pitch.abs() > 0.55)
-        {
-            let yaw = forward.x.atan2(forward.z);
-            self.rot = Quat::from_axis_angle(Vec3::UP, yaw);
-            self.pos.y = QUAD_RADIUS + 0.25;
-            self.vel = Vec3::new(0.0, 1.8, 0.0);
-            self.omega = Vec3::ZERO;
-            self.inverted = false;
-            self.turtle_cooldown = 0.55;
-            self.combo_text = "TURTLE FLIP";
-            self.combo_timer = 1.2;
-        }
+        // Turtle mode: physically rock & flip the quad over in real time (~320 deg/s) instead of teleporting!
+        let near_ground = self.on_ground || self.pos.y <= QUAD_RADIUS + 0.30;
+        let turtle_active = near_ground
+            && up.y < 0.45
+            && (input.roll.abs() > 0.45 || input.pitch.abs() > 0.45);
 
         // 4. Target body angular rates (rad/s)
         let (center_sens, max_rate, expo) = cfg.actual_rates();
-        let target_omega = match cfg.flight_mode {
-            FlightMode::Acro => {
-                let pitch_rate = Self::betaflight_actual(input.pitch, center_sens, max_rate, expo);
-                let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.82, expo);
-                let roll_rate = -Self::betaflight_actual(input.roll, center_sens, max_rate, expo);
-                Vec3::new(pitch_rate, yaw_rate, roll_rate)
+        let target_omega = if turtle_active {
+            if self.turtle_cooldown <= 0.0 {
+                self.combo_text = "TURTLE FLIP";
+                self.combo_timer = 0.8;
+                self.turtle_cooldown = 1.0;
             }
-            FlightMode::Angle => {
-                let max_tilt = 45.0_f32.to_radians();
-                let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
-                let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
+            // Controlled physical flip rate (~5.6 rad/s = ~320 deg/s) with a small prop-hop off the floor
+            if self.on_ground && self.vel.y < 0.7 {
+                self.vel.y = 0.85;
+            }
+            let r_cmd = if input.roll.abs() > 0.45 { -input.roll.signum() * 5.6 } else { 0.0 };
+            let p_cmd = if input.pitch.abs() > 0.45 { input.pitch.signum() * 5.6 } else { 0.0 };
+            Vec3::new(p_cmd, 0.0, r_cmd)
+        } else {
+            match cfg.flight_mode {
+                FlightMode::Acro => {
+                    let pitch_rate = Self::betaflight_actual(input.pitch, center_sens, max_rate, expo);
+                    let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.82, expo);
+                    let roll_rate = -Self::betaflight_actual(input.roll, center_sens, max_rate, expo);
+                    Vec3::new(pitch_rate, yaw_rate, roll_rate)
+                }
+                FlightMode::Angle => {
+                    let max_tilt = 45.0_f32.to_radians();
+                    let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
+                    let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
 
-                let cur_pitch = (-forward.y).asin();
-                let cur_roll = (-right.y).asin();
-                let pitch_err = desired_pitch - cur_pitch;
-                let roll_err = desired_roll - cur_roll;
+                    let cur_pitch = (-forward.y).asin();
+                    let cur_roll = (-right.y).asin();
+                    let pitch_err = desired_pitch - cur_pitch;
+                    let roll_err = desired_roll - cur_roll;
 
-                let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.7, expo);
-                Vec3::new(
-                    clampf(pitch_err * 7.5, -6.0, 6.0),
-                    yaw_rate,
-                    clampf(-roll_err * 7.5, -6.0, 6.0),
-                )
+                    let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.7, expo);
+                    Vec3::new(
+                        clampf(pitch_err * 7.5, -6.0, 6.0),
+                        yaw_rate,
+                        clampf(-roll_err * 7.5, -6.0, 6.0),
+                    )
+                }
             }
         };
 
         // Fast PID-like rotational tracking (slightly heavier pack = slightly softer snap)
-        let rot_resp = if self.on_ground && self.motor_thr < 0.08 {
-            2.0
+        let rot_resp = if turtle_active {
+            16.0
+        } else if self.on_ground && self.motor_thr < 0.12 {
+            1.5
         } else {
             24.0 / mass_ratio.sqrt()
         };
@@ -240,58 +245,74 @@ impl QuadState {
         }
 
         // Integrate quaternion
-        if !self.on_ground || self.motor_thr > 0.08 {
+        if !self.on_ground || self.motor_thr > 0.08 || turtle_active {
             self.rot = self.rot.integrate_body_omega(self.omega, dt);
         }
 
         // 5. Forces: Thrust (scaled by battery mass ratio & sag) + Ground Effect + Drag + Gravity
         let (_, up_now, _) = self.rot.basis();
-        let thr_curve = self.motor_thr.powf(1.35);
+        let thr_curve = self.motor_thr.powf(1.45);
         let sag_factor = if batt_on {
-            (self.cell_voltage / 4.0).clamp(0.72, 1.06)
+            (self.cell_voltage / 4.0).clamp(0.72, 1.05)
         } else {
             1.0
         };
-        let ge = if self.pos.y < 1.4 && up_now.y > 0.2 {
-            1.0 + 0.16 * (1.0 - self.pos.y / 1.4)
+        let ge = if self.pos.y < 1.2 && up_now.y > 0.2 {
+            1.0 + 0.14 * (1.0 - self.pos.y / 1.2)
         } else {
             1.0
         };
-        let thrust_mag = ((params.idle_accel * self.motor_thr.signum()
-            + params.max_accel * thr_curve)
-            / mass_ratio)
-            * sag_factor
-            * ge
-            * wash_thrust_loss;
+        let thrust_mag = if turtle_active {
+            0.0
+        } else {
+            ((params.idle_accel * self.motor_thr.signum()
+                + params.max_accel * thr_curve)
+                / mass_ratio)
+                * sag_factor
+                * ge
+                * wash_thrust_loss
+        };
 
         let thrust_accel = up_now.scale(thrust_mag);
         let speed = self.vel.len();
-        let drag_accel = self.vel.scale(-(params.drag / mass_ratio) * speed - 0.12);
+        let drag_accel = self.vel.scale(-(params.drag / mass_ratio) * speed - 0.06);
         let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);
 
         let total_accel = thrust_accel.add(drag_accel).add(gravity_accel);
         self.vel = self.vel.add(total_accel.scale(dt));
         self.pos = self.pos.add(self.vel.scale(dt));
 
-        // 6. Ground collision
+        // 6. Ground collision + flat skids/canopy leveling
         if self.pos.y <= QUAD_RADIUS {
             self.pos.y = QUAD_RADIUS;
             if self.vel.y < -6.0 {
                 self.hit_flash = 0.25;
             }
             if self.vel.y < 0.0 {
-                self.vel.y = -self.vel.y * 0.15;
-                if self.vel.y.abs() < 0.4 {
+                self.vel.y = -self.vel.y * 0.12;
+                if self.vel.y.abs() < 0.35 {
                     self.vel.y = 0.0;
                 }
             }
             // Ground friction
-            self.vel.x *= 1.0 - (6.0 * dt).min(0.9);
-            self.vel.z *= 1.0 - (6.0 * dt).min(0.9);
+            self.vel.x *= 1.0 - (7.0 * dt).min(0.9);
+            self.vel.z *= 1.0 - (7.0 * dt).min(0.9);
             self.on_ground = true;
             self.flip_accum = 0.0;
             self.roll_accum = 0.0;
             self.inverted_time = 0.0;
+
+            // Naturally settle flat onto skids (if upright) or canopy (if upside down) when on ground
+            if !turtle_active && self.motor_thr < 0.22 {
+                let (r_g, u_g, f_g) = self.rot.basis();
+                let target_up = if u_g.y >= 0.0 { 1.0f32 } else { -1.0f32 };
+                // Body-frame correction torque to align local +Y with +world_up (or -world_up)
+                let cur_pitch = (-f_g.y * target_up).asin();
+                let cur_roll = (-r_g.y * target_up).asin();
+                let level_omega = Vec3::new(-cur_pitch * 12.0, 0.0, cur_roll * 12.0);
+                self.rot = self.rot.integrate_body_omega(level_omega, dt);
+                self.omega = self.omega.scale(1.0 - (14.0 * dt).min(0.9));
+            }
         } else {
             self.on_ground = false;
         }

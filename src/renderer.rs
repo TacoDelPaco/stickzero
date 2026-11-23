@@ -53,9 +53,9 @@ fn palette(theme: VisualTheme) -> ThemePalette {
         VisualTheme::Summer => ThemePalette {
             sky_top: rgb565(32, 108, 210),
             sky_horizon: rgb565(155, 206, 240),
-            ground_near: rgb565(56, 122, 54),
-            ground_far: rgb565(118, 162, 122),
-            grid_line: rgb565(42, 98, 42),
+            ground_near: rgb565(48, 108, 48),
+            ground_far: rgb565(102, 146, 106),
+            grid_line: rgb565(115, 195, 105),
             active_gate: rgb565(255, 110, 20),
             active_gate_hi: rgb565(255, 220, 60),
             idle_gate: rgb565(180, 190, 205),
@@ -64,9 +64,9 @@ fn palette(theme: VisualTheme) -> ThemePalette {
         VisualTheme::Evening => ThemePalette {
             sky_top: rgb565(42, 34, 88),
             sky_horizon: rgb565(235, 130, 74),
-            ground_near: rgb565(58, 66, 46),
-            ground_far: rgb565(118, 92, 72),
-            grid_line: rgb565(42, 48, 34),
+            ground_near: rgb565(48, 56, 40),
+            ground_far: rgb565(106, 84, 66),
+            grid_line: rgb565(135, 145, 95),
             active_gate: rgb565(255, 210, 40),
             active_gate_hi: rgb565(255, 255, 180),
             idle_gate: rgb565(160, 145, 165),
@@ -75,9 +75,9 @@ fn palette(theme: VisualTheme) -> ThemePalette {
         VisualTheme::Night => ThemePalette {
             sky_top: rgb565(6, 10, 26),
             sky_horizon: rgb565(22, 30, 64),
-            ground_near: rgb565(16, 22, 30),
-            ground_far: rgb565(24, 30, 44),
-            grid_line: rgb565(30, 56, 78),
+            ground_near: rgb565(14, 20, 28),
+            ground_far: rgb565(22, 28, 42),
+            grid_line: rgb565(45, 118, 155),
             active_gate: rgb565(0, 255, 180),
             active_gate_hi: rgb565(160, 255, 240),
             idle_gate: rgb565(80, 110, 210),
@@ -88,7 +88,7 @@ fn palette(theme: VisualTheme) -> ThemePalette {
             sky_horizon: rgb565(8, 22, 18),
             ground_near: rgb565(4, 10, 8),
             ground_far: rgb565(8, 22, 18),
-            grid_line: rgb565(18, 95, 58),
+            grid_line: rgb565(38, 165, 98),
             active_gate: rgb565(80, 255, 120),
             active_gate_hi: rgb565(220, 255, 120),
             idle_gate: rgb565(36, 130, 82),
@@ -378,6 +378,28 @@ impl Renderer {
         None
     }
 
+    /// Draw a 3D line directly onto the framebuffer (used for ground grid so it ALWAYS renders
+    /// underneath all 3D structures and gates and can never bleed through objects!).
+    fn draw_3d_line_immediate(&mut self, a: Vec3, b: Vec3, cam_pos: Vec3, cam_inv: Quat, color: u16) {
+        let mut ca = Self::world_to_cam(a, cam_pos, cam_inv);
+        let mut cb = Self::world_to_cam(b, cam_pos, cam_inv);
+        if ca.z < NEAR_Z && cb.z < NEAR_Z {
+            return;
+        }
+        if ca.z < NEAR_Z {
+            let t = (NEAR_Z - ca.z) / (cb.z - ca.z);
+            ca = ca.add(cb.sub(ca).scale(t));
+        } else if cb.z < NEAR_Z {
+            let t = (NEAR_Z - cb.z) / (ca.z - cb.z);
+            cb = cb.add(ca.sub(cb).scale(t));
+        }
+        let (fx0, fy0) = self.project_f32(ca);
+        let (fx1, fy1) = self.project_f32(cb);
+        if let Some((x0, y0, x1, y1)) = Self::clip_line_2d(fx0, fy0, fx1, fy1) {
+            self.draw_line(x0, y0, x1, y1, color);
+        }
+    }
+
     fn push_3d_line(&mut self, a: Vec3, b: Vec3, cam_pos: Vec3, cam_inv: Quat, color: u16, thick: bool) {
         let mut ca = Self::world_to_cam(a, cam_pos, cam_inv);
         let mut cb = Self::world_to_cam(b, cam_pos, cam_inv);
@@ -396,7 +418,7 @@ impl Renderer {
         let Some((x0, y0, x1, y1)) = Self::clip_line_2d(fx0, fy0, fx1, fy1) else {
             return;
         };
-        let depth = (ca.z + cb.z) * 0.5;
+        let depth = ca.z.min(cb.z) * 0.4 + ((ca.z + cb.z) * 0.5) * 0.6;
         self.cmds.push(DrawCmd::Line { depth, x0, y0, x1, y1, color, thick });
     }
 
@@ -448,6 +470,7 @@ impl Renderer {
         let mut min_y = i32::MAX;
         let mut max_y = i32::MIN;
         let mut depth_sum = 0.0f32;
+        let mut min_z = f32::MAX;
         for i in 0..count {
             let p = self.project(clipped[i]);
             pts[i] = p;
@@ -456,11 +479,13 @@ impl Renderer {
             min_y = min_y.min(p.1);
             max_y = max_y.max(p.1);
             depth_sum += clipped[i].z;
+            min_z = min_z.min(clipped[i].z);
         }
         if max_x < 0 || min_x >= W || max_y < 0 || min_y >= H {
             return;
         }
-        let depth = depth_sum / (count as f32);
+        let mean_z = depth_sum / (count as f32);
+        let depth = min_z * 0.45 + mean_z * 0.55;
         self.cmds.push(DrawCmd::Poly {
             depth,
             count,
@@ -652,33 +677,28 @@ impl Renderer {
 
         self.cmds.clear();
 
-        // 2. Ground speed grid around quad (10m spacing on High, 20m spacing on Low)
-        let step = if cfg.detail_high { 10 } else { 20 };
-        let half_cnt = if cfg.detail_high { 4 } else { 2 };
+        // 2. Ground orientation grid drawn IMMEDIATELY on ground plane (never bleeds through structures!)
+        let step = if cfg.detail_high { 8 } else { 16 };
+        let half_cnt = if cfg.detail_high { 5 } else { 3 };
+        let span = (half_cnt * step) as f32;
         let gx0 = (cam_pos.x / step as f32).floor() as i32 * step;
         let gz0 = (cam_pos.z / step as f32).floor() as i32 * step;
         for i in -half_cnt..=half_cnt {
             let x = (gx0 + i * step) as f32;
-            let z_start = (gz0 - 40) as f32;
-            let z_end = (gz0 + 40) as f32;
-            self.push_3d_line(
-                Vec3::new(x, 0.0, z_start),
-                Vec3::new(x, 0.0, z_end),
+            self.draw_3d_line_immediate(
+                Vec3::new(x, 0.0, gz0 as f32 - span),
+                Vec3::new(x, 0.0, gz0 as f32 + span),
                 cam_pos,
                 cam_inv,
                 pal.grid_line,
-                false,
             );
             let z = (gz0 + i * step) as f32;
-            let x_start = (gx0 - 40) as f32;
-            let x_end = (gx0 + 40) as f32;
-            self.push_3d_line(
-                Vec3::new(x_start, 0.0, z),
-                Vec3::new(x_end, 0.0, z),
+            self.draw_3d_line_immediate(
+                Vec3::new(gx0 as f32 - span, 0.0, z),
+                Vec3::new(gx0 as f32 + span, 0.0, z),
                 cam_pos,
                 cam_inv,
                 pal.grid_line,
-                false,
             );
         }
 
