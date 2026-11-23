@@ -13,8 +13,7 @@ const W: i32 = SCREEN_W as i32;
 const H: i32 = SCREEN_H as i32;
 const HALF_W: f32 = (SCREEN_W as f32) * 0.5;
 const HALF_H: f32 = (SCREEN_H as f32) * 0.5;
-const FOV_FOCAL: f32 = 175.0; // ~85 deg horizontal FOV on 320px wide display
-const NEAR_Z: f32 = 0.30;
+const NEAR_Z: f32 = 0.18;
 
 #[inline(always)]
 pub const fn rgb565(r: u8, g: u8, b: u8) -> u16 {
@@ -100,9 +99,10 @@ fn palette(theme: VisualTheme) -> ThemePalette {
 
 #[derive(Copy, Clone)]
 enum DrawCmd {
-    Quad {
+    Poly {
         depth: f32,
-        pts: [(i32, i32); 4],
+        count: usize,
+        pts: [(i32, i32); 5],
         fill: u16,
         edge: u16,
     },
@@ -121,7 +121,7 @@ impl DrawCmd {
     #[inline(always)]
     fn depth(&self) -> f32 {
         match *self {
-            DrawCmd::Quad { depth, .. } => depth,
+            DrawCmd::Poly { depth, .. } => depth,
             DrawCmd::Line { depth, .. } => depth,
         }
     }
@@ -130,6 +130,7 @@ impl DrawCmd {
 pub struct Renderer {
     pub fb: Box<[u16; SCREEN_W * SCREEN_H]>,
     cmds: Vec<DrawCmd>,
+    focal: f32,
 }
 
 impl Renderer {
@@ -137,6 +138,7 @@ impl Renderer {
         Self {
             fb: Box::new([0u16; SCREEN_W * SCREEN_H]),
             cmds: Vec::with_capacity(512),
+            focal: 150.0,
         }
     }
 
@@ -316,11 +318,11 @@ impl Renderer {
     }
 
     #[inline(always)]
-    fn project(c: Vec3) -> (i32, i32) {
-        let inv_z = FOV_FOCAL / c.z;
+    fn project(&self, c: Vec3) -> (i32, i32) {
+        let inv_z = self.focal / c.z;
         let sx = HALF_W + c.x * inv_z;
         let sy = HALF_H - c.y * inv_z;
-        (sx as i32, sy as i32)
+        (sx.clamp(-4000.0, 4000.0) as i32, sy.clamp(-4000.0, 4000.0) as i32)
     }
 
     fn push_3d_line(&mut self, a: Vec3, b: Vec3, cam_pos: Vec3, cam_inv: Quat, color: u16, thick: bool) {
@@ -336,89 +338,178 @@ impl Renderer {
             let t = (NEAR_Z - cb.z) / (ca.z - cb.z);
             cb = cb.add(ca.sub(cb).scale(t));
         }
-        let (x0, y0) = Self::project(ca);
-        let (x1, y1) = Self::project(cb);
+        let (x0, y0) = self.project(ca);
+        let (x1, y1) = self.project(cb);
         let depth = (ca.z + cb.z) * 0.5;
         self.cmds.push(DrawCmd::Line { depth, x0, y0, x1, y1, color, thick });
     }
 
+    /// Clip a 4-vertex camera-space quad against `z >= NEAR_Z` using Sutherland-Hodgman.
+    /// Keeps solid walls 100% visible even when touching or scraping right against them!
     fn push_3d_quad(&mut self, verts: [Vec3; 4], cam_pos: Vec3, cam_inv: Quat, fill: u16, edge: u16, wireframe: bool) {
-        let mut c = [Vec3::ZERO; 4];
-        let mut all_behind = true;
-        let mut any_behind = false;
-        for i in 0..4 {
-            c[i] = Self::world_to_cam(verts[i], cam_pos, cam_inv);
-            if c[i].z >= NEAR_Z {
-                all_behind = false;
-            } else {
-                any_behind = true;
-            }
-        }
-        if all_behind {
-            return;
-        }
-        if wireframe || any_behind {
+        if wireframe {
             for i in 0..4 {
                 self.push_3d_line(verts[i], verts[(i + 1) & 3], cam_pos, cam_inv, edge, false);
             }
             return;
         }
-        let p0 = Self::project(c[0]);
-        let p1 = Self::project(c[1]);
-        let p2 = Self::project(c[2]);
-        let p3 = Self::project(c[3]);
-        // Frustum reject
-        let min_x = p0.0.min(p1.0).min(p2.0).min(p3.0);
-        let max_x = p0.0.max(p1.0).max(p2.0).max(p3.0);
-        let min_y = p0.1.min(p1.1).min(p2.1).min(p3.1);
-        let max_y = p0.1.max(p1.1).max(p2.1).max(p3.1);
+        let mut c = [Vec3::ZERO; 4];
+        for i in 0..4 {
+            c[i] = Self::world_to_cam(verts[i], cam_pos, cam_inv);
+        }
+
+        // Sutherland-Hodgman clip against z >= NEAR_Z (yields 0..=5 vertices)
+        let mut clipped = [Vec3::ZERO; 5];
+        let mut count = 0usize;
+        for i in 0..4 {
+            let cur = c[i];
+            let nxt = c[(i + 1) & 3];
+            let cur_in = cur.z >= NEAR_Z;
+            let nxt_in = nxt.z >= NEAR_Z;
+            if cur_in {
+                if count < 5 {
+                    clipped[count] = cur;
+                    count += 1;
+                }
+                if !nxt_in && count < 5 {
+                    let t = (NEAR_Z - cur.z) / (nxt.z - cur.z);
+                    clipped[count] = cur.add(nxt.sub(cur).scale(t));
+                    count += 1;
+                }
+            } else if nxt_in && count < 5 {
+                let t = (NEAR_Z - cur.z) / (nxt.z - cur.z);
+                clipped[count] = cur.add(nxt.sub(cur).scale(t));
+                count += 1;
+            }
+        }
+        if count < 3 {
+            return;
+        }
+
+        let mut pts = [(0i32, 0i32); 5];
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+        let mut depth_sum = 0.0f32;
+        for i in 0..count {
+            let p = self.project(clipped[i]);
+            pts[i] = p;
+            min_x = min_x.min(p.0);
+            max_x = max_x.max(p.0);
+            min_y = min_y.min(p.1);
+            max_y = max_y.max(p.1);
+            depth_sum += clipped[i].z;
+        }
         if max_x < 0 || min_x >= W || max_y < 0 || min_y >= H {
             return;
         }
-        let depth = (c[0].z + c[1].z + c[2].z + c[3].z) * 0.25;
-        self.cmds.push(DrawCmd::Quad {
+        let depth = depth_sum / (count as f32);
+        self.cmds.push(DrawCmd::Poly {
             depth,
-            pts: [p0, p1, p2, p3],
+            count,
+            pts,
             fill,
             edge,
         });
     }
 
     /// Render the sky and ground background accurately tilted by camera pitch and roll.
-    fn draw_sky_and_ground(&mut self, cam_rot: Quat, pal: ThemePalette) {
+    fn draw_sky_and_ground(&mut self, cam_rot: Quat, pal: ThemePalette, detail_high: bool) {
         let (cam_right, cam_up, cam_fwd) = cam_rot.basis();
-        // World-up vector expressed in camera space:
-        // For screen pixel (sx, sy), view ray in camera space is:
-        //   rx = (sx - HALF_W), ry = (HALF_H - sy), rz = FOV_FOCAL
-        // Dot with world_up_in_cam = cam_right.y * rx + cam_up.y * ry + cam_fwd.y * rz
-        // Positive => sky, Negative => ground!
         let ux = cam_right.y;
         let uy = cam_up.y;
-        let uz = cam_fwd.y * FOV_FOCAL;
+        let uz = cam_fwd.y * self.focal;
+        let inv_f = 1.0 / self.focal;
 
         for y in 0..SCREEN_H {
             let ry = HALF_H - (y as f32);
             let base = uy * ry + uz;
             let row = y * SCREEN_W;
-            // Fast path when roll is near zero (most menu/level flight frames)
             if ux.abs() < 0.002 {
-                let elev = base / FOV_FOCAL;
+                let elev = base * inv_f;
                 let color = if elev >= 0.0 {
-                    lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
-                } else {
+                    if detail_high {
+                        lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
+                    } else {
+                        pal.sky_top
+                    }
+                } else if detail_high {
                     lerp_rgb565(pal.ground_far, pal.ground_near, (-elev * 2.2).min(1.0))
+                } else {
+                    pal.ground_near
                 };
                 self.fb[row..row + SCREEN_W].fill(color);
             } else {
                 for x in 0..SCREEN_W {
                     let rx = (x as f32) - HALF_W;
-                    let elev = (ux * rx + base) / FOV_FOCAL;
+                    let elev = (ux * rx + base) * inv_f;
                     let color = if elev >= 0.0 {
-                        lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
-                    } else {
+                        if detail_high {
+                            lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
+                        } else {
+                            pal.sky_top
+                        }
+                    } else if detail_high {
                         lerp_rgb565(pal.ground_far, pal.ground_near, (-elev * 2.2).min(1.0))
+                    } else {
+                        pal.ground_near
                     };
                     self.fb[row + x] = color;
+                }
+            }
+        }
+    }
+
+    fn draw_sky_detail(&mut self, cam_inv: Quat, theme: VisualTheme) {
+        if theme == VisualTheme::Wireframe {
+            return;
+        }
+        // Sun / Moon directional disc in world sky
+        let (sun_dir, sun_col, halo_col) = match theme {
+            VisualTheme::Summer => (
+                Vec3::new(0.45, 0.48, 0.75),
+                rgb565(255, 252, 200),
+                rgb565(255, 235, 140),
+            ),
+            VisualTheme::Evening => (
+                Vec3::new(0.35, 0.16, 0.92),
+                rgb565(255, 210, 95),
+                rgb565(245, 130, 60),
+            ),
+            VisualTheme::Night => (
+                Vec3::new(-0.40, 0.52, 0.75),
+                rgb565(225, 235, 255),
+                rgb565(120, 140, 190),
+            ),
+            VisualTheme::Wireframe => return,
+        };
+        let sc = cam_inv.rotate(sun_dir);
+        if sc.z > 0.15 {
+            let (sx, sy) = self.project(sc);
+            self.fill_rect(sx - 5, sy - 5, 11, 11, halo_col);
+            self.fill_rect(sx - 3, sy - 3, 7, 7, sun_col);
+        }
+        // Night starfield
+        if theme == VisualTheme::Night {
+            const STARS: [Vec3; 10] = [
+                Vec3::new(0.6, 0.5, 0.6),
+                Vec3::new(-0.7, 0.4, 0.55),
+                Vec3::new(0.2, 0.75, 0.62),
+                Vec3::new(-0.25, 0.65, -0.7),
+                Vec3::new(0.75, 0.35, -0.55),
+                Vec3::new(-0.65, 0.55, -0.5),
+                Vec3::new(0.1, 0.45, -0.88),
+                Vec3::new(-0.85, 0.3, 0.42),
+                Vec3::new(0.42, 0.68, -0.6),
+                Vec3::new(-0.15, 0.32, 0.93),
+            ];
+            let star_col = rgb565(200, 220, 255);
+            for &s in &STARS {
+                let c = cam_inv.rotate(s);
+                if c.z > 0.2 {
+                    let (px, py) = self.project(c);
+                    self.put_pixel(px, py, star_col);
                 }
             }
         }
@@ -435,24 +526,30 @@ impl Renderer {
         frame_ms: f32,
     ) {
         let pal = palette(cfg.theme);
+        let half_fov_rad = ((cfg.fov_deg as f32).clamp(70.0, 115.0) * 0.5).to_radians();
+        self.focal = HALF_W / half_fov_rad.tan();
 
         // Camera orientation = quad orientation pitched up by camera_tilt_deg
-        // (Negative rotation around +X pitches nose UP in our Y-up +Z-forward frame)
         let tilt = -(cfg.camera_tilt_deg as f32).to_radians();
         let cam_rot = quad.rot.mul(Quat::from_axis_angle(Vec3::RIGHT, tilt)).normalized();
         let cam_inv = cam_rot.conjugate();
         let cam_pos = quad.pos;
 
-        // 1. Sky & Ground
-        self.draw_sky_and_ground(cam_rot, pal);
+        // 1. Sky & Ground + optional Sun/Moon/Stars
+        self.draw_sky_and_ground(cam_rot, pal, cfg.detail_high);
+        if cfg.sky_detail {
+            self.draw_sky_detail(cam_inv, cfg.theme);
+        }
 
         self.cmds.clear();
 
-        // 2. Ground speed grid around quad (10m spacing, 50m radius)
-        let gx0 = (cam_pos.x / 10.0).floor() as i32 * 10;
-        let gz0 = (cam_pos.z / 10.0).floor() as i32 * 10;
-        for i in -4..=4 {
-            let x = (gx0 + i * 10) as f32;
+        // 2. Ground speed grid around quad (10m spacing on High, 20m spacing on Low)
+        let step = if cfg.detail_high { 10 } else { 20 };
+        let half_cnt = if cfg.detail_high { 4 } else { 2 };
+        let gx0 = (cam_pos.x / step as f32).floor() as i32 * step;
+        let gz0 = (cam_pos.z / step as f32).floor() as i32 * step;
+        for i in -half_cnt..=half_cnt {
+            let x = (gx0 + i * step) as f32;
             let z_start = (gz0 - 40) as f32;
             let z_end = (gz0 + 40) as f32;
             self.push_3d_line(
@@ -463,7 +560,7 @@ impl Renderer {
                 pal.grid_line,
                 false,
             );
-            let z = (gz0 + i * 10) as f32;
+            let z = (gz0 + i * step) as f32;
             let x_start = (gx0 - 40) as f32;
             let x_end = (gx0 + 40) as f32;
             self.push_3d_line(
@@ -476,7 +573,7 @@ impl Renderer {
             );
         }
 
-        // 3. Structures (solid shaded 3D boxes)
+        // 3. Structures (solid shaded 3D boxes with true near-plane clipping)
         for s in track.structures {
             let (c_top, c_side_a, c_side_b, c_edge) = match s.color {
                 StructureColor::Concrete => (
@@ -507,7 +604,6 @@ impl Renderer {
             let (x0, y0, z0) = (s.min.x, s.min.y, s.min.z);
             let (x1, y1, z1) = (s.max.x, s.max.y, s.max.z);
             let wf = pal.wireframe;
-            // Backface-cull faces pointing away from camera
             if cam_pos.y > y1 {
                 self.push_3d_quad(
                     [Vec3::new(x0, y1, z0), Vec3::new(x1, y1, z0), Vec3::new(x1, y1, z1), Vec3::new(x0, y1, z1)],
@@ -540,9 +636,9 @@ impl Renderer {
             }
         }
 
-        // 4. Racing Gates
+        // 4. Racing Gates (all gates highlighted brightly in Freestyle so loops pop!)
         for (idx, g) in track.gates.iter().enumerate() {
-            let is_next = idx == quad.next_gate && cfg.game_mode == GameMode::Race;
+            let is_next = cfg.game_mode == GameMode::Freestyle || idx == quad.next_gate;
             let main_col = if is_next { pal.active_gate } else { pal.idle_gate };
             let hi_col = if is_next { pal.active_gate_hi } else { rgb565(225, 230, 235) };
 
@@ -554,19 +650,16 @@ impl Renderer {
                     let p_tl = Vec3::new(p_bl.x, g.pos.y + g.height, p_bl.z);
                     let p_tr = Vec3::new(p_br.x, g.pos.y + g.height, p_br.z);
 
-                    // Draw thick frame bars
                     self.push_3d_line(p_bl, p_tl, cam_pos, cam_inv, main_col, true);
                     self.push_3d_line(p_br, p_tr, cam_pos, cam_inv, main_col, true);
                     self.push_3d_line(p_tl, p_tr, cam_pos, cam_inv, hi_col, true);
                     self.push_3d_line(p_bl, p_br, cam_pos, cam_inv, main_col, false);
 
-                    // Top banner quad on active gate so it pops at long range
-                    if is_next && !pal.wireframe {
+                    if is_next && cfg.detail_high && !pal.wireframe {
                         let b_tl = Vec3::new(p_tl.x, p_tl.y + 0.55, p_tl.z);
                         let b_tr = Vec3::new(p_tr.x, p_tr.y + 0.55, p_tr.z);
                         self.push_3d_quad([p_tl, p_tr, b_tr, b_tl], cam_pos, cam_inv, main_col, hi_col, false);
                     }
-                    // Ground stilts for elevated gates
                     if g.pos.y > 0.2 {
                         let g_bl = Vec3::new(p_bl.x, 0.0, p_bl.z);
                         let g_br = Vec3::new(p_br.x, 0.0, p_br.z);
@@ -599,13 +692,14 @@ impl Renderer {
         self.cmds.sort_unstable_by(|a, b| b.depth().total_cmp(&a.depth()));
         for i in 0..self.cmds.len() {
             match self.cmds[i] {
-                DrawCmd::Quad { pts, fill, edge, .. } => {
-                    self.fill_tri(pts[0], pts[1], pts[2], fill);
-                    self.fill_tri(pts[0], pts[2], pts[3], fill);
-                    self.draw_line(pts[0].0, pts[0].1, pts[1].0, pts[1].1, edge);
-                    self.draw_line(pts[1].0, pts[1].1, pts[2].0, pts[2].1, edge);
-                    self.draw_line(pts[2].0, pts[2].1, pts[3].0, pts[3].1, edge);
-                    self.draw_line(pts[3].0, pts[3].1, pts[0].0, pts[0].1, edge);
+                DrawCmd::Poly { count, pts, fill, edge, .. } => {
+                    for k in 1..(count - 1) {
+                        self.fill_tri(pts[0], pts[k], pts[k + 1], fill);
+                    }
+                    for k in 0..count {
+                        let n = (k + 1) % count;
+                        self.draw_line(pts[k].0, pts[k].1, pts[n].0, pts[n].1, edge);
+                    }
                 }
                 DrawCmd::Line { x0, y0, x1, y1, color, thick, .. } => {
                     self.draw_line(x0, y0, x1, y1, color);
@@ -630,9 +724,8 @@ impl Renderer {
             let tc = Self::world_to_cam(target, cam_pos, cam_inv);
             let marker_col = rgb565(255, 230, 40);
             if tc.z > 0.5 {
-                let (sx, sy) = Self::project(tc);
+                let (sx, sy) = self.project(tc);
                 if sx >= 8 && sx < W - 8 && sy >= 14 && sy < H - 14 {
-                    // Small diamond above next gate
                     self.draw_line(sx - 4, sy - 9, sx, sy - 5, marker_col);
                     self.draw_line(sx + 4, sy - 9, sx, sy - 5, marker_col);
                 } else {
@@ -681,12 +774,14 @@ impl Renderer {
         self.draw_hline(cx + 2, cx + 5, cy, white);
         self.draw_vline(cx, cy - 3, cy - 2, white);
 
-        // Top-left: Mode + Track / Gate
+        // Top-left: Mode + Gate / Live Points
         let mode_str = cfg.flight_mode.name();
         self.draw_text(4, 3, mode_str, cyan, 1, true);
         if cfg.game_mode == GameMode::Race {
             let g_str = format!("G {}/{}", quad.next_gate + 1, track.gates.len());
             self.draw_text(4, 13, &g_str, yellow, 1, true);
+            let s_str = format!("PTS {}", quad.score);
+            self.draw_text(4, 23, &s_str, green, 1, true);
         } else {
             let s_str = format!("PTS {}", quad.score);
             self.draw_text(4, 13, &s_str, yellow, 1, true);
@@ -833,21 +928,42 @@ impl Renderer {
     }
 
     pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize) {
-        self.draw_header("SETTINGS", "LEFT/RIGHT");
-
-        let rows: [(&str, String); 8] = [
+        let rows: [(&str, String); 13] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", cfg.flight_mode.name().to_string()),
-            ("Rates (BF)", cfg.rates.name().to_string()),
+            ("Rate Preset", cfg.rates.name().to_string()),
+            ("Center Sens", format!("{} deg/s", cfg.rate_center)),
+            ("Max Rate", format!("{} deg/s", cfg.rate_max)),
+            ("Rate Expo", format!("{:.2}", cfg.rate_expo as f32 / 100.0)),
             ("Camera Tilt", format!("{} deg", cfg.camera_tilt_deg)),
+            ("FOV", format!("{} deg", cfg.fov_deg)),
+            ("Gfx Detail", if cfg.detail_high { "High" } else { "Low" }.to_string()),
+            ("Sky Detail", if cfg.sky_detail { "On (Sun/Stars)" } else { "Off" }.to_string()),
             ("Stick Mode", cfg.stick_mode.name().to_string()),
             ("Throttle", cfg.throttle_mode.name().to_string()),
-            ("Invert Pitch", if cfg.invert_pitch { "Yes" } else { "No" }.to_string()),
-            ("Battery / OSD", format!("{} / Sticks:{}", if cfg.battery_sim { "On" } else { "Off" }, if cfg.show_sticks { "On" } else { "Off" })),
+            (
+                "Batt / OSD",
+                format!(
+                    "Batt:{} Stk:{}",
+                    if cfg.battery_sim { "On" } else { "Off" },
+                    if cfg.show_sticks { "On" } else { "Off" }
+                ),
+            ),
         ];
 
-        for (i, (k, v)) in rows.iter().enumerate() {
-            let y = 27 + (i as i32) * 16;
+        let tag = format!("{}/{}", selected + 1, rows.len());
+        self.draw_header("SETTINGS", &tag);
+
+        const VISIBLE: usize = 8;
+        let start = if selected >= VISIBLE {
+            (selected + 1 - VISIBLE).min(rows.len() - VISIBLE)
+        } else {
+            0
+        };
+
+        for (slot, i) in (start..(start + VISIBLE).min(rows.len())).enumerate() {
+            let (k, ref v) = rows[i];
+            let y = 27 + (slot as i32) * 16;
             let is_sel = i == selected;
             if is_sel {
                 self.fill_rect(6, y - 2, W - 12, 14, rgb565(36, 66, 118));
@@ -855,10 +971,10 @@ impl Renderer {
             let kcol = if is_sel { rgb565(255, 230, 80) } else { rgb565(180, 195, 215) };
             let vcol = if is_sel { rgb565(255, 255, 255) } else { rgb565(135, 200, 235) };
             self.draw_text(12, y + 1, k, kcol, 1, false);
-            self.draw_text(140, y + 1, v, vcol, 1, false);
+            self.draw_text(134, y + 1, v, vcol, 1, false);
         }
 
-        self.draw_text(8, H - 12, "Esc/B: Save & Back | Enter/Left/Right: Change", rgb565(145, 160, 180), 1, false);
+        self.draw_text(8, H - 12, "Up/Dn:Scroll | L/R:Adjust | Esc:Save", rgb565(145, 160, 180), 1, false);
     }
 
     pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {

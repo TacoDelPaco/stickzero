@@ -94,20 +94,20 @@ impl Gate {
                     let r = self.right();
                     let lx = rel.dot(r).abs();
                     let ly = rel.y.abs();
-                    lx <= self.width * 0.58 && ly <= self.height * 0.58
+                    lx <= self.width * 0.68 && ly <= self.height * 0.68
                 } else {
                     false
                 }
             }
             GateKind::Dive => {
                 let c = self.pos;
-                if prev.y >= c.y && curr.y < c.y {
-                    let dy = prev.y - curr.y;
-                    let t = if dy > 1e-6 { (prev.y - c.y) / dy } else { 0.5 };
+                if (prev.y >= c.y && curr.y < c.y) || (prev.y <= c.y && curr.y > c.y) {
+                    let dy = (prev.y - curr.y).abs();
+                    let t = if dy > 1e-6 { (prev.y - c.y).abs() / dy } else { 0.5 };
                     let hit = prev.add(curr.sub(prev).scale(t));
                     let dx = (hit.x - c.x).abs();
                     let dz = (hit.z - c.z).abs();
-                    dx <= self.width * 0.6 && dz <= self.height * 0.6
+                    dx <= self.width * 0.68 && dz <= self.height * 0.68
                 } else {
                     false
                 }

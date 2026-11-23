@@ -14,7 +14,7 @@ mod png;
 mod renderer;
 mod tracks;
 
-use config::{Config, ThrottleMode, VisualTheme};
+use config::{Config, RatesPreset, ThrottleMode, VisualTheme};
 use display::{FbDisplay, SCREEN_H, SCREEN_W};
 use input::InputManager;
 use linux_sys::{signal, SIGINT, SIGTERM};
@@ -317,28 +317,64 @@ fn main() {
                 renderer.render_pause_menu(pause_idx);
             }
             AppScreen::Settings => {
+                const NUM_SETTINGS: usize = 13;
                 if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
                 } else {
-                    if act.up { settings_idx = (settings_idx + 7) % 8; }
-                    if act.down { settings_idx = (settings_idx + 1) % 8; }
+                    if act.up { settings_idx = (settings_idx + NUM_SETTINGS - 1) % NUM_SETTINGS; }
+                    if act.down { settings_idx = (settings_idx + 1) % NUM_SETTINGS; }
                     if act.left || act.right || act.select {
                         match settings_idx {
                             0 => cfg.game_mode = cfg.game_mode.toggle(),
                             1 => cfg.flight_mode = cfg.flight_mode.toggle(),
-                            2 => cfg.rates = cfg.rates.next(),
+                            2 => {
+                                let next = cfg.rates.next_preset();
+                                cfg.apply_rate_preset(next);
+                            }
                             3 => {
+                                cfg.rate_center = if act.left {
+                                    cfg.rate_center.saturating_sub(10).max(50)
+                                } else {
+                                    (cfg.rate_center + 10).min(400)
+                                };
+                                cfg.rates = RatesPreset::Custom;
+                            }
+                            4 => {
+                                cfg.rate_max = if act.left {
+                                    cfg.rate_max.saturating_sub(20).max(300)
+                                } else {
+                                    (cfg.rate_max + 20).min(1200)
+                                };
+                                cfg.rates = RatesPreset::Custom;
+                            }
+                            5 => {
+                                cfg.rate_expo = if act.left {
+                                    cfg.rate_expo.saturating_sub(5)
+                                } else {
+                                    (cfg.rate_expo + 5).min(90)
+                                };
+                                cfg.rates = RatesPreset::Custom;
+                            }
+                            6 => {
                                 if act.left {
                                     cfg.camera_tilt_deg = cfg.camera_tilt_deg.saturating_sub(5);
                                 } else {
                                     cfg.camera_tilt_deg = (cfg.camera_tilt_deg + 5).min(50);
                                 }
                             }
-                            4 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            5 => cfg.throttle_mode = cfg.throttle_mode.toggle(),
-                            6 => cfg.invert_pitch = !cfg.invert_pitch,
                             7 => {
+                                cfg.fov_deg = if act.left {
+                                    cfg.fov_deg.saturating_sub(10).max(75)
+                                } else {
+                                    (cfg.fov_deg + 10).min(105)
+                                };
+                            }
+                            8 => cfg.detail_high = !cfg.detail_high,
+                            9 => cfg.sky_detail = !cfg.sky_detail,
+                            10 => cfg.stick_mode = cfg.stick_mode.toggle(),
+                            11 => cfg.throttle_mode = cfg.throttle_mode.toggle(),
+                            12 => {
                                 if act.left {
                                     cfg.battery_sim = !cfg.battery_sim;
                                 } else {

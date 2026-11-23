@@ -2,9 +2,9 @@
 //! Acro & Angle modes, motor spool lag, ground effect, obstacle collisions,
 //! turtle mode, battery sag simulation, and freestyle trick tracking.
 
-use crate::config::{Config, FlightMode};
+use crate::config::{Config, FlightMode, GameMode};
 use crate::math::{clampf, Quat, Vec3};
-use crate::tracks::Track;
+use crate::tracks::{GateKind, Track};
 
 pub const PHYSICS_HZ: f32 = 240.0;
 pub const PHYSICS_DT: f32 = 1.0 / PHYSICS_HZ;
@@ -48,6 +48,7 @@ pub struct QuadState {
     pub lap_time: f32,
     pub last_lap_ms: u32,
     pub lap_started: bool,
+    pub gate_cooldowns: [f32; 16],
 
     // Freestyle trick state
     pub score: u32,
@@ -77,6 +78,7 @@ impl QuadState {
             lap_time: 0.0,
             last_lap_ms: 0,
             lap_started: false,
+            gate_cooldowns: [0.0; 16],
             score: 0,
             combo_text: "",
             combo_timer: 0.0,
@@ -162,7 +164,7 @@ impl QuadState {
         }
 
         // 4. Target body angular rates (rad/s)
-        let (center_sens, max_rate, expo) = cfg.rates.actual_rates();
+        let (center_sens, max_rate, expo) = cfg.actual_rates();
         let target_omega = match cfg.flight_mode {
             FlightMode::Acro => {
                 // In our Y-up +Z-forward right-handed frame:
@@ -318,7 +320,12 @@ impl QuadState {
             self.vel.y = self.vel.y.min(0.0);
         }
 
-        // 8. Race gate progression & lap timing
+        // 8. Gate / loop scoring & lap timing
+        for cd in &mut self.gate_cooldowns {
+            if *cd > 0.0 {
+                *cd = (*cd - dt).max(0.0);
+            }
+        }
         if !self.lap_started && self.motor_thr > 0.15 && self.pos.y > 0.45 {
             self.lap_started = true;
         }
@@ -326,26 +333,55 @@ impl QuadState {
             self.lap_time += dt;
         }
         if !track.gates.is_empty() {
-            let g = &track.gates[self.next_gate];
-            if g.check_pass(prev_pos, self.pos) {
-                self.next_gate += 1;
-                self.score += 100;
-                if self.next_gate >= track.gates.len() {
-                    self.next_gate = 0;
-                    let ms = (self.lap_time * 1000.0) as u32;
-                    self.last_lap_ms = ms;
-                    let ti = cfg.track_index.min(3);
-                    if ms > 1000 && (cfg.best_laps_ms[ti] == 0 || ms < cfg.best_laps_ms[ti]) {
-                        cfg.best_laps_ms[ti] = ms;
-                        cfg.save();
-                        self.combo_text = "NEW BEST LAP!";
-                        self.combo_timer = 2.0;
-                    } else {
-                        self.combo_text = "LAP COMPLETE";
-                        self.combo_timer = 1.6;
+            match cfg.game_mode {
+                GameMode::Race => {
+                    let g = &track.gates[self.next_gate];
+                    if g.check_pass(prev_pos, self.pos) {
+                        self.next_gate += 1;
+                        self.score += 100;
+                        if self.next_gate >= track.gates.len() {
+                            self.next_gate = 0;
+                            self.score += 500;
+                            let ms = (self.lap_time * 1000.0) as u32;
+                            self.last_lap_ms = ms;
+                            let ti = cfg.track_index.min(3);
+                            if ms > 1000 && (cfg.best_laps_ms[ti] == 0 || ms < cfg.best_laps_ms[ti]) {
+                                cfg.best_laps_ms[ti] = ms;
+                                cfg.save();
+                                self.combo_text = "NEW BEST LAP! +500";
+                                self.combo_timer = 2.0;
+                            } else {
+                                self.combo_text = "LAP COMPLETE +500";
+                                self.combo_timer = 1.6;
+                            }
+                            self.lap += 1;
+                            self.lap_time = 0.0;
+                        } else {
+                            self.combo_text = "GATE +100";
+                            self.combo_timer = 0.8;
+                        }
                     }
-                    self.lap += 1;
-                    self.lap_time = 0.0;
+                }
+                GameMode::Freestyle => {
+                    for (idx, g) in track.gates.iter().enumerate() {
+                        if idx < self.gate_cooldowns.len()
+                            && self.gate_cooldowns[idx] <= 0.0
+                            && g.check_pass(prev_pos, self.pos)
+                        {
+                            self.gate_cooldowns[idx] = 1.2;
+                            match g.kind {
+                                GateKind::Dive => {
+                                    self.score += 200;
+                                    self.combo_text = "DIVE GATE +200";
+                                }
+                                _ => {
+                                    self.score += 100;
+                                    self.combo_text = "GATE +100";
+                                }
+                            }
+                            self.combo_timer = 1.1;
+                        }
+                    }
                 }
             }
         }
@@ -419,5 +455,21 @@ mod tests {
             quad.step(input, &mut cfg, track);
         }
         assert!(quad.score >= 250, "Full pitch should register a flip trick");
+    }
+
+    #[test]
+    fn test_freestyle_gate_scoring() {
+        let mut cfg = Config::default();
+        cfg.game_mode = GameMode::Freestyle;
+        let track = &TRACKS[0];
+        let mut quad = QuadState::spawn(track);
+        // Place quad right before gate 0 (at z=22) moving forward through it
+        quad.pos = Vec3::new(0.0, 1.8, 21.7);
+        quad.vel = Vec3::new(0.0, 0.0, 15.0);
+        let input = StickInput { throttle: 0.3, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..30 {
+            quad.step(input, &mut cfg, track);
+        }
+        assert!(quad.score >= 100, "Flying through a loop/gate in Freestyle should award points, got {}", quad.score);
     }
 }

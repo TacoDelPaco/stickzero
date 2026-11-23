@@ -5,7 +5,7 @@ VERSION="0.1.0"
 PKG_NAME="stickzero"
 ARCH="arm64"
 BIN="target/aarch64-unknown-linux-musl/release/stickzero"
-ICON="screenshots/stickzero-icon.png"
+ICON="assets/stickzero.png"
 STAGE="build/deb/${PKG_NAME}_${VERSION}_${ARCH}"
 
 if [ ! -f "$BIN" ]; then
