@@ -174,10 +174,37 @@ impl InputManager {
         mgr
     }
 
-    pub fn controller_name(&self) -> &str {
+    pub fn controller_name(&self) -> String {
         match &self.gamepad {
-            Some(g) => &g.name,
-            None => "No BT/USB Controller",
+            Some(g) => Self::friendly_name(&g.name),
+            None => "No BT/USB Controller".to_string(),
+        }
+    }
+
+    /// Shorten verbose USB/BT HID descriptor names so they fit cleanly on the 1.9" screen.
+    fn friendly_name(raw: &str) -> String {
+        let lower = raw.to_ascii_lowercase();
+        let is_edgetx_family = lower.contains("opentx") || lower.contains("edgetx") || lower.contains("radiomaster");
+
+        let mut s = raw.trim().to_string();
+        for prefix in ["OpenTX ", "EdgeTX ", "Microsoft ", "Sony Interactive Entertainment "] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.to_string();
+            }
+        }
+        s = s.replace("RadioMaster", "RM");
+        s = s.replace("Radiomaster", "RM");
+        for suffix in [" Joystick", " Gamepad", " Controller"] {
+            if s.len() > 16 {
+                if let Some(trimmed) = s.strip_suffix(suffix) {
+                    s = trimmed.to_string();
+                }
+            }
+        }
+        if is_edgetx_family && !s.to_ascii_lowercase().contains("edgetx") {
+            format!("{} (EdgeTX)", s.trim())
+        } else {
+            s.trim().to_string()
         }
     }
 
