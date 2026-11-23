@@ -56,7 +56,7 @@ bash ./package.sh
 ```bash
 curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.0_arm64.deb \
   && sudo dpkg -i stickzero_0.1.0_arm64.deb \
-  && sudo systemctl restart APPLaunch.service
+  && systemctl --user restart APPLaunch.service
 ```
 
 ### Option B: Deploy from your PC via SSH or ADB

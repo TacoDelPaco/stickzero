@@ -22,10 +22,10 @@ fi
 
 if [ "$TARGET" = "adb" ]; then
     adb push "$DEB" /tmp/stickzero.deb
-    adb shell "sudo dpkg -i /tmp/stickzero.deb && sudo systemctl restart APPLaunch.service"
+    adb shell "sudo dpkg -i /tmp/stickzero.deb && (systemctl --user restart APPLaunch.service 2>/dev/null || true)"
 else
     scp "$DEB" "$TARGET:/tmp/stickzero.deb"
-    ssh -t "$TARGET" "sudo dpkg -i /tmp/stickzero.deb && sudo systemctl restart APPLaunch.service"
+    ssh -t "$TARGET" "sudo dpkg -i /tmp/stickzero.deb && (systemctl --user restart APPLaunch.service 2>/dev/null || true)"
 fi
 
 echo "StickZero installed and APPLaunch restarted!"
