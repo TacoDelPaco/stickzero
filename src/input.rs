@@ -655,8 +655,23 @@ impl InputManager {
                 KEY_R => {
                     if pressed { self.pending.respawn = true; }
                 }
+                KEY_F | KEY_SEMICOLON => {
+                    if pressed && in_menu { self.pending.up = true; }
+                }
+                KEY_X | KEY_DOT => {
+                    if pressed && in_menu { self.pending.down = true; }
+                }
+                KEY_Z | KEY_COMMA => {
+                    if pressed && in_menu { self.pending.left = true; }
+                }
+                KEY_SLASH => {
+                    if pressed && in_menu { self.pending.right = true; }
+                }
                 KEY_C => {
-                    if pressed { self.pending.calibrate = true; }
+                    if pressed {
+                        self.pending.calibrate = true;
+                        if in_menu { self.pending.right = true; }
+                    }
                 }
                 KEY_N => {
                     if pressed { self.pending.next_device = true; }
