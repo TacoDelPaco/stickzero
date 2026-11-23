@@ -9,10 +9,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SAMPLE_RATE: f32 = 22050.0;
-const CHUNK_SAMPLES: usize = 512; // ~23 ms latency per chunk
+const CHUNK_SAMPLES: usize = 256; // ~11.6 ms per chunk for crisp low-latency audio
 
 /// Lock-free telemetry snapshot shared from physics/main loop to the audio synth thread.
 pub struct AudioShared {
@@ -123,7 +123,8 @@ fn spawn_aplay() -> Option<Child> {
             "-f", "S16_LE",
             "-c", "1",
             "-r", "22050",
-            "-B", "45000",
+            "--buffer-time=25000",
+            "--period-time=8000",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -135,6 +136,8 @@ fn spawn_aplay() -> Option<Child> {
 fn audio_thread(shared: Arc<AudioShared>) {
     let mut child: Option<Child> = None;
     let mut pcm = [0u8; CHUNK_SAMPLES * 2];
+    let chunk_dur = Duration::from_secs_f64(CHUNK_SAMPLES as f64 / SAMPLE_RATE as f64);
+    let mut next_chunk_at = Instant::now();
 
     // 4 tinywhoop brushless motor oscillators (FL, FR, RL, RR)
     let mut phases = [0.0f32; 4];
@@ -163,17 +166,27 @@ fn audio_thread(shared: Arc<AudioShared>) {
                 let _ = c.wait();
             }
             thread::sleep(Duration::from_millis(50));
+            next_chunk_at = Instant::now();
             continue;
         }
 
         if child.is_none() {
             child = spawn_aplay();
+            next_chunk_at = Instant::now();
             if child.is_none() {
-                // No audio device / aplay unavailable; retry slowly
                 thread::sleep(Duration::from_millis(1000));
                 continue;
             }
         }
+
+        // Wall-clock pacing prevents filling the 64 KB Linux pipe buffer (~1.5s delay!)
+        let now = Instant::now();
+        if next_chunk_at > now {
+            thread::sleep(next_chunk_at - now);
+        } else if now.duration_since(next_chunk_at) > Duration::from_millis(80) {
+            next_chunk_at = now;
+        }
+        next_chunk_at += chunk_dur;
 
         // Check one-shot triggers
         if shared.event_arm.swap(false, Ordering::Relaxed) {

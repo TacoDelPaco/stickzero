@@ -320,11 +320,62 @@ impl Renderer {
     }
 
     #[inline(always)]
-    fn project(&self, c: Vec3) -> (i32, i32) {
+    fn project_f32(&self, c: Vec3) -> (f32, f32) {
         let inv_z = self.focal / c.z;
-        let sx = HALF_W + c.x * inv_z;
-        let sy = HALF_H - c.y * inv_z;
-        (sx.clamp(-4000.0, 4000.0) as i32, sy.clamp(-4000.0, 4000.0) as i32)
+        (HALF_W + c.x * inv_z, HALF_H - c.y * inv_z)
+    }
+
+    #[inline(always)]
+    fn project(&self, c: Vec3) -> (i32, i32) {
+        let (sx, sy) = self.project_f32(c);
+        (sx.clamp(-16000.0, 16000.0) as i32, sy.clamp(-16000.0, 16000.0) as i32)
+    }
+
+    /// Exact Cohen-Sutherland 2D line clipper against `[0, W-1] x [0, H-1]`.
+    /// Eliminates slope distortion / skewing when lines cross near the camera or roll 90 deg!
+    fn clip_line_2d(mut x0: f32, mut y0: f32, mut x1: f32, mut y1: f32) -> Option<(i32, i32, i32, i32)> {
+        const xmin: f32 = 0.0;
+        const ymin: f32 = 0.0;
+        const xmax: f32 = (W - 1) as f32;
+        const ymax: f32 = (H - 1) as f32;
+
+        let outcode = |x: f32, y: f32| -> u8 {
+            let mut c = 0u8;
+            if x < xmin { c |= 1; } else if x > xmax { c |= 2; }
+            if y < ymin { c |= 4; } else if y > ymax { c |= 8; }
+            c
+        };
+
+        let mut c0 = outcode(x0, y0);
+        let mut c1 = outcode(x1, y1);
+        for _ in 0..8 {
+            if (c0 | c1) == 0 {
+                return Some((x0 as i32, y0 as i32, x1 as i32, y1 as i32));
+            }
+            if (c0 & c1) != 0 {
+                return None;
+            }
+            let out = if c0 != 0 { c0 } else { c1 };
+            let (nx, ny) = if (out & 8) != 0 {
+                (x0 + (x1 - x0) * (ymax - y0) / (y1 - y0), ymax)
+            } else if (out & 4) != 0 {
+                (x0 + (x1 - x0) * (ymin - y0) / (y1 - y0), ymin)
+            } else if (out & 2) != 0 {
+                (xmax, y0 + (y1 - y0) * (xmax - x0) / (x1 - x0))
+            } else {
+                (xmin, y0 + (y1 - y0) * (xmin - x0) / (x1 - x0))
+            };
+            if out == c0 {
+                x0 = nx;
+                y0 = ny;
+                c0 = outcode(x0, y0);
+            } else {
+                x1 = nx;
+                y1 = ny;
+                c1 = outcode(x1, y1);
+            }
+        }
+        None
     }
 
     fn push_3d_line(&mut self, a: Vec3, b: Vec3, cam_pos: Vec3, cam_inv: Quat, color: u16, thick: bool) {
@@ -340,8 +391,11 @@ impl Renderer {
             let t = (NEAR_Z - cb.z) / (ca.z - cb.z);
             cb = cb.add(ca.sub(cb).scale(t));
         }
-        let (x0, y0) = self.project(ca);
-        let (x1, y1) = self.project(cb);
+        let (fx0, fy0) = self.project_f32(ca);
+        let (fx1, fy1) = self.project_f32(cb);
+        let Some((x0, y0, x1, y1)) = Self::clip_line_2d(fx0, fy0, fx1, fy1) else {
+            return;
+        };
         let depth = (ca.z + cb.z) * 0.5;
         self.cmds.push(DrawCmd::Line { depth, x0, y0, x1, y1, color, thick });
     }
@@ -416,7 +470,8 @@ impl Renderer {
         });
     }
 
-    /// Render the sky and ground background accurately tilted by camera pitch and roll.
+    /// Ultra-fast zero-per-pixel-float horizon renderer using scanline `slice::fill()`.
+    /// Runs at the exact same speed whether flying level OR doing a 900 deg/s roll!
     fn draw_sky_and_ground(&mut self, cam_rot: Quat, pal: ThemePalette, detail_high: bool) {
         let (cam_right, cam_up, cam_fwd) = cam_rot.basis();
         let ux = cam_right.y;
@@ -424,12 +479,22 @@ impl Renderer {
         let uz = cam_fwd.y * self.focal;
         let inv_f = 1.0 / self.focal;
 
-        for y in 0..SCREEN_H {
-            let ry = HALF_H - (y as f32);
-            let base = uy * ry + uz;
-            let row = y * SCREEN_W;
-            if ux.abs() < 0.002 {
-                let elev = base * inv_f;
+        // Precompute subtle horizon-haze band colors once per frame (zero per-pixel float math!)
+        let sky_mid = if detail_high {
+            lerp_rgb565(pal.sky_horizon, pal.sky_top, 0.45)
+        } else {
+            pal.sky_top
+        };
+        let gnd_mid = if detail_high {
+            lerp_rgb565(pal.ground_far, pal.ground_near, 0.45)
+        } else {
+            pal.ground_near
+        };
+
+        if ux.abs() < 0.002 {
+            for y in 0..SCREEN_H {
+                let ry = HALF_H - (y as f32);
+                let elev = (uy * ry + uz) * inv_f;
                 let color = if elev >= 0.0 {
                     if detail_high {
                         lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
@@ -441,23 +506,65 @@ impl Renderer {
                 } else {
                     pal.ground_near
                 };
+                let row = y * SCREEN_W;
                 self.fb[row..row + SCREEN_W].fill(color);
-            } else {
-                for x in 0..SCREEN_W {
-                    let rx = (x as f32) - HALF_W;
-                    let elev = (ux * rx + base) * inv_f;
-                    let color = if elev >= 0.0 {
-                        if detail_high {
-                            lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
-                        } else {
-                            pal.sky_top
+            }
+            return;
+        }
+
+        // Fast rolled-horizon scanline split: solve x where elev == 0 (and haze band +/- 0.14)
+        let inv_ux = 1.0 / ux;
+        let band_dx = (0.14 * self.focal * inv_ux).abs();
+        let sky_on_right = ux > 0.0;
+
+        for y in 0..SCREEN_H {
+            let ry = HALF_H - (y as f32);
+            let base = uy * ry + uz;
+            let row = y * SCREEN_W;
+
+            // Exact horizon crossing x on this scanline
+            let x_hor = HALF_W - base * inv_ux;
+            let x_split = (x_hor.round() as i32).clamp(0, W) as usize;
+
+            if sky_on_right {
+                // Left = ground, Right = sky
+                if x_split > 0 {
+                    self.fb[row..row + x_split].fill(pal.ground_near);
+                    if detail_high {
+                        let g_haze_start = ((x_hor - band_dx).round() as i32).clamp(0, x_split as i32) as usize;
+                        if g_haze_start < x_split {
+                            self.fb[row + g_haze_start..row + x_split].fill(gnd_mid);
                         }
-                    } else if detail_high {
-                        lerp_rgb565(pal.ground_far, pal.ground_near, (-elev * 2.2).min(1.0))
-                    } else {
-                        pal.ground_near
-                    };
-                    self.fb[row + x] = color;
+                    }
+                }
+                if x_split < SCREEN_W {
+                    self.fb[row + x_split..row + SCREEN_W].fill(pal.sky_top);
+                    if detail_high {
+                        let s_haze_end = ((x_hor + band_dx).round() as i32).clamp(x_split as i32, W) as usize;
+                        if s_haze_end > x_split {
+                            self.fb[row + x_split..row + s_haze_end].fill(sky_mid);
+                        }
+                    }
+                }
+            } else {
+                // Left = sky, Right = ground
+                if x_split > 0 {
+                    self.fb[row..row + x_split].fill(pal.sky_top);
+                    if detail_high {
+                        let s_haze_start = ((x_hor - band_dx).round() as i32).clamp(0, x_split as i32) as usize;
+                        if s_haze_start < x_split {
+                            self.fb[row + s_haze_start..row + x_split].fill(sky_mid);
+                        }
+                    }
+                }
+                if x_split < SCREEN_W {
+                    self.fb[row + x_split..row + SCREEN_W].fill(pal.ground_near);
+                    if detail_high {
+                        let g_haze_end = ((x_hor + band_dx).round() as i32).clamp(x_split as i32, W) as usize;
+                        if g_haze_end > x_split {
+                            self.fb[row + x_split..row + g_haze_end].fill(gnd_mid);
+                        }
+                    }
                 }
             }
         }
@@ -612,6 +719,12 @@ impl Renderer {
                     cam_pos, cam_inv, c_top, c_edge, wf,
                 );
             }
+            if cam_pos.y < y0 {
+                self.push_3d_quad(
+                    [Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y0, z1), Vec3::new(x0, y0, z1)],
+                    cam_pos, cam_inv, c_side_b, c_edge, wf,
+                );
+            }
             if cam_pos.z < z0 {
                 self.push_3d_quad(
                     [Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y1, z0), Vec3::new(x0, y1, z0)],
@@ -700,7 +813,14 @@ impl Renderer {
                     }
                     for k in 0..count {
                         let n = (k + 1) % count;
-                        self.draw_line(pts[k].0, pts[k].1, pts[n].0, pts[n].1, edge);
+                        if let Some((x0, y0, x1, y1)) = Self::clip_line_2d(
+                            pts[k].0 as f32,
+                            pts[k].1 as f32,
+                            pts[n].0 as f32,
+                            pts[n].1 as f32,
+                        ) {
+                            self.draw_line(x0, y0, x1, y1, edge);
+                        }
                     }
                 }
                 DrawCmd::Line { x0, y0, x1, y1, color, thick, .. } => {

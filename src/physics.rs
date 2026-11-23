@@ -38,6 +38,7 @@ pub struct QuadState {
     pub hit_flash: f32,
     pub prop_wash_phase: f32,
     pub prop_wash_level: f32,
+    pub turtle_cooldown: f32,
 
     // Battery simulation
     pub cell_voltage: f32,
@@ -74,6 +75,7 @@ impl QuadState {
             hit_flash: 0.0,
             prop_wash_phase: 0.0,
             prop_wash_level: 0.0,
+            turtle_cooldown: 0.0,
             cell_voltage: 4.35, // 1S LiHV fresh charge (4.35V)
             mah_used: 0.0,
             battery_empty: false,
@@ -123,6 +125,9 @@ impl QuadState {
         if self.combo_timer > 0.0 {
             self.combo_timer = (self.combo_timer - dt).max(0.0);
         }
+        if self.turtle_cooldown > 0.0 {
+            self.turtle_cooldown = (self.turtle_cooldown - dt).max(0.0);
+        }
 
         let prev_pos = self.pos;
         let batt_on = cfg.battery_pack != BatteryPack::Off;
@@ -160,16 +165,22 @@ impl QuadState {
 
         // 3. Determine orientation & ground status
         let (right, up, forward) = self.rot.basis();
-        self.inverted = up.y < -0.25;
+        self.inverted = up.y < 0.20;
 
-        // Turtle mode: if upside down on ground, pushing roll or pitch flips the quad upright!
-        if self.on_ground && self.inverted && (input.roll.abs() > 0.65 || input.pitch.abs() > 0.65) {
+        // Turtle mode: if inverted or stuck on side near the ground, push roll or pitch to flip upright!
+        let near_ground = self.on_ground || self.pos.y <= QUAD_RADIUS + 0.35;
+        if near_ground
+            && up.y < 0.35
+            && self.turtle_cooldown <= 0.0
+            && (input.roll.abs() > 0.55 || input.pitch.abs() > 0.55)
+        {
             let yaw = forward.x.atan2(forward.z);
             self.rot = Quat::from_axis_angle(Vec3::UP, yaw);
-            self.pos.y = 0.5;
-            self.vel = Vec3::new(0.0, 2.2, 0.0);
+            self.pos.y = QUAD_RADIUS + 0.25;
+            self.vel = Vec3::new(0.0, 1.8, 0.0);
             self.omega = Vec3::ZERO;
             self.inverted = false;
+            self.turtle_cooldown = 0.55;
             self.combo_text = "TURTLE FLIP";
             self.combo_timer = 1.2;
         }
