@@ -1,7 +1,7 @@
 //! Ultra-fast zero-allocation 320x170 RGB565 3D software rasterizer,
 //! Betaflight-style OSD, and CardputerZero 1.9" menu UI.
 
-use crate::config::{Config, GameMode, VisualTheme};
+use crate::config::{BatteryPack, Config, GameMode, VisualTheme};
 use crate::display::{SCREEN_H, SCREEN_W};
 use crate::font::{glyph, GLYPH_H, GLYPH_W};
 use crate::input::{ControllerKind, InputManager};
@@ -131,6 +131,7 @@ pub struct Renderer {
     pub fb: Box<[u16; SCREEN_W * SCREEN_H]>,
     cmds: Vec<DrawCmd>,
     focal: f32,
+    rng_state: u32,
 }
 
 impl Renderer {
@@ -139,6 +140,7 @@ impl Renderer {
             fb: Box::new([0u16; SCREEN_W * SCREEN_H]),
             cmds: Vec::with_capacity(512),
             focal: 150.0,
+            rng_state: 0x51A7_1C09,
         }
     }
 
@@ -736,8 +738,53 @@ impl Renderer {
             }
         }
 
-        // 8. Betaflight-style OSD
+        // 7b. Optional fast Analog 5.8GHz FPV video filter (NTSC scanlines + vignette + RF grain)
+        if cfg.analog_filter {
+            self.apply_analog_filter(quad.hit_flash > 0.0);
+        }
+
+        // 8. Betaflight-style OSD (drawn crisp over analog feed, just like real Betaflight OSD)
         self.draw_osd(quad, cfg, track, sticks, fps, frame_ms);
+    }
+
+    /// Ultra-fast integer-only RGB565 analog FPV filter:
+    /// - Even-row NTSC scanlines (~87.5% brightness via bitshifts)
+    /// - Subtle edge vignette
+    /// - Light 5.8 GHz RF snow speckle (stronger briefly on crash/hit)
+    fn apply_analog_filter(&mut self, static_burst: bool) {
+        let mut s = self.rng_state;
+        let grain_mask: u32 = if static_burst { 0x07 } else { 0x3F };
+        for y in 0..SCREEN_H {
+            let row = y * SCREEN_W;
+            let scanline = (y & 1) == 1;
+            let y_edge = y < 12 || y >= SCREEN_H - 12;
+            for x in 0..SCREEN_W {
+                let mut c = self.fb[row + x];
+                if scanline {
+                    // Fast ~87.5% (7/8) RGB565 darken using bitshifts only
+                    c = ((c >> 1) & 0x7BEF) + ((c >> 2) & 0x39E7) + ((c >> 3) & 0x18E3);
+                }
+                if y_edge && (x < 18 || x >= SCREEN_W - 18) {
+                    // Subtle corner vignette (~75% = 3/4)
+                    c = ((c >> 1) & 0x7BEF) + ((c >> 2) & 0x39E7);
+                }
+                // Fast xorshift32 for subtle analog RF speckle
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                if (s & grain_mask) == 0 {
+                    // Faint luma snow pixel
+                    let luma = if (s & 0x100) != 0 {
+                        rgb565(200, 200, 200)
+                    } else {
+                        rgb565(40, 40, 40)
+                    };
+                    c = ((c >> 1) & 0x7BEF) + ((luma >> 1) & 0x7BEF);
+                }
+                self.fb[row + x] = c;
+            }
+        }
+        self.rng_state = s;
     }
 
     fn draw_edge_arrow(&mut self, tc: Vec3, color: u16) {
@@ -805,7 +852,8 @@ impl Renderer {
         }
 
         // Top-right: Battery + FPS
-        if cfg.battery_sim {
+        let batt_on = cfg.battery_pack != BatteryPack::Off;
+        if batt_on {
             let v_col = if quad.cell_voltage < 3.4 {
                 red
             } else if quad.cell_voltage < 3.6 {
@@ -829,7 +877,7 @@ impl Renderer {
             self.draw_text(cx - tw / 2, 34, quad.combo_text, yellow, 1, true);
         } else if quad.on_ground && quad.inverted {
             self.draw_text(cx - 54, 34, "TURTLE: PUSH ROLL", red, 1, true);
-        } else if quad.battery_empty && cfg.battery_sim {
+        } else if quad.battery_empty && batt_on {
             self.draw_text(cx - 48, 34, "BATT EMPTY (R)", red, 1, true);
         }
 
@@ -928,24 +976,26 @@ impl Renderer {
     }
 
     pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize) {
-        let rows: [(&str, String); 13] = [
+        let rows: [(&str, String); 15] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", cfg.flight_mode.name().to_string()),
+            ("Battery", cfg.battery_pack.name().to_string()),
+            ("Prop Wash", if cfg.prop_wash { "Stock" } else { "Off" }.to_string()),
             ("Rate Preset", cfg.rates.name().to_string()),
             ("Center Sens", format!("{} deg/s", cfg.rate_center)),
             ("Max Rate", format!("{} deg/s", cfg.rate_max)),
             ("Rate Expo", format!("{:.2}", cfg.rate_expo as f32 / 100.0)),
             ("Camera Tilt", format!("{} deg", cfg.camera_tilt_deg)),
             ("FOV", format!("{} deg", cfg.fov_deg)),
+            ("Analog FX", if cfg.analog_filter { "On (NTSC/RF)" } else { "Off" }.to_string()),
             ("Gfx Detail", if cfg.detail_high { "High" } else { "Low" }.to_string()),
             ("Sky Detail", if cfg.sky_detail { "On (Sun/Stars)" } else { "Off" }.to_string()),
             ("Stick Mode", cfg.stick_mode.name().to_string()),
-            ("Throttle", cfg.throttle_mode.name().to_string()),
             (
-                "Batt / OSD",
+                "Thr / Sticks",
                 format!(
-                    "Batt:{} Stk:{}",
-                    if cfg.battery_sim { "On" } else { "Off" },
+                    "{} | Stk:{}",
+                    cfg.throttle_mode.name(),
                     if cfg.show_sticks { "On" } else { "Off" }
                 ),
             ),
@@ -971,7 +1021,7 @@ impl Renderer {
             let kcol = if is_sel { rgb565(255, 230, 80) } else { rgb565(180, 195, 215) };
             let vcol = if is_sel { rgb565(255, 255, 255) } else { rgb565(135, 200, 235) };
             self.draw_text(12, y + 1, k, kcol, 1, false);
-            self.draw_text(134, y + 1, v, vcol, 1, false);
+            self.draw_text(126, y + 1, v, vcol, 1, false);
         }
 
         self.draw_text(8, H - 12, "Up/Dn:Scroll | L/R:Adjust | Esc:Save", rgb565(145, 160, 180), 1, false);

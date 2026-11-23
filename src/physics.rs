@@ -2,7 +2,7 @@
 //! Acro & Angle modes, motor spool lag, ground effect, obstacle collisions,
 //! turtle mode, battery sag simulation, and freestyle trick tracking.
 
-use crate::config::{Config, FlightMode, GameMode};
+use crate::config::{BatteryPack, Config, FlightMode, GameMode};
 use crate::math::{clampf, Quat, Vec3};
 use crate::tracks::{GateKind, Track};
 
@@ -36,6 +36,7 @@ pub struct QuadState {
     pub on_ground: bool,
     pub inverted: bool,
     pub hit_flash: f32,
+    pub prop_wash_phase: f32,
 
     // Battery simulation
     pub cell_voltage: f32,
@@ -70,7 +71,8 @@ impl QuadState {
             on_ground: true,
             inverted: false,
             hit_flash: 0.0,
-            cell_voltage: 4.20,
+            prop_wash_phase: 0.0,
+            cell_voltage: 4.35, // 1S LiHV fresh charge (4.35V)
             mah_used: 0.0,
             battery_empty: false,
             next_gate: 0,
@@ -121,9 +123,12 @@ impl QuadState {
         }
 
         let prev_pos = self.pos;
+        let batt_on = cfg.battery_pack != BatteryPack::Off;
+        let (pack_mah, pack_mass_g, pack_sag) = cfg.battery_pack.specs(&params);
+        let mass_ratio = (params.dry_mass_g + pack_mass_g) / (params.dry_mass_g + params.ref_batt_g);
 
         // 1. Motor spool lag (first-order filter)
-        let target_thr = if self.battery_empty && cfg.battery_sim {
+        let target_thr = if self.battery_empty && batt_on {
             0.0
         } else {
             clampf(input.throttle, 0.0, 1.0)
@@ -131,19 +136,23 @@ impl QuadState {
         let alpha = dt / (params.motor_tau + dt);
         self.motor_thr += (target_thr - self.motor_thr) * alpha;
 
-        // 2. Battery voltage sag & depletion
-        if cfg.battery_sim {
-            let amps = 1.5 + params.full_amp * self.motor_thr * self.motor_thr;
+        // 2. Battery voltage sag & depletion (LiHV 4.35V -> 3.30V for Lava II packs)
+        if batt_on {
+            let amps = (1.2 + params.full_amp * self.motor_thr * self.motor_thr) * mass_ratio.sqrt();
             self.mah_used += amps * (dt / 3.6);
-            let soc = (1.0 - self.mah_used / params.mah).clamp(0.0, 1.0);
-            let resting = 3.30 + 0.90 * soc;
-            let sag = 0.35 * self.motor_thr * self.motor_thr;
+            let soc = (1.0 - self.mah_used / pack_mah).clamp(0.0, 1.0);
+            let full_v = match cfg.battery_pack {
+                BatteryPack::LavaII580 | BatteryPack::LavaII680 => 4.35,
+                _ => 4.20,
+            };
+            let resting = 3.30 + (full_v - 3.30) * soc;
+            let sag = pack_sag * self.motor_thr * self.motor_thr;
             self.cell_voltage = (resting - sag).max(3.0);
             if soc <= 0.0 {
                 self.battery_empty = true;
             }
         } else {
-            self.cell_voltage = 4.20;
+            self.cell_voltage = 4.35;
             self.battery_empty = false;
         }
 
@@ -167,22 +176,16 @@ impl QuadState {
         let (center_sens, max_rate, expo) = cfg.actual_rates();
         let target_omega = match cfg.flight_mode {
             FlightMode::Acro => {
-                // In our Y-up +Z-forward right-handed frame:
-                // +X is right (positive rotation around +X pitches nose DOWN)
-                // +Y is up (positive rotation around +Y yaws RIGHT? Actually right-hand rule around +Y turns +Z toward +X = RIGHT! Wait: +Y x +Z = +X, so +Y rot turns +Z toward +X = RIGHT!)
-                // +Z is forward (positive rotation around +Z rolls LEFT; so roll right is -Z)
                 let pitch_rate = Self::betaflight_actual(input.pitch, center_sens, max_rate, expo);
                 let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.82, expo);
                 let roll_rate = -Self::betaflight_actual(input.roll, center_sens, max_rate, expo);
                 Vec3::new(pitch_rate, yaw_rate, roll_rate)
             }
             FlightMode::Angle => {
-                // Self-leveling: max 45 deg tilt
                 let max_tilt = 45.0_f32.to_radians();
                 let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
                 let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
 
-                // Measure current pitch/roll relative to world up
                 let cur_pitch = (-forward.y).asin();
                 let cur_roll = (-right.y).asin();
                 let pitch_err = desired_pitch - cur_pitch;
@@ -197,43 +200,59 @@ impl QuadState {
             }
         };
 
-        // Fast PID-like rotational tracking (airmode authority even at low throttle)
+        // Fast PID-like rotational tracking (slightly heavier pack = slightly softer snap)
         let rot_resp = if self.on_ground && self.motor_thr < 0.08 {
             2.0
         } else {
-            24.0
+            24.0 / mass_ratio.sqrt()
         };
         let rot_alpha = (rot_resp * dt).min(1.0);
         self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
+
+        // 4b. Realistic Stock Prop Wash (descending through own dirty air / dive pullout)
+        let mut wash_thrust_loss = 1.0_f32;
+        if cfg.prop_wash && !self.on_ground && self.vel.y < -1.8 && up.y > 0.25 {
+            let horiz_speed = (self.vel.x * self.vel.x + self.vel.z * self.vel.z).sqrt();
+            // Strongest when descending vertically with low forward airspeed & punching throttle
+            let descent = ((-self.vel.y - 1.8) / 8.0).clamp(0.0, 1.0);
+            let slow_factor = (1.0 - horiz_speed / 16.0).clamp(0.15, 1.0);
+            let intensity = descent * slow_factor * (0.35 + 0.65 * self.motor_thr);
+            self.prop_wash_phase += dt * 115.0; // ~18 Hz prop wash wobble
+            let wobble_p = self.prop_wash_phase.sin() * intensity * 0.42;
+            let wobble_r = (self.prop_wash_phase * 1.37).cos() * intensity * 0.55;
+            self.omega.x += wobble_p;
+            self.omega.z += wobble_r;
+            wash_thrust_loss = 1.0 - intensity * 0.11;
+        }
 
         // Integrate quaternion
         if !self.on_ground || self.motor_thr > 0.08 {
             self.rot = self.rot.integrate_body_omega(self.omega, dt);
         }
 
-        // 5. Forces: Thrust + Ground Effect + Quadratic Drag + Gravity
+        // 5. Forces: Thrust (scaled by battery mass ratio & sag) + Ground Effect + Drag + Gravity
         let (_, up_now, _) = self.rot.basis();
-        // Nonlinear prop thrust curve (feels like real Betaflight throttle)
         let thr_curve = self.motor_thr.powf(1.35);
-        let sag_factor = if cfg.battery_sim {
-            (self.cell_voltage / 4.0).clamp(0.72, 1.05)
+        let sag_factor = if batt_on {
+            (self.cell_voltage / 4.0).clamp(0.72, 1.06)
         } else {
             1.0
         };
-        // Ground effect cushion below 1.4 m
         let ge = if self.pos.y < 1.4 && up_now.y > 0.2 {
             1.0 + 0.16 * (1.0 - self.pos.y / 1.4)
         } else {
             1.0
         };
-        let thrust_mag = (params.idle_accel * self.motor_thr.signum()
+        let thrust_mag = ((params.idle_accel * self.motor_thr.signum()
             + params.max_accel * thr_curve)
+            / mass_ratio)
             * sag_factor
-            * ge;
+            * ge
+            * wash_thrust_loss;
 
         let thrust_accel = up_now.scale(thrust_mag);
         let speed = self.vel.len();
-        let drag_accel = self.vel.scale(-params.drag * speed - 0.12);
+        let drag_accel = self.vel.scale(-(params.drag / mass_ratio) * speed - 0.12);
         let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);
 
         let total_accel = thrust_accel.add(drag_accel).add(gravity_accel);

@@ -317,7 +317,7 @@ fn main() {
                 renderer.render_pause_menu(pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 13;
+                const NUM_SETTINGS: usize = 15;
                 if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
@@ -328,11 +328,13 @@ fn main() {
                         match settings_idx {
                             0 => cfg.game_mode = cfg.game_mode.toggle(),
                             1 => cfg.flight_mode = cfg.flight_mode.toggle(),
-                            2 => {
+                            2 => cfg.battery_pack = cfg.battery_pack.next(),
+                            3 => cfg.prop_wash = !cfg.prop_wash,
+                            4 => {
                                 let next = cfg.rates.next_preset();
                                 cfg.apply_rate_preset(next);
                             }
-                            3 => {
+                            5 => {
                                 cfg.rate_center = if act.left {
                                     cfg.rate_center.saturating_sub(10).max(50)
                                 } else {
@@ -340,7 +342,7 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            4 => {
+                            6 => {
                                 cfg.rate_max = if act.left {
                                     cfg.rate_max.saturating_sub(20).max(300)
                                 } else {
@@ -348,7 +350,7 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            5 => {
+                            7 => {
                                 cfg.rate_expo = if act.left {
                                     cfg.rate_expo.saturating_sub(5)
                                 } else {
@@ -356,27 +358,27 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            6 => {
+                            8 => {
                                 if act.left {
                                     cfg.camera_tilt_deg = cfg.camera_tilt_deg.saturating_sub(5);
                                 } else {
                                     cfg.camera_tilt_deg = (cfg.camera_tilt_deg + 5).min(50);
                                 }
                             }
-                            7 => {
+                            9 => {
                                 cfg.fov_deg = if act.left {
-                                    cfg.fov_deg.saturating_sub(10).max(75)
+                                    cfg.fov_deg.saturating_sub(5).max(75)
                                 } else {
-                                    (cfg.fov_deg + 10).min(105)
+                                    (cfg.fov_deg + 5).min(105)
                                 };
                             }
-                            8 => cfg.detail_high = !cfg.detail_high,
-                            9 => cfg.sky_detail = !cfg.sky_detail,
-                            10 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            11 => cfg.throttle_mode = cfg.throttle_mode.toggle(),
-                            12 => {
+                            10 => cfg.analog_filter = !cfg.analog_filter,
+                            11 => cfg.detail_high = !cfg.detail_high,
+                            12 => cfg.sky_detail = !cfg.sky_detail,
+                            13 => cfg.stick_mode = cfg.stick_mode.toggle(),
+                            14 => {
                                 if act.left {
-                                    cfg.battery_sim = !cfg.battery_sim;
+                                    cfg.throttle_mode = cfg.throttle_mode.toggle();
                                 } else {
                                     cfg.show_sticks = !cfg.show_sticks;
                                 }

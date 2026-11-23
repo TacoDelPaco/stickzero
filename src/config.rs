@@ -1,5 +1,6 @@
-//! Configuration, quad presets (including BetaFPV Air75 II & Meteor85 Pro II),
-//! custom Betaflight Actual rates, graphics settings, and persistent storage.
+//! Configuration, BetaFPV whoop & quad presets (Air75 II, Meteor75 Pro II),
+//! Lava II 580mAh / 680mAh battery packs with real weight/TWR physics,
+//! custom Betaflight Actual rates (default 100/480/0.20), prop wash, and analog FX.
 
 use std::fs;
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum QuadClass {
     Air75II,
-    Meteor85ProII,
+    Meteor75ProII,
     Whoop65,
     Toothpick3,
     Freestyle5,
@@ -18,7 +19,7 @@ impl QuadClass {
     pub fn name(self) -> &'static str {
         match self {
             Self::Air75II => "Air75 II 75mm",
-            Self::Meteor85ProII => "Meteor85 Pro II",
+            Self::Meteor75ProII => "Meteor75 Pro II",
             Self::Whoop65 => "65mm Whoop",
             Self::Toothpick3 => "3\" Toothpick",
             Self::Freestyle5 => "5\" Freestyle",
@@ -28,8 +29,8 @@ impl QuadClass {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Air75II => Self::Meteor85ProII,
-            Self::Meteor85ProII => Self::Whoop65,
+            Self::Air75II => Self::Meteor75ProII,
+            Self::Meteor75ProII => Self::Whoop65,
             Self::Whoop65 => Self::Toothpick3,
             Self::Toothpick3 => Self::Freestyle5,
             Self::Freestyle5 => Self::Racer5,
@@ -39,29 +40,35 @@ impl QuadClass {
 
     pub fn params(self) -> QuadParams {
         match self {
-            // BetaFPV Air75 II Freestyle 75mm (1S 450mAh, ultra-light nimble freestyle whoop)
+            // BetaFPV Air75 II Freestyle 75mm (ultra-light ~21g dry, 40mm props, nimble 1S)
             Self::Air75II => QuadParams {
-                max_accel: 42.0,
-                drag: 0.058,
-                motor_tau: 0.015,
+                max_accel: 43.0,
+                drag: 0.056,
+                motor_tau: 0.014,
                 idle_accel: 1.6,
+                dry_mass_g: 21.0,
+                ref_batt_g: 13.5,
                 mah: 450.0,
-                full_amp: 16.0,
+                full_amp: 15.5,
             },
-            // BetaFPV Meteor85 Pro II 85mm (2S 450mAh, punchy outdoor/freestyle whoop)
-            Self::Meteor85ProII => QuadParams {
-                max_accel: 50.0,
-                drag: 0.050,
+            // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, more throw & stability)
+            Self::Meteor75ProII => QuadParams {
+                max_accel: 40.5,
+                drag: 0.051,
                 motor_tau: 0.016,
-                idle_accel: 1.8,
-                mah: 450.0,
-                full_amp: 22.0,
+                idle_accel: 1.7,
+                dry_mass_g: 31.0,
+                ref_batt_g: 13.5,
+                mah: 550.0,
+                full_amp: 17.5,
             },
             Self::Whoop65 => QuadParams {
                 max_accel: 34.0,
                 drag: 0.075,
                 motor_tau: 0.022,
                 idle_accel: 1.5,
+                dry_mass_g: 18.0,
+                ref_batt_g: 8.5,
                 mah: 300.0,
                 full_amp: 12.0,
             },
@@ -70,6 +77,8 @@ impl QuadClass {
                 drag: 0.048,
                 motor_tau: 0.015,
                 idle_accel: 1.8,
+                dry_mass_g: 68.0,
+                ref_batt_g: 36.0,
                 mah: 450.0,
                 full_amp: 28.0,
             },
@@ -78,6 +87,8 @@ impl QuadClass {
                 drag: 0.040,
                 motor_tau: 0.018,
                 idle_accel: 2.0,
+                dry_mass_g: 410.0,
+                ref_batt_g: 220.0,
                 mah: 1300.0,
                 full_amp: 78.0,
             },
@@ -86,6 +97,8 @@ impl QuadClass {
                 drag: 0.036,
                 motor_tau: 0.014,
                 idle_accel: 2.2,
+                dry_mass_g: 320.0,
+                ref_batt_g: 210.0,
                 mah: 1300.0,
                 full_amp: 95.0,
             },
@@ -99,8 +112,50 @@ pub struct QuadParams {
     pub drag: f32,
     pub motor_tau: f32,
     pub idle_accel: f32,
+    pub dry_mass_g: f32,
+    pub ref_batt_g: f32,
     pub mah: f32,
     pub full_amp: f32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BatteryPack {
+    LavaII580,
+    LavaII680,
+    Stock,
+    Off,
+}
+
+impl BatteryPack {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LavaII580 => "Lava II 580mAh",
+            Self::LavaII680 => "Lava II 680mAh",
+            Self::Stock => "Stock Pack",
+            Self::Off => "Off (Infinite)",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::LavaII580 => Self::LavaII680,
+            Self::LavaII680 => Self::Stock,
+            Self::Stock => Self::Off,
+            Self::Off => Self::LavaII580,
+        }
+    }
+
+    /// Returns (capacity_mah, mass_g, sag_factor) where lower sag_factor = higher C-rating.
+    pub fn specs(self, quad: &QuadParams) -> (f32, f32, f32) {
+        match self {
+            // BetaFPV LAVA II 1S 580mAh folded cell (~13.5g, high C-rating, very low sag)
+            Self::LavaII580 => (580.0, 13.5, 0.24),
+            // BetaFPV LAVA II 1S 680mAh folded cell (~16.2g, longer flight, slightly heavier)
+            Self::LavaII680 => (680.0, 16.2, 0.22),
+            Self::Stock => (quad.mah, quad.ref_batt_g, 0.34),
+            Self::Off => (quad.mah, quad.ref_batt_g, 0.0),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -151,13 +206,13 @@ impl RatesPreset {
         }
     }
 
-    /// Betaflight Actual rate starting points: (center_sens deg/s, max_rate deg/s, expo %)
+    /// Betaflight Actual rate presets: (center_sens deg/s, max_rate deg/s, expo %)
     pub fn defaults(self) -> (u16, u16, u8) {
         match self {
-            Self::Soft => (120, 520, 50),
-            Self::Normal => (180, 680, 55),
-            Self::Fast => (220, 860, 60),
-            Self::Custom => (180, 680, 55),
+            Self::Soft => (100, 480, 20),
+            Self::Normal => (160, 640, 45),
+            Self::Fast => (220, 860, 55),
+            Self::Custom => (100, 480, 20),
         }
     }
 }
@@ -259,6 +314,8 @@ impl ThrottleMode {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub quad: QuadClass,
+    pub battery_pack: BatteryPack,
+    pub prop_wash: bool,
     pub flight_mode: FlightMode,
     pub rates: RatesPreset,
     /// Betaflight Actual Center Sensitivity (deg/s, 50..=400)
@@ -272,6 +329,7 @@ pub struct Config {
     /// Graphics settings
     pub detail_high: bool,
     pub sky_detail: bool,
+    pub analog_filter: bool,
     pub fov_deg: u8,
     pub game_mode: GameMode,
     pub track_index: usize,
@@ -286,7 +344,6 @@ pub struct Config {
     pub axis_pit: Option<u16>,
     pub axis_rol: Option<u16>,
     pub show_sticks: bool,
-    pub battery_sim: bool,
     pub best_laps_ms: [u32; 4],
 }
 
@@ -294,16 +351,19 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             quad: QuadClass::Air75II,
+            battery_pack: BatteryPack::LavaII580,
+            prop_wash: true,
             flight_mode: FlightMode::Acro,
-            rates: RatesPreset::Normal,
-            rate_center: 180,
-            rate_max: 680,
-            rate_expo: 55,
+            rates: RatesPreset::Soft,
+            rate_center: 100,
+            rate_max: 480,
+            rate_expo: 20,
             camera_tilt_deg: 25,
             theme: VisualTheme::Summer,
             detail_high: true,
             sky_detail: true,
-            fov_deg: 95,
+            analog_filter: true,
+            fov_deg: 90,
             game_mode: GameMode::Freestyle,
             track_index: 0,
             stick_mode: StickMode::Mode2,
@@ -317,7 +377,6 @@ impl Default for Config {
             axis_pit: None,
             axis_rol: None,
             show_sticks: true,
-            battery_sim: true,
             best_laps_ms: [0; 4],
         }
     }
@@ -358,19 +417,28 @@ impl Config {
             match k {
                 "quad" => cfg.quad = match v {
                     "air75ii" => QuadClass::Air75II,
-                    "meteor85proii" => QuadClass::Meteor85ProII,
+                    "meteor75proii" | "meteor85proii" => QuadClass::Meteor75ProII,
                     "whoop65" => QuadClass::Whoop65,
                     "toothpick3" => QuadClass::Toothpick3,
                     "freestyle5" => QuadClass::Freestyle5,
                     "racer5" => QuadClass::Racer5,
                     _ => QuadClass::Air75II,
                 },
+                "battery_pack" => cfg.battery_pack = match v {
+                    "lava580" => BatteryPack::LavaII580,
+                    "lava680" => BatteryPack::LavaII680,
+                    "stock" => BatteryPack::Stock,
+                    "off" => BatteryPack::Off,
+                    _ => BatteryPack::LavaII580,
+                },
+                "prop_wash" => cfg.prop_wash = v != "0",
                 "flight_mode" => cfg.flight_mode = if v == "angle" { FlightMode::Angle } else { FlightMode::Acro },
                 "rates" => cfg.rates = match v {
                     "soft" => RatesPreset::Soft,
+                    "normal" => RatesPreset::Normal,
                     "fast" => RatesPreset::Fast,
                     "custom" => RatesPreset::Custom,
-                    _ => RatesPreset::Normal,
+                    _ => RatesPreset::Soft,
                 },
                 "rate_center" => if let Ok(n) = v.parse::<u16>() { cfg.rate_center = n.clamp(50, 400); },
                 "rate_max" => if let Ok(n) = v.parse::<u16>() { cfg.rate_max = n.clamp(300, 1200); },
@@ -384,6 +452,7 @@ impl Config {
                 },
                 "detail_high" => cfg.detail_high = v != "0",
                 "sky_detail" => cfg.sky_detail = v != "0",
+                "analog_filter" => cfg.analog_filter = v != "0",
                 "fov_deg" => if let Ok(f) = v.parse::<u8>() { cfg.fov_deg = f.clamp(70, 115); },
                 "game_mode" => cfg.game_mode = if v == "race" { GameMode::Race } else { GameMode::Freestyle },
                 "track" => if let Ok(i) = v.parse::<usize>() { cfg.track_index = i.min(3); },
@@ -398,7 +467,6 @@ impl Config {
                 "axis_pit" => cfg.axis_pit = v.parse::<u16>().ok(),
                 "axis_rol" => cfg.axis_rol = v.parse::<u16>().ok(),
                 "show_sticks" => cfg.show_sticks = v != "0",
-                "battery_sim" => cfg.battery_sim = v != "0",
                 "best0" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[0] = ms; },
                 "best1" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[1] = ms; },
                 "best2" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[2] = ms; },
@@ -416,11 +484,17 @@ impl Config {
         }
         let quad = match self.quad {
             QuadClass::Air75II => "air75ii",
-            QuadClass::Meteor85ProII => "meteor85proii",
+            QuadClass::Meteor75ProII => "meteor75proii",
             QuadClass::Whoop65 => "whoop65",
             QuadClass::Toothpick3 => "toothpick3",
             QuadClass::Freestyle5 => "freestyle5",
             QuadClass::Racer5 => "racer5",
+        };
+        let batt = match self.battery_pack {
+            BatteryPack::LavaII580 => "lava580",
+            BatteryPack::LavaII680 => "lava680",
+            BatteryPack::Stock => "stock",
+            BatteryPack::Off => "off",
         };
         let fm = match self.flight_mode {
             FlightMode::Acro => "acro",
@@ -452,13 +526,15 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\nshow_sticks={}\nbattery_sim={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            self.prop_wash as u8,
             self.rate_center,
             self.rate_max,
             self.rate_expo,
             self.camera_tilt_deg,
             self.detail_high as u8,
             self.sky_detail as u8,
+            self.analog_filter as u8,
             self.fov_deg,
             self.track_index,
             self.invert_pitch as u8,
@@ -470,7 +546,6 @@ impl Config {
             fmt_opt(self.axis_pit),
             fmt_opt(self.axis_rol),
             self.show_sticks as u8,
-            self.battery_sim as u8,
             self.best_laps_ms[0],
             self.best_laps_ms[1],
             self.best_laps_ms[2],
