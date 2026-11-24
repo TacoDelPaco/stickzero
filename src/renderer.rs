@@ -1516,7 +1516,7 @@ impl Renderer {
             ("TRACK", format!("{} ({})", track.name, track.subtitle)),
             (
                 "DRONE",
-                format!("{} | {}", cfg.quad.craft_name(), cfg.battery_pack.short_name()),
+                format!("{} | {}g {}", cfg.quad.craft_name(), cfg.weight_g, cfg.battery_pack.short_name()),
             ),
             ("THEME", format!("{} / {} deg", cfg.theme.name(), cfg.camera_tilt_deg)),
             ("SETTINGS", format!("{} | Rates, Gfx, OSD", cfg.flight_mode.name())),
@@ -1549,17 +1549,18 @@ impl Renderer {
 
     pub fn render_drone_tuning_menu(&mut self, cfg: &Config, selected: usize) {
         let ui = ui_colors(cfg.ui_theme);
-        let rows: [(&str, String); 10] = [
+        let rows: [(&str, String); 11] = [
             ("Quad Preset", cfg.quad.name().to_string()),
             ("Battery Pack", cfg.battery_pack.name().to_string()),
             ("Prop Wash", cfg.prop_wash.name().to_string()),
-            ("Thrust", format!("{}% ({:.1}:1)", cfg.thrust_pct, cfg.effective_twr())),
-            ("Weight", format!("{}% ({:.0}g AUW)", cfg.weight_pct, cfg.effective_auw_grams())),
-            ("Air Drag", format!("{}%", cfg.drag_pct)),
-            ("Rotor Grip", format!("{}%", cfg.grip_pct)),
-            ("Motor Resp", format!("{}%", cfg.motor_pct)),
-            ("Thr Expo", format!("{:.2} (Hover)", cfg.thr_expo as f32 / 100.0)),
-            ("Reset Tuning", "Press Enter -> Stock".to_string()),
+            ("Weight (g)", format!("{}", cfg.weight_g)),
+            ("Thrust (g)", format!("{} ({:.1}:1)", cfg.thrust_g, cfg.effective_twr())),
+            ("Air Drag", format!("{:.2}", cfg.air_drag as f32 / 100.0)),
+            ("Rotor Grip", format!("{:.2}", cfg.rotor_grip as f32 / 100.0)),
+            ("Motor Lag (ms)", format!("{}", cfg.motor_lag_ms)),
+            ("Thr Mid", format!("{:.2}", cfg.thr_mid as f32 / 100.0)),
+            ("Thr Expo", format!("{:.2}", cfg.thr_expo as f32 / 100.0)),
+            ("Reset Tuning", "Enter -> Stock".to_string()),
         ];
 
         let tag = format!("{}/{}", selected + 1, rows.len());
@@ -1583,7 +1584,7 @@ impl Renderer {
             let kcol = if is_sel { ui.sel_label } else { ui.label };
             let vcol = if is_sel { ui.sel_val } else { ui.val };
             self.draw_text(12, y + 1, k, kcol, 1, false);
-            self.draw_text(120, y + 1, v, vcol, 1, false);
+            self.draw_text(128, y + 1, v, vcol, 1, false);
         }
 
         self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Tune | Esc:Save & Back", ui.muted, 1, false);

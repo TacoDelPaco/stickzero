@@ -18,7 +18,7 @@ StickTime-Pi runs `StickTime.lua` inside an embedded Lua 5.3 interpreter (design
 - **6-DOF FPV Flight Physics (240 Hz)**:
   - **Flight Modes**: `ACRO` (full 3D flips/rolls/dives), `HORIZON` (self-leveling near center, full acro flips past 55%–85% stick), and `ANGLE` (self-leveling).
   - **6 Quad Presets**: `Air75 II 75mm`, `Meteor75 Pro II`, `65mm Whoop`, `3" Toothpick`, `5" Freestyle`, `5" Racer`.
-  - **Drone Tuning Menu** (*The Zone*-style customization): **Battery Pack** (`Lava II 580mAh`, `Lava II 680mAh`, `Stock`, `Off`), **Prop Wash** (`Off` / `Stock` / `Max`), **Thrust** (60–150% with live TWR readout), **Weight** (70–150% with live AUW readout), **Air Drag** (50–160%), **Rotor Grip** (0–160%), **Motor Response** (60–150%), and **Throttle Expo** (0.00–0.60 around hover).
+  - **Drone Tuning Menu** (*The Zone*-style real physical units): **Battery Pack** (`Lava II 580mAh`, `Lava II 680mAh`, `Stock`, `Off`), **Prop Wash** (`Off` / `Stock` / `Max`), **Weight (g)** (`15–1500 g` AUW), **Thrust (g)** (`40–8000 g` with live TWR readout), **Air Drag** (`0.05–1.00`), **Rotor Grip** (`0.00–1.00`), **Motor Lag (ms)** (`5–45 ms`), **Thr Mid** (`0.20–0.70`), and **Thr Expo** (`0.00–0.80`).
   - **StickTime-calibrated Hover Aerodynamics**: Axial inflow climb damping & descent cushion, translational lift, in-plane rotor grip, realistic ground friction & yaw-while-grounded, solid 3D gate collisions, and grounded **Turtle Mode**.
   - **Betaflight Actual Rates**: `Soft` (`100/480/0.20`), `Normal`, `Fast`, or fully customizable `Center Sens`, `Max Rate`, and `Rate Expo`.
 - **Per-Pixel 16-bit Z-Buffered 3D Engine & 4 Tracks**:
@@ -51,8 +51,8 @@ bash ./package.sh
 ### Option A: One-line install directly on CardputerZero (over Wi-Fi)
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.4_arm64.deb \
-  && sudo dpkg -i stickzero_0.1.4_arm64.deb \
+curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.5_arm64.deb \
+  && sudo dpkg -i stickzero_0.1.5_arm64.deb \
   && systemctl --user restart APPLaunch.service
 ```
 

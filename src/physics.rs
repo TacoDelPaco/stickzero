@@ -200,15 +200,15 @@ impl QuadState {
         deg_s * (std::f32::consts::PI / 180.0)
     }
 
-    /// Betaflight throttle mid + expo curve (flattens sensitivity around hover `mid=0.40`).
+    /// Betaflight throttle mid + expo curve (flattens sensitivity around `thr_mid`).
     #[inline]
-    fn apply_throttle_expo(raw: f32, expo_pct: u8) -> f32 {
+    fn apply_throttle_expo(raw: f32, mid_pct: u8, expo_pct: u8) -> f32 {
         let x = clampf(raw, 0.0, 1.0);
-        let e = (expo_pct as f32 / 100.0).clamp(0.0, 0.65);
+        let e = (expo_pct as f32 / 100.0).clamp(0.0, 0.80);
         if e < 1e-3 {
             return x;
         }
-        let mid = 0.40_f32;
+        let mid = (mid_pct as f32 / 100.0).clamp(0.20, 0.70);
         if x < mid {
             let u = (x - mid) / mid; // -1..0
             mid + mid * ((1.0 - e) * u + e * u * u * u)
@@ -268,23 +268,22 @@ impl QuadState {
 
         let prev_pos = self.pos;
         let batt_on = cfg.battery_pack != BatteryPack::Off;
-        let (pack_mah, pack_mass_g, pack_sag) = cfg.battery_pack.specs(&params);
+        let (pack_mah, _, pack_sag) = cfg.battery_pack.specs(&params);
 
-        // Apply custom Drone Tuning multipliers ("The Zone"-style physics customization)
-        let thrust_scale = cfg.thrust_pct as f32 / 100.0;
-        let weight_scale = cfg.weight_pct as f32 / 100.0;
-        let drag_scale = cfg.drag_pct as f32 / 100.0;
-        let grip_scale = cfg.grip_pct as f32 / 100.0;
-        let motor_scale = cfg.motor_pct as f32 / 100.0;
-
-        let effective_dry_g = params.dry_mass_g * weight_scale;
-        let mass_ratio = (effective_dry_g + pack_mass_g) / (params.dry_mass_g + params.ref_batt_g);
-        let eff_motor_tau = (params.motor_tau / motor_scale).clamp(0.005, 0.05);
+        // Direct physical Drone Tuning values ("The Zone"-style real units)
+        let weight_g = (cfg.weight_g as f32).max(15.0);
+        let thrust_g = (cfg.thrust_g as f32).max(40.0);
+        let ref_auw_g = (params.dry_mass_g + params.ref_batt_g).max(15.0);
+        let mass_ratio = (weight_g / ref_auw_g).clamp(0.35, 3.0);
+        let thrust_ratio = (thrust_g / (params.thrust_g as f32).max(40.0)).clamp(0.35, 3.0);
+        // Exact Newtonian max upward acceleration from thrust (g) / weight (g) * g
+        let max_accel = (thrust_g / weight_g) * GRAVITY;
+        let eff_motor_tau = (cfg.motor_lag_ms as f32 / 1000.0).clamp(0.005, 0.050);
 
         self.throttle_pct = (clampf(input.throttle, 0.0, 1.0) * 100.0).round() as u8;
 
-        // 1. Betaflight throttle expo + motor spool lag
-        let shaped_thr = Self::apply_throttle_expo(input.throttle, cfg.thr_expo);
+        // 1. Betaflight throttle mid + expo + motor spool lag
+        let shaped_thr = Self::apply_throttle_expo(input.throttle, cfg.thr_mid, cfg.thr_expo);
         let target_thr = if !self.armed || (self.battery_empty && batt_on) {
             0.0
         } else {
@@ -300,7 +299,7 @@ impl QuadState {
         if batt_on {
             let draw_active = self.armed && !self.battery_empty;
             let amps = if draw_active {
-                (1.1 + params.full_amp * thrust_scale * self.motor_thr * self.motor_thr) * mass_ratio.sqrt()
+                (1.1 + params.full_amp * thrust_ratio * self.motor_thr * self.motor_thr) * mass_ratio.sqrt()
             } else {
                 0.35
             };
@@ -361,7 +360,7 @@ impl QuadState {
         let turtle_flipping = turtle_ready && (input.roll.abs() > 0.40 || input.pitch.abs() > 0.40);
 
         // Compute static + aerodynamic thrust (StickTime-style climb loss, descent cushion, translational lift)
-        let thr_curve = self.motor_thr.powf(1.18); // Closer to StickTime whoop curve (0.92..1.4) + thr_expo around hover!
+        let thr_curve = self.motor_thr.powf(1.18);
         let sag_factor = if batt_on {
             (self.cell_voltage / 4.0).clamp(0.72, 1.05)
         } else {
@@ -376,9 +375,7 @@ impl QuadState {
         let base_thrust = if !self.armed || turtle_ready {
             0.0
         } else {
-            ((params.idle_accel * self.motor_thr.signum()
-                + params.max_accel * thrust_scale * thr_curve)
-                / mass_ratio)
+            ((params.idle_accel / mass_ratio) * self.motor_thr.signum() + max_accel * thr_curve)
                 * sag_factor
                 * ge
         };
@@ -502,8 +499,10 @@ impl QuadState {
                 }
             };
 
+            let motor_resp_scale =
+                (params.motor_lag_ms as f32 / (cfg.motor_lag_ms as f32).max(5.0)).clamp(0.4, 2.5);
             let rot_resp = if self.armed {
-                (24.0 * motor_scale.sqrt()) / mass_ratio.sqrt()
+                (24.0 * motor_resp_scale.sqrt()) / mass_ratio.sqrt()
             } else {
                 1.0
             };
@@ -529,14 +528,15 @@ impl QuadState {
 
         let thrust_accel = up_now.scale(thrust_mag);
         let speed = self.vel.len();
-        let eff_drag = (params.drag * drag_scale) / mass_ratio;
-        let drag_accel = self.vel.scale(-eff_drag * speed - 0.04 * drag_scale);
+        let eff_drag = (cfg.air_drag as f32) / 1000.0; // e.g. 29 (0.29) -> 0.029
+        let drag_accel = self.vel.scale(-eff_drag * speed - eff_drag * 1.4);
 
-        // In-plane rotor H-force grip (StickTime Grip setting: carves turns cleanly without icy drift)
+        // In-plane rotor H-force grip (carves turns cleanly without icy drift)
         let v_plane = right_now
             .scale(self.vel.dot(right_now))
             .add(fwd_now.scale(self.vel.dot(fwd_now)));
-        let grip_coeff = (params.grip * grip_scale / mass_ratio) * ((thrust_mag / (5.0 * GRAVITY) + 0.04).sqrt());
+        let eff_grip = (cfg.rotor_grip as f32) / 100.0; // e.g. 34 -> 0.34
+        let grip_coeff = eff_grip * ((thrust_mag / (5.0 * GRAVITY) + 0.04).sqrt());
         let grip_accel = v_plane.scale(-grip_coeff);
 
         let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);

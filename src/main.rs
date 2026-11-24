@@ -168,8 +168,13 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     renderer.render_main_menu(&cfg, 0, &input);
     png::save_rgb565_png(&dir.join("sticktime-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 3. Monokai Settings showing UI Theme + Stick OSD: Trails
+    // 3. Monokai Drone Tuning Menu (real physical units: Weight (g): 37 with Lava II 680mAh)
     cfg.ui_theme = UiTheme::Monokai;
+    cfg.set_battery_pack(BatteryPack::LavaII680);
+    renderer.render_drone_tuning_menu(&cfg, 3);
+    png::save_rgb565_png(&dir.join("monokai-drone-tuning.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 4. Monokai Settings showing UI Theme + Stick OSD: Trails
     cfg.flight_mode = FlightMode::Horizon;
     cfg.stick_overlay = StickOverlay::Trails;
     renderer.render_settings_menu(&cfg, 10);
@@ -321,7 +326,8 @@ fn main() {
                                 sub_return = AppScreen::MainMenu;
                                 screen = AppScreen::DroneTuning;
                             } else {
-                                cfg.quad = if act.left { cfg.quad.prev() } else { cfg.quad.next() };
+                                let next_q = if act.left { cfg.quad.prev() } else { cfg.quad.next() };
+                                cfg.set_quad(next_q);
                                 cfg.save();
                             }
                         }
@@ -344,7 +350,7 @@ fn main() {
                 renderer.render_main_menu(&cfg, menu_idx, &input);
             }
             AppScreen::DroneTuning => {
-                const NUM_DRONE: usize = 10;
+                const NUM_DRONE: usize = 11;
                 if act.back {
                     cfg.save();
                     screen = sub_return;
@@ -353,13 +359,17 @@ fn main() {
                     if act.down { drone_idx = (drone_idx + 1) % NUM_DRONE; }
                     if act.left || act.right || act.select {
                         match drone_idx {
-                            0 => cfg.quad = if act.left { cfg.quad.prev() } else { cfg.quad.next() },
+                            0 => {
+                                let next_q = if act.left { cfg.quad.prev() } else { cfg.quad.next() };
+                                cfg.set_quad(next_q);
+                            }
                             1 => {
-                                cfg.battery_pack = if act.left {
+                                let next_b = if act.left {
                                     cfg.battery_pack.prev()
                                 } else {
                                     cfg.battery_pack.next()
                                 };
+                                cfg.set_battery_pack(next_b);
                             }
                             2 => {
                                 cfg.prop_wash = if act.left {
@@ -369,48 +379,64 @@ fn main() {
                                 };
                             }
                             3 => {
-                                cfg.thrust_pct = if act.left {
-                                    cfg.thrust_pct.saturating_sub(5).max(60)
+                                // Weight (g): 1g steps for whoops (<=100g), 5g for micros, 10g for 5"
+                                let step: u16 = if cfg.weight_g <= 100 { 1 } else if cfg.weight_g <= 250 { 5 } else { 10 };
+                                cfg.weight_g = if act.left {
+                                    cfg.weight_g.saturating_sub(step).max(15)
                                 } else {
-                                    (cfg.thrust_pct + 5).min(150)
+                                    (cfg.weight_g + step).min(1500)
                                 };
                             }
                             4 => {
-                                cfg.weight_pct = if act.left {
-                                    cfg.weight_pct.saturating_sub(5).max(70)
+                                // Thrust (g): 5g steps for whoops (<=300g), 20g for micros, 100g for 5"
+                                let step: u16 = if cfg.thrust_g <= 300 { 5 } else if cfg.thrust_g <= 1000 { 20 } else { 100 };
+                                cfg.thrust_g = if act.left {
+                                    cfg.thrust_g.saturating_sub(step).max(40)
                                 } else {
-                                    (cfg.weight_pct + 5).min(150)
+                                    (cfg.thrust_g + step).min(8000)
                                 };
                             }
                             5 => {
-                                cfg.drag_pct = if act.left {
-                                    cfg.drag_pct.saturating_sub(5).max(50)
+                                // Air Drag (0.05..=1.00, step 0.02)
+                                cfg.air_drag = if act.left {
+                                    cfg.air_drag.saturating_sub(2).max(5)
                                 } else {
-                                    (cfg.drag_pct + 5).min(160)
+                                    (cfg.air_drag + 2).min(100)
                                 };
                             }
                             6 => {
-                                cfg.grip_pct = if act.left {
-                                    cfg.grip_pct.saturating_sub(10)
+                                // Rotor Grip (0.00..=1.00, step 0.02)
+                                cfg.rotor_grip = if act.left {
+                                    cfg.rotor_grip.saturating_sub(2)
                                 } else {
-                                    (cfg.grip_pct + 10).min(160)
+                                    (cfg.rotor_grip + 2).min(100)
                                 };
                             }
                             7 => {
-                                cfg.motor_pct = if act.left {
-                                    cfg.motor_pct.saturating_sub(5).max(60)
+                                // Motor Lag (ms): 5..=45 ms, step 1 ms
+                                cfg.motor_lag_ms = if act.left {
+                                    cfg.motor_lag_ms.saturating_sub(1).max(5)
                                 } else {
-                                    (cfg.motor_pct + 5).min(150)
+                                    (cfg.motor_lag_ms + 1).min(45)
                                 };
                             }
                             8 => {
+                                // Throttle Mid (0.20..=0.70, step 0.02)
+                                cfg.thr_mid = if act.left {
+                                    cfg.thr_mid.saturating_sub(2).max(20)
+                                } else {
+                                    (cfg.thr_mid + 2).min(70)
+                                };
+                            }
+                            9 => {
+                                // Throttle Expo (0.00..=0.80, step 0.05)
                                 cfg.thr_expo = if act.left {
                                     cfg.thr_expo.saturating_sub(5)
                                 } else {
-                                    (cfg.thr_expo + 5).min(60)
+                                    (cfg.thr_expo + 5).min(80)
                                 };
                             }
-                            9 if act.select => {
+                            10 if act.select => {
                                 cfg.reset_drone_tuning();
                             }
                             _ => {}

@@ -64,68 +64,78 @@ impl QuadClass {
 
     pub fn params(self) -> QuadParams {
         match self {
-            // BetaFPV Air75 II Freestyle 75mm (~21g dry, 40mm props, nimble 1S ~3.4:1 TWR)
+            // BetaFPV Air75 II Freestyle 75mm (~21g dry + 13.5g Lava580 = 35g AUW, or 37g w/ Lava680)
             Self::Air75II => QuadParams {
-                max_accel: 35.5,
-                drag: 0.029,
-                grip: 0.34,
-                motor_tau: 0.015,
+                thrust_g: 125,
+                air_drag: 29,     // 0.29
+                rotor_grip: 34,   // 0.34
+                motor_lag_ms: 15, // 15 ms
+                thr_mid: 38,      // 0.38
                 idle_accel: 0.75,
                 dry_mass_g: 21.0,
                 ref_batt_g: 13.5,
                 mah: 450.0,
                 full_amp: 15.5,
             },
-            // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, planted carry & stability)
+            // BetaFPV Meteor75 Pro II 75mm (~31g dry + 13.5g Lava580 = 45g AUW, 45mm props)
             Self::Meteor75ProII => QuadParams {
-                max_accel: 33.0,
-                drag: 0.026,
-                grip: 0.38,
-                motor_tau: 0.017,
+                thrust_g: 155,
+                air_drag: 26,     // 0.26
+                rotor_grip: 38,   // 0.38
+                motor_lag_ms: 17, // 17 ms
+                thr_mid: 38,      // 0.38
                 idle_accel: 0.75,
                 dry_mass_g: 31.0,
                 ref_batt_g: 13.5,
                 mah: 550.0,
                 full_amp: 17.5,
             },
+            // 65mm Indoor Whoop (~18g dry + 8.5g 300mAh = 27g AUW)
             Self::Whoop65 => QuadParams {
-                max_accel: 28.0,
-                drag: 0.038,
-                grip: 0.42,
-                motor_tau: 0.021,
+                thrust_g: 90,
+                air_drag: 38,     // 0.38
+                rotor_grip: 42,   // 0.42
+                motor_lag_ms: 21, // 21 ms
+                thr_mid: 40,      // 0.40
                 idle_accel: 0.65,
                 dry_mass_g: 18.0,
                 ref_batt_g: 8.5,
                 mah: 300.0,
                 full_amp: 12.0,
             },
+            // 3" Sub-120g Toothpick (~68g dry + 36g 2S/3S = 104g AUW)
             Self::Toothpick3 => QuadParams {
-                max_accel: 54.0,
-                drag: 0.036,
-                grip: 0.28,
-                motor_tau: 0.014,
+                thrust_g: 540,
+                air_drag: 36,     // 0.36
+                rotor_grip: 28,   // 0.28
+                motor_lag_ms: 14, // 14 ms
+                thr_mid: 34,      // 0.34
                 idle_accel: 1.4,
                 dry_mass_g: 68.0,
                 ref_batt_g: 36.0,
                 mah: 450.0,
                 full_amp: 28.0,
             },
+            // 5" 6S Freestyle (~410g dry + 220g 1300mAh = 630g AUW)
             Self::Freestyle5 => QuadParams {
-                max_accel: 68.0,
-                drag: 0.032,
-                grip: 0.26,
-                motor_tau: 0.016,
+                thrust_g: 4100,
+                air_drag: 32,     // 0.32
+                rotor_grip: 26,   // 0.26
+                motor_lag_ms: 16, // 16 ms
+                thr_mid: 30,      // 0.30
                 idle_accel: 1.8,
                 dry_mass_g: 410.0,
                 ref_batt_g: 220.0,
                 mah: 1300.0,
                 full_amp: 78.0,
             },
+            // 5" 6S Racer (~320g dry + 210g 1300mAh = 530g AUW)
             Self::Racer5 => QuadParams {
-                max_accel: 82.0,
-                drag: 0.028,
-                grip: 0.24,
-                motor_tau: 0.012,
+                thrust_g: 4350,
+                air_drag: 28,     // 0.28
+                rotor_grip: 24,   // 0.24
+                motor_lag_ms: 12, // 12 ms
+                thr_mid: 26,      // 0.26
                 idle_accel: 2.0,
                 dry_mass_g: 320.0,
                 ref_batt_g: 210.0,
@@ -138,11 +148,16 @@ impl QuadClass {
 
 #[derive(Copy, Clone, Debug)]
 pub struct QuadParams {
-    pub max_accel: f32,
-    pub drag: f32,
-    /// In-plane rotor H-force grip coefficient
-    pub grip: f32,
-    pub motor_tau: f32,
+    /// Total static max thrust in grams
+    pub thrust_g: u16,
+    /// Aerodynamic drag coefficient * 100 (e.g. 29 -> 0.29)
+    pub air_drag: u8,
+    /// In-plane rotor H-force grip * 100 (e.g. 34 -> 0.34)
+    pub rotor_grip: u8,
+    /// Motor/ESC spin-up time constant in milliseconds
+    pub motor_lag_ms: u8,
+    /// Betaflight throttle mid * 100 (e.g. 38 -> 0.38)
+    pub thr_mid: u8,
     pub idle_accel: f32,
     pub dry_mass_g: f32,
     pub ref_batt_g: f32,
@@ -514,13 +529,14 @@ pub struct Config {
     pub quad: QuadClass,
     pub battery_pack: BatteryPack,
     pub prop_wash: PropWashLevel,
-    // Optional "The Zone"-style Drone Tuning multipliers
-    pub thrust_pct: u16, // 60..=150 %
-    pub weight_pct: u16, // 70..=150 %
-    pub drag_pct: u16,   // 50..=160 %
-    pub grip_pct: u16,   // 0..=160 %
-    pub motor_pct: u16,  // 60..=150 %
-    pub thr_expo: u8,    // 0..=60 (0.00..=0.60 Betaflight throttle expo around hover)
+    // "The Zone"-style real physical Drone Tuning parameters (no abstract percentages!)
+    pub weight_g: u16,     // Total AUW in grams (15..=1500 g)
+    pub thrust_g: u16,     // Max static thrust in grams (40..=8000 g)
+    pub air_drag: u8,      // Aerodynamic drag * 100 (5..=100 -> 0.05..=1.00)
+    pub rotor_grip: u8,    // In-plane rotor grip * 100 (0..=100 -> 0.00..=1.00)
+    pub motor_lag_ms: u8,  // Motor/ESC spool lag in ms (5..=45 ms)
+    pub thr_mid: u8,       // Betaflight throttle mid * 100 (20..=70 -> 0.20..=0.70)
+    pub thr_expo: u8,      // Betaflight throttle expo * 100 (0..=80 -> 0.00..=0.80)
 
     pub flight_mode: FlightMode,
     pub rates: RatesPreset,
@@ -561,11 +577,12 @@ impl Default for Config {
             quad: QuadClass::Air75II,
             battery_pack: BatteryPack::LavaII580,
             prop_wash: PropWashLevel::Stock,
-            thrust_pct: 100,
-            weight_pct: 100,
-            drag_pct: 100,
-            grip_pct: 100,
-            motor_pct: 100,
+            weight_g: 35,
+            thrust_g: 125,
+            air_drag: 29,
+            rotor_grip: 34,
+            motor_lag_ms: 15,
+            thr_mid: 38,
             thr_expo: 25,
             flight_mode: FlightMode::Acro,
             rates: RatesPreset::Soft,
@@ -603,28 +620,43 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Switch quad preset and load its real-world physical stock specs (grams, drag, grip, motor lag).
+    pub fn set_quad(&mut self, new_quad: QuadClass) {
+        self.quad = new_quad;
+        if !matches!(new_quad, QuadClass::Air75II | QuadClass::Meteor75ProII)
+            && matches!(self.battery_pack, BatteryPack::LavaII580 | BatteryPack::LavaII680)
+        {
+            self.battery_pack = BatteryPack::Stock;
+        }
+        self.reset_drone_tuning();
+    }
+
+    /// Switch battery pack and adjust total `weight_g` by the real battery mass delta.
+    pub fn set_battery_pack(&mut self, new_pack: BatteryPack) {
+        let p = self.quad.params();
+        let (_, old_g, _) = self.battery_pack.specs(&p);
+        let (_, new_g, _) = new_pack.specs(&p);
+        let delta = (new_g - old_g).round() as i32;
+        self.battery_pack = new_pack;
+        self.weight_g = (self.weight_g as i32 + delta).clamp(15, 1500) as u16;
+    }
+
+    /// Reset all numeric drone tuning values back to the current Quad Preset + Battery Pack stock specs.
     pub fn reset_drone_tuning(&mut self) {
-        self.thrust_pct = 100;
-        self.weight_pct = 100;
-        self.drag_pct = 100;
-        self.grip_pct = 100;
-        self.motor_pct = 100;
+        let p = self.quad.params();
+        let (_, batt_g, _) = self.battery_pack.specs(&p);
+        self.weight_g = (p.dry_mass_g + batt_g).round().clamp(15.0, 1500.0) as u16;
+        self.thrust_g = p.thrust_g;
+        self.air_drag = p.air_drag;
+        self.rotor_grip = p.rotor_grip;
+        self.motor_lag_ms = p.motor_lag_ms;
+        self.thr_mid = p.thr_mid;
         self.thr_expo = 25;
     }
 
-    pub fn effective_auw_grams(&self) -> f32 {
-        let p = self.quad.params();
-        let (_, batt_g, _) = self.battery_pack.specs(&p);
-        p.dry_mass_g * (self.weight_pct as f32 / 100.0) + batt_g
-    }
-
+    /// Thrust-to-weight ratio computed directly from `thrust_g / weight_g`.
     pub fn effective_twr(&self) -> f32 {
-        let p = self.quad.params();
-        let (_, batt_g, _) = self.battery_pack.specs(&p);
-        let mass_ratio = (p.dry_mass_g * (self.weight_pct as f32 / 100.0) + batt_g)
-            / (p.dry_mass_g + p.ref_batt_g);
-        let max_a = p.max_accel * (self.thrust_pct as f32 / 100.0) / mass_ratio;
-        max_a / 10.6
+        (self.thrust_g as f32) / (self.weight_g as f32).max(15.0)
     }
 
     pub fn apply_rate_preset(&mut self, preset: RatesPreset) {
@@ -654,6 +686,13 @@ impl Config {
         let Ok(text) = fs::read_to_string(&path) else {
             return cfg;
         };
+        let mut custom_weight: Option<u16> = None;
+        let mut custom_thrust: Option<u16> = None;
+        let mut custom_drag: Option<u8> = None;
+        let mut custom_grip: Option<u8> = None;
+        let mut custom_lag: Option<u8> = None;
+        let mut custom_mid: Option<u8> = None;
+
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             let k = k.trim();
@@ -680,12 +719,13 @@ impl Config {
                     "2" | "max" => PropWashLevel::Max,
                     _ => PropWashLevel::Stock,
                 },
-                "thrust_pct" => if let Ok(n) = v.parse::<u16>() { cfg.thrust_pct = n.clamp(60, 150); },
-                "weight_pct" => if let Ok(n) = v.parse::<u16>() { cfg.weight_pct = n.clamp(70, 150); },
-                "drag_pct" => if let Ok(n) = v.parse::<u16>() { cfg.drag_pct = n.clamp(50, 160); },
-                "grip_pct" => if let Ok(n) = v.parse::<u16>() { cfg.grip_pct = n.clamp(0, 160); },
-                "motor_pct" => if let Ok(n) = v.parse::<u16>() { cfg.motor_pct = n.clamp(60, 150); },
-                "thr_expo" => if let Ok(n) = v.parse::<u8>() { cfg.thr_expo = n.clamp(0, 60); },
+                "weight_g" => if let Ok(n) = v.parse::<u16>() { custom_weight = Some(n.clamp(15, 1500)); },
+                "thrust_g" => if let Ok(n) = v.parse::<u16>() { custom_thrust = Some(n.clamp(40, 8000)); },
+                "air_drag" => if let Ok(n) = v.parse::<u8>() { custom_drag = Some(n.clamp(5, 100)); },
+                "rotor_grip" => if let Ok(n) = v.parse::<u8>() { custom_grip = Some(n.clamp(0, 100)); },
+                "motor_lag_ms" => if let Ok(n) = v.parse::<u8>() { custom_lag = Some(n.clamp(5, 45)); },
+                "thr_mid" => if let Ok(n) = v.parse::<u8>() { custom_mid = Some(n.clamp(20, 70)); },
+                "thr_expo" => if let Ok(n) = v.parse::<u8>() { cfg.thr_expo = n.clamp(0, 80); },
                 "flight_mode" => cfg.flight_mode = match v {
                     "horizon" => FlightMode::Horizon,
                     "angle" => FlightMode::Angle,
@@ -746,6 +786,17 @@ impl Config {
                 _ => {}
             }
         }
+
+        // Initialize baseline real-unit specs from the loaded quad & battery pack, then apply any saved custom values
+        let saved_expo = cfg.thr_expo;
+        cfg.reset_drone_tuning();
+        cfg.thr_expo = saved_expo;
+        if let Some(w) = custom_weight { cfg.weight_g = w; }
+        if let Some(t) = custom_thrust { cfg.thrust_g = t; }
+        if let Some(d) = custom_drag { cfg.air_drag = d; }
+        if let Some(g) = custom_grip { cfg.rotor_grip = g; }
+        if let Some(l) = custom_lag { cfg.motor_lag_ms = l; }
+        if let Some(m) = custom_mid { cfg.thr_mid = m; }
         cfg
     }
 
@@ -813,12 +864,13 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nthrust_pct={}\nweight_pct={}\ndrag_pct={}\ngrip_pct={}\nmotor_pct={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
-            self.thrust_pct,
-            self.weight_pct,
-            self.drag_pct,
-            self.grip_pct,
-            self.motor_pct,
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nweight_g={}\nthrust_g={}\nair_drag={}\nrotor_grip={}\nmotor_lag_ms={}\nthr_mid={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            self.weight_g,
+            self.thrust_g,
+            self.air_drag,
+            self.rotor_grip,
+            self.motor_lag_ms,
+            self.thr_mid,
             self.thr_expo,
             self.rate_center,
             self.rate_max,
