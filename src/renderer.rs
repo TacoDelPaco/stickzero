@@ -1365,14 +1365,20 @@ impl Renderer {
         // Center Betaflight Warnings & Score Popups
         if quad.arm_blocked_throttle {
             self.draw_text(cx - 42, cy - 22, "THROTTLE HIGH", red, 1, true);
-        } else if !quad.armed {
+        } else if quad.arm_aux_connected && !quad.armed {
             self.draw_text(cx - 24, cy - 22, "DISARMED", yellow, 1, true);
-            let hint = if cfg.aux_arm != AuxBinding::None {
-                "FLIP ARM SWITCH"
-            } else {
-                "PRESS TAB TO ARM"
+            let hint = match cfg.aux_arm {
+                AuxBinding::Button { .. } => "PRESS ARM BUTTON",
+                _ => "FLIP ARM SWITCH",
             };
             self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
+        } else if !quad.arm_aux_connected
+            && quad.on_ground
+            && !quad.has_flown
+            && !quad.inverted
+            && !quad.battery_empty
+        {
+            self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
         } else if quad.turtle_active && quad.turtle_mode {
             self.draw_text(cx - 30, cy - 22, "CRASH FLIP", yellow, 1, true);
             let sub = if quad.inverted {
@@ -1451,10 +1457,10 @@ impl Renderer {
 
         let footer = if quad.battery_empty {
             "R: FRESH PACK | ESC: MENU"
-        } else if cfg.aux_arm != AuxBinding::None {
+        } else if quad.arm_aux_connected {
             "ARM:FLY | R:PACK | ESC:MENU"
         } else {
-            "TAB:ARM | R:PACK | ESC:MENU"
+            "R: FRESH PACK | ESC: MENU"
         };
         self.draw_text(W / 2 - (footer.len() as i32) * 3, my + mh - 14, footer, ui.tag, 1, false);
     }

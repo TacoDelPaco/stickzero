@@ -347,6 +347,8 @@ pub struct MenuActions {
 /// Live radio AUX switch and button inputs evaluated every frame during flight.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AuxInputs {
+    /// True only when `cfg.aux_arm` is bound to an active axis/button on a connected controller.
+    pub arm_aux_connected: bool,
     /// Latched ARM switch state (Some(true)=ARM, Some(false)=DISARM) if bound to an EV_ABS switch.
     pub arm_switch: Option<bool>,
     /// Edge-triggered toggle for ARM (bound EV_KEY button or keyboard Tab).
@@ -1183,8 +1185,15 @@ impl InputManager {
         };
 
         match cfg.aux_arm {
-            AuxBinding::Axis { code, invert } => out.arm_switch = Some(eval_axis(code, invert)),
+            AuxBinding::Axis { code, invert } => {
+                let c = (code as usize).min(ABS_MAX);
+                if gp.axes[c].present {
+                    out.arm_aux_connected = true;
+                    out.arm_switch = Some(eval_axis(code, invert));
+                }
+            }
             AuxBinding::Button { code } => {
+                out.arm_aux_connected = true;
                 if gp.was_btn_pressed(code) {
                     out.arm_toggle = true;
                 }

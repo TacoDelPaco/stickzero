@@ -46,6 +46,7 @@ pub struct QuadState {
     // Betaflight arming & mode state
     pub armed: bool,
     pub arm_blocked_throttle: bool,
+    pub arm_aux_connected: bool,
     pub turtle_mode: bool,
     pub turtle_active: bool,
     pub turtle_aux_connected: bool,
@@ -98,6 +99,7 @@ impl QuadState {
             turtle_cooldown: 0.0,
             armed: start_armed,
             arm_blocked_throttle: false,
+            arm_aux_connected: false,
             turtle_mode: false,
             turtle_active: false,
             turtle_aux_connected: false,
@@ -169,6 +171,22 @@ impl QuadState {
         }
 
         // 3. Arm / Disarm switch / toggle with Betaflight throttle-low safety
+        self.arm_aux_connected = aux.arm_aux_connected;
+        if input.throttle <= 0.15 {
+            self.arm_blocked_throttle = false;
+        }
+
+        if !self.arm_aux_connected {
+            // No ARM AUX bound on a connected controller: keep quad automatically ready/armed
+            // (unless battery is empty) so players don't need extra arming controls.
+            if !self.battery_empty && !self.armed {
+                self.armed = true;
+                self.arm_blocked_throttle = false;
+                just_armed = true;
+            }
+            return just_armed;
+        }
+
         let want_arm = if let Some(sw) = aux.arm_switch {
             Some(sw)
         } else if aux.arm_toggle {
@@ -176,10 +194,6 @@ impl QuadState {
         } else {
             None
         };
-
-        if input.throttle <= 0.15 {
-            self.arm_blocked_throttle = false;
-        }
 
         if let Some(want) = want_arm {
             if want && !self.armed {
@@ -381,7 +395,9 @@ impl QuadState {
         }
 
         if self.armed {
-            self.flight_time += dt;
+            if self.arm_aux_connected || self.has_flown {
+                self.flight_time += dt;
+            }
             let spd = self.speed_kmh();
             if spd > self.max_speed_kmh {
                 self.max_speed_kmh = spd;
@@ -1061,5 +1077,27 @@ mod tests {
         let (_, up, _) = quad.rot.basis();
         assert!(up.y > 0.75, "Auto-turtle should roll upright without Crash Flip button, got up.y={}", up.y);
         assert!(!quad.turtle_active, "Auto-turtle should exit once flipped upright");
+    }
+
+    #[test]
+    fn test_auto_arm_ready_without_connected_aux() {
+        let mut cfg = Config::default();
+        cfg.aux_arm = AuxBinding::Axis { code: 2, invert: false };
+        let track = &TRACKS[0];
+        let mut quad = QuadState::spawn(track, &cfg);
+        let idle = StickInput { throttle: 0.0, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+
+        // 1. No connected controller providing ARM AUX -> auto-armed & READY
+        quad.apply_aux(AuxInputs::default(), idle, &mut cfg);
+        assert!(!quad.arm_aux_connected);
+        assert!(quad.armed, "Without a connected ARM AUX, quad should auto-arm immediately");
+
+        // 2. Connected controller providing ARM AUX low -> disarms cleanly
+        let mut connected_disarmed = AuxInputs::default();
+        connected_disarmed.arm_aux_connected = true;
+        connected_disarmed.arm_switch = Some(false);
+        quad.apply_aux(connected_disarmed, idle, &mut cfg);
+        assert!(quad.arm_aux_connected);
+        assert!(!quad.armed, "Connected ARM AUX switch low should disarm quad");
     }
 }
