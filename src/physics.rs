@@ -48,6 +48,7 @@ pub struct QuadState {
     pub arm_blocked_throttle: bool,
     pub turtle_mode: bool,
     pub turtle_active: bool,
+    pub turtle_aux_connected: bool,
     pub has_flown: bool,
     pub throttle_pct: u8,
 
@@ -99,6 +100,7 @@ impl QuadState {
             arm_blocked_throttle: false,
             turtle_mode: false,
             turtle_active: false,
+            turtle_aux_connected: false,
             has_flown: false,
             throttle_pct: 0,
             cell_voltage: start_v,
@@ -151,12 +153,19 @@ impl QuadState {
         }
 
         // 2. Turtle Mode switch / toggle
+        let was_aux_turtle = self.turtle_aux_connected;
+        self.turtle_aux_connected = aux.turtle_switch.is_some();
         if let Some(on) = aux.turtle_switch {
             self.turtle_mode = on;
-        } else if aux.turtle_toggle {
-            self.turtle_mode = !self.turtle_mode;
-            self.combo_text = if self.turtle_mode { "TURTLE ARMED" } else { "TURTLE OFF" };
-            self.combo_timer = 0.8;
+        } else {
+            if was_aux_turtle {
+                self.turtle_mode = false;
+            }
+            if aux.turtle_toggle {
+                self.turtle_mode = !self.turtle_mode;
+                self.combo_text = if self.turtle_mode { "TURTLE ARMED" } else { "TURTLE OFF" };
+                self.combo_timer = 0.8;
+            }
         }
 
         // 3. Arm / Disarm switch / toggle with Betaflight throttle-low safety
@@ -287,13 +296,14 @@ impl QuadState {
         self.inverted = up.y < -0.35;
 
         // Crash Flip / Turtle Mode latch:
+        // - If Crash Flip is bound on a connected controller (turtle_aux_connected), require that switch/button.
+        // - Otherwise automate turtle mode while grounded & inverted so players can simply roll to flip.
         // - Only enters when genuinely on the ground (so bumping the switch midair never drops you!).
         // - Stays latched through the entire flip hop even when on_ground briefly goes false!
         // - Completely disables throttle stick (zero thrust & zero throttle audio) while active.
-        let auto_turtle = cfg.aux_turtle == AuxBinding::None
+        let auto_turtle = !self.turtle_aux_connected
             && self.on_ground
-            && up.y < -0.55
-            && input.throttle < 0.12;
+            && up.y < -0.55;
         if !self.armed {
             self.turtle_active = false;
         } else if self.turtle_mode {
@@ -306,7 +316,7 @@ impl QuadState {
             self.turtle_active = true;
         } else if self.turtle_active {
             // If Crash Flip switch was released, exit immediately (auto-turtle finishes its flip first)
-            if cfg.aux_turtle != AuxBinding::None || up.y > 0.72 || self.on_ground {
+            if self.turtle_aux_connected || up.y > 0.72 || self.on_ground {
                 self.turtle_active = false;
             }
         }
@@ -1006,9 +1016,10 @@ mod tests {
         cfg.aux_turtle = AuxBinding::Button { code: 304 };
         let track = &TRACKS[0];
         let mut quad = QuadState::spawn(track, &cfg);
-        // Flip quad upside down on the ground and engage Crash Flip
+        // Flip quad upside down on the ground and engage Crash Flip via connected AUX
         quad.rot = Quat::from_axis_angle(Vec3::FORWARD, std::f32::consts::PI);
         quad.on_ground = true;
+        quad.turtle_aux_connected = true;
         quad.turtle_mode = true;
 
         // 1. Full throttle with centered roll/pitch must do NOTHING (zero motor_thr, stays on ground)
@@ -1027,5 +1038,28 @@ mod tests {
         }
         let (_, up, _) = quad.rot.basis();
         assert!(up.y > 0.75, "Crash Flip must flip inverted quad upright, got up.y={}", up.y);
+    }
+
+    #[test]
+    fn test_auto_turtle_rolls_upright_without_connected_aux() {
+        let mut cfg = Config::default();
+        // Even if a binding exists in config, without a connected controller providing it,
+        // turtle_aux_connected stays false and roll-to-flip works automatically.
+        cfg.aux_turtle = AuxBinding::Button { code: 304 };
+        let track = &TRACKS[0];
+        let mut quad = QuadState::spawn(track, &cfg);
+        quad.rot = Quat::from_axis_angle(Vec3::FORWARD, std::f32::consts::PI);
+        quad.on_ground = true;
+        let idle = StickInput { throttle: 0.0, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        quad.apply_aux(AuxInputs::default(), idle, &mut cfg);
+        assert!(!quad.turtle_aux_connected);
+
+        let push_roll = StickInput { throttle: 0.0, yaw: 0.0, pitch: 0.0, roll: 1.0 };
+        for _ in 0..120 {
+            quad.step(push_roll, &mut cfg, track);
+        }
+        let (_, up, _) = quad.rot.basis();
+        assert!(up.y > 0.75, "Auto-turtle should roll upright without Crash Flip button, got up.y={}", up.y);
+        assert!(!quad.turtle_active, "Auto-turtle should exit once flipped upright");
     }
 }
