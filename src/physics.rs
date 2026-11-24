@@ -50,6 +50,7 @@ pub struct QuadState {
     pub turtle_mode: bool,
     pub turtle_active: bool,
     pub turtle_aux_connected: bool,
+    pub horizon_smooth: f32,
     pub has_flown: bool,
     pub throttle_pct: u8,
 
@@ -103,6 +104,7 @@ impl QuadState {
             turtle_mode: false,
             turtle_active: false,
             turtle_aux_connected: false,
+            horizon_smooth: 1.0,
             has_flown: false,
             throttle_pct: 0,
             cell_voltage: start_v,
@@ -549,33 +551,62 @@ impl QuadState {
                     )
                 }
                 FlightMode::Horizon => {
-                    // Authentic Betaflight HORIZON mode:
-                    // Always uses fluid Acro angular rate response + a self-leveling spring that fades smoothly
-                    // to 0 by 70% stick deflection (and fades at steep bank angles while steering) so you can
-                    // bank freely past 55 deg and execute full flips/rolls, then self-level upright when centered!
+                    // Verified Betaflight HORIZON mode (`pidLevel` crossfade + asymmetric PT1 smoothing):
+                    // 1. Stick deflection fades `raw_s` from 1.0 (near center) to 0.0 at 75% stick
+                    //    (`horizonLimitSticks = 0.75`), dropping instantly on outer stick throws so
+                    //    flips/rolls start with zero lag, and ramping smoothly (`tau = 0.12s`) when
+                    //    centering sticks so recovery glides level without violent camera jerks.
+                    // 2. Crossfades `angle_omega` (targeting up to 65 deg tilt via gimbal-lock-free
+                    //    3D shortest-arc `desired_sky x sky`) with `acro_omega` (`acro * (1 - S) + angle * S`)
+                    //    so moderate stick carves steeper/livelier banks than Angle mode without ever
+                    //    accidentally flipping, while >= 75% stick delivers 100% pure Acro flips/rolls
+                    //    and pure pitch flips recover purely along pitch (no sideways roll yank).
                     let def = input.pitch.abs().max(input.roll.abs());
-                    let stick_level = (1.0 - def / 0.70).clamp(0.0, 1.0);
-                    let tilt_factor = if def < 0.25 {
-                        1.0
-                    } else {
-                        clampf((up.y - 0.15) / 0.75, 0.0, 1.0)
-                    };
-                    let level_strength = stick_level * stick_level * tilt_factor;
+                    let t = clampf((def - 0.15) / 0.60, 0.0, 1.0); // 0.0 at <=15%, 1.0 at >=75% stick
+                    let raw_s = 1.0 - t * t;
+                    let smooth_alpha = dt / (0.12 + dt);
+                    let pt1_s = self.horizon_smooth + (raw_s - self.horizon_smooth) * smooth_alpha;
+                    let level_s = raw_s.min(pt1_s);
+                    self.horizon_smooth = level_s;
 
-                    let (level_x, level_z) = if up.y >= 0.0 {
-                        let cur_pitch = clampf(-forward.y, -1.0, 1.0).asin();
-                        let cur_roll = clampf(-right.y, -1.0, 1.0).asin();
-                        (-cur_pitch * 5.2, cur_roll * 5.2)
+                    let max_tilt = 65.0_f32.to_radians();
+                    let des_p = clampf(input.pitch, -1.0, 1.0) * max_tilt;
+                    let des_r = clampf(input.roll, -1.0, 1.0) * max_tilt;
+                    let desired_sky = Vec3::new(
+                        -des_r.sin(),
+                        (des_p.cos() * des_r.cos()).max(0.1),
+                        -des_p.sin(),
+                    )
+                    .normalized();
+                    let sky_body = Vec3::new(right.y, up.y, forward.y);
+                    let cross = desired_sky.cross(sky_body);
+                    let cross_len = (cross.x * cross.x + cross.y * cross.y + cross.z * cross.z).sqrt();
+                    let dot = clampf(desired_sky.dot(sky_body), -1.0, 1.0);
+                    let err_angle = dot.acos();
+
+                    let (err_x, err_z) = if cross_len > 1e-4 {
+                        let scale = err_angle / cross_len;
+                        (cross.x * scale, cross.z * scale)
+                    } else if dot < 0.0 {
+                        // Exact 180-deg antipodal fallback: continue along active rotation axis
+                        if self.omega.x.abs() > self.omega.z.abs() {
+                            let sx = if self.omega.x >= 0.0 { 1.0 } else { -1.0 };
+                            (sx * std::f32::consts::PI, 0.0)
+                        } else {
+                            let sz = if self.omega.z >= 0.0 { 1.0 } else { -1.0 };
+                            (0.0, sz * std::f32::consts::PI)
+                        }
                     } else {
-                        // Upside down with centered stick -> smoothly roll back upright
-                        let roll_sign = if right.y >= 0.0 { -1.0 } else { 1.0 };
-                        (0.0, roll_sign * 7.0)
+                        (0.0, 0.0)
                     };
+
+                    let angle_omega_x = clampf(err_x * 6.2, -7.5, 7.5);
+                    let angle_omega_z = clampf(err_z * 6.2, -7.5, 7.5);
 
                     Vec3::new(
-                        acro_omega.x + clampf(level_x, -6.5, 6.5) * level_strength,
+                        acro_omega.x * (1.0 - level_s) + angle_omega_x * level_s,
                         acro_omega.y,
-                        acro_omega.z + clampf(level_z, -6.5, 6.5) * level_strength,
+                        acro_omega.z * (1.0 - level_s) + angle_omega_z * level_s,
                     )
                 }
             };
@@ -1099,5 +1130,64 @@ mod tests {
         quad.apply_aux(connected_disarmed, idle, &mut cfg);
         assert!(quad.arm_aux_connected);
         assert!(!quad.armed, "Connected ARM AUX switch low should disarm quad");
+    }
+
+    #[test]
+    fn test_horizon_holds_half_stick_bank_and_recovers_pitch_flip_cleanly() {
+        let track = &TRACKS[0];
+        let half_roll = StickInput { throttle: 0.65, yaw: 0.0, pitch: 0.0, roll: 0.45 };
+
+        // 1. At 45% stick held for 3 seconds (720 steps), Horizon must hold a steady bank
+        //    (steeper than Angle mode, yet NEVER accidentally flip inverted!)
+        let mut cfg_ang = Config::default();
+        cfg_ang.flight_mode = FlightMode::Angle;
+        let mut q_ang = QuadState::spawn(track, &cfg_ang);
+        q_ang.pos = Vec3::new(0.0, 25.0, 0.0);
+        q_ang.on_ground = false;
+
+        let mut cfg_hor = Config::default();
+        cfg_hor.flight_mode = FlightMode::Horizon;
+        let mut q_hor = QuadState::spawn(track, &cfg_hor);
+        q_hor.pos = Vec3::new(0.0, 25.0, 0.0);
+        q_hor.on_ground = false;
+
+        for _ in 0..720 {
+            q_ang.step(half_roll, &mut cfg_ang, track);
+            q_hor.step(half_roll, &mut cfg_hor, track);
+            assert!(
+                q_hor.rot.basis().1.y > 0.25,
+                "Horizon at 45% stick must NEVER flip inverted, got up.y={}",
+                q_hor.rot.basis().1.y
+            );
+        }
+        let tilt_ang = q_ang.rot.basis().1.y.acos().to_degrees();
+        let tilt_hor = q_hor.rot.basis().1.y.acos().to_degrees();
+        assert!(
+            tilt_hor > tilt_ang + 8.0 && tilt_hor < 65.0,
+            "Horizon 45% stick bank ({tilt_hor:.1} deg) should be livelier than Angle ({tilt_ang:.1} deg) without flipping"
+        );
+
+        // 2. Pure 145-deg pitch inverted recovery with centered sticks must recover purely along
+        //    pitch without yanking sideways on the roll axis!
+        let mut q_flip = QuadState::spawn(track, &cfg_hor);
+        q_flip.pos = Vec3::new(0.0, 25.0, 0.0);
+        q_flip.on_ground = false;
+        q_flip.rot = Quat::from_axis_angle(Vec3::RIGHT, 145.0_f32.to_radians());
+        q_flip.horizon_smooth = 0.0; // Just exited a full-stick frontflip
+        let centered = StickInput { throttle: 0.50, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..240 {
+            q_flip.step(centered, &mut cfg_hor, track);
+            let (right, _, _) = q_flip.rot.basis();
+            assert!(
+                right.y.abs() < 0.02,
+                "Pure pitch recovery in Horizon must not twist sideways onto roll, right.y={}",
+                right.y
+            );
+        }
+        assert!(
+            q_flip.rot.basis().1.y > 0.96,
+            "Horizon should smoothly recover upright from 145-deg pitch, got up.y={}",
+            q_flip.rot.basis().1.y
+        );
     }
 }
