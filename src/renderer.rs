@@ -1373,13 +1373,19 @@ impl Renderer {
                 "PRESS TAB TO ARM"
             };
             self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
-        } else if quad.turtle_mode && quad.on_ground {
+        } else if quad.turtle_active {
             self.draw_text(cx - 30, cy - 22, "CRASH FLIP", yellow, 1, true);
+            let sub = if quad.inverted {
+                "PUSH ROLL / PITCH"
+            } else {
+                "RELEASE CRASH FLIP"
+            };
+            self.draw_text(cx - (sub.len() as i32) * 3, cy - 11, sub, if quad.inverted { white } else { green }, 1, true);
         } else if quad.combo_timer > 0.0 && !quad.combo_text.is_empty() {
             let tw = (quad.combo_text.len() as i32) * 6;
             self.draw_text(cx - tw / 2, 32, quad.combo_text, yellow, 1, true);
         } else if quad.on_ground && quad.inverted {
-            self.draw_text(cx - 54, 32, "TURTLE: PUSH ROLL", red, 1, true);
+            self.draw_text(cx - 72, 32, "TURTLE: PRESS CRASH FLIP", red, 1, true);
         } else if batt_on && quad.cell_voltage < 3.35 {
             self.draw_text(cx - 24, 32, "LAND NOW", red, 1, true);
         } else if batt_on && quad.cell_voltage < 3.48 {

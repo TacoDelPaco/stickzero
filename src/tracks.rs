@@ -94,7 +94,10 @@ impl Gate {
                     let r = self.right();
                     let lx = rel.dot(r).abs();
                     let ly = rel.y.abs();
-                    lx <= self.width * 0.68 && ly <= self.height * 0.68
+                    // Must pass strictly INSIDE the inner gate opening (never outside the posts/crossbar!)
+                    let inner_hw = (self.width * 0.5 - 0.14).max(0.4);
+                    let inner_hh = (self.height * 0.5 - 0.14).max(0.4);
+                    lx <= inner_hw && ly <= inner_hh
                 } else {
                     false
                 }
@@ -107,7 +110,9 @@ impl Gate {
                     let hit = prev.add(curr.sub(prev).scale(t));
                     let dx = (hit.x - c.x).abs();
                     let dz = (hit.z - c.z).abs();
-                    dx <= self.width * 0.68 && dz <= self.height * 0.68
+                    let inner_hw = (self.width * 0.5 - 0.14).max(0.4);
+                    let inner_hd = (self.height * 0.5 - 0.14).max(0.4);
+                    dx <= inner_hw && dz <= inner_hd
                 } else {
                     false
                 }

@@ -1005,9 +1005,8 @@ impl InputManager {
         match cfg.aux_turtle {
             AuxBinding::Axis { code, invert } => out.turtle_switch = Some(eval_axis(code, invert)),
             AuxBinding::Button { code } => {
-                if gp.frame_btn_pressed == Some(code) {
-                    out.turtle_toggle = true;
-                }
+                // Works identically for both momentary (SD/SH) and latching (SA) radio buttons!
+                out.turtle_switch = Some(gp.is_key_down(code));
             }
             AuxBinding::None => {}
         }

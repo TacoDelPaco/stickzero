@@ -47,6 +47,7 @@ pub struct QuadState {
     pub armed: bool,
     pub arm_blocked_throttle: bool,
     pub turtle_mode: bool,
+    pub turtle_active: bool,
     pub has_flown: bool,
     pub throttle_pct: u8,
 
@@ -97,6 +98,7 @@ impl QuadState {
             armed: start_armed,
             arm_blocked_throttle: false,
             turtle_mode: false,
+            turtle_active: false,
             has_flown: false,
             throttle_pct: 0,
             cell_voltage: start_v,
@@ -280,18 +282,56 @@ impl QuadState {
         let max_accel = (thrust_g / weight_g) * GRAVITY;
         let eff_motor_tau = (cfg.motor_lag_ms as f32 / 1000.0).clamp(0.005, 0.050);
 
-        self.throttle_pct = (clampf(input.throttle, 0.0, 1.0) * 100.0).round() as u8;
+        // Orientation & body-frame airflow decomposition (computed first so Crash Flip can silence throttle!)
+        let (right, up, forward) = self.rot.basis();
+        self.inverted = up.y < -0.35;
 
-        // 1. Betaflight throttle mid + expo + motor spool lag
+        // Crash Flip / Turtle Mode latch:
+        // - Only enters when genuinely on the ground (so bumping the switch midair never drops you!).
+        // - Stays latched through the entire flip hop even when on_ground briefly goes false!
+        // - Completely disables throttle stick (zero thrust & zero throttle audio) while active.
+        let auto_turtle = cfg.aux_turtle == AuxBinding::None
+            && self.on_ground
+            && up.y < -0.55
+            && input.throttle < 0.12;
+        if !self.armed {
+            self.turtle_active = false;
+        } else if self.turtle_mode {
+            if self.on_ground {
+                self.turtle_active = true;
+            } else if self.turtle_active && self.pos.y > QUAD_RADIUS + 1.4 {
+                self.turtle_active = false;
+            }
+        } else if auto_turtle {
+            self.turtle_active = true;
+        } else if self.turtle_active {
+            // If Crash Flip switch was released, exit immediately (auto-turtle finishes its flip first)
+            if cfg.aux_turtle != AuxBinding::None || up.y > 0.72 || self.on_ground {
+                self.turtle_active = false;
+            }
+        }
+
+        let stick_flip_mag = input.roll.abs().max(input.pitch.abs());
+        let turtle_flipping = self.turtle_active && stick_flip_mag > 0.22 && up.y < 0.72;
+
+        self.throttle_pct = if self.turtle_active {
+            0
+        } else {
+            (clampf(input.throttle, 0.0, 1.0) * 100.0).round() as u8
+        };
+
+        // 1. Betaflight throttle mid + expo + motor spool lag (Throttle 100% disabled during Crash Flip!)
         let shaped_thr = Self::apply_throttle_expo(input.throttle, cfg.thr_mid, cfg.thr_expo);
         let target_thr = if !self.armed || (self.battery_empty && batt_on) {
             0.0
+        } else if self.turtle_active {
+            if turtle_flipping { 0.35 * stick_flip_mag } else { 0.0 }
         } else {
             shaped_thr
         };
         let alpha = dt / (eff_motor_tau + dt);
         self.motor_thr += (target_thr - self.motor_thr) * alpha;
-        if !self.armed && self.motor_thr < 0.01 {
+        if (!self.armed || (self.turtle_active && !turtle_flipping)) && self.motor_thr < 0.01 {
             self.motor_thr = 0.0;
         }
 
@@ -336,28 +376,16 @@ impl QuadState {
             if spd > self.max_speed_kmh {
                 self.max_speed_kmh = spd;
             }
-            if !self.on_ground && self.pos.y > QUAD_RADIUS + 0.25 {
+            if !self.on_ground && self.pos.y > QUAD_RADIUS + 0.25 && !self.turtle_active {
                 self.has_flown = true;
             }
         }
-
-        // 3. Orientation & body-frame airflow decomposition (StickTime aerodynamic model!)
-        let (right, up, forward) = self.rot.basis();
-        self.inverted = up.y < -0.35;
 
         let v_up = self.vel.dot(up);
         let v_right = self.vel.dot(right);
         let v_fwd = self.vel.dot(forward);
         let edge_sq = v_right * v_right + v_fwd * v_fwd;
         let edge_speed = edge_sq.sqrt();
-
-        // Turtle Mode ONLY activates when genuinely on the ground!
-        let auto_turtle = cfg.aux_turtle == AuxBinding::None
-            && self.on_ground
-            && up.y < -0.55
-            && input.throttle < 0.12;
-        let turtle_ready = self.armed && self.on_ground && (self.turtle_mode || auto_turtle);
-        let turtle_flipping = turtle_ready && (input.roll.abs() > 0.40 || input.pitch.abs() > 0.40);
 
         // Compute static + aerodynamic thrust (StickTime-style climb loss, descent cushion, translational lift)
         let thr_curve = self.motor_thr.powf(1.18);
@@ -372,7 +400,7 @@ impl QuadState {
         } else {
             1.0
         };
-        let base_thrust = if !self.armed || turtle_ready {
+        let base_thrust = if !self.armed || self.turtle_active {
             0.0
         } else {
             ((params.idle_accel / mass_ratio) * self.motor_thr.signum() + max_accel * thr_curve)
@@ -419,32 +447,42 @@ impl QuadState {
 
         let aero_thrust = base_thrust * inflow_factor * trans_lift * wash_thrust_mult;
         let vertical_lift = up.y * aero_thrust;
-        let pinned_on_ground = self.on_ground && !turtle_flipping && (!self.armed || up.y < 0.25 || vertical_lift <= GRAVITY * 1.01);
+        let pinned_on_ground =
+            self.on_ground && !turtle_flipping && (!self.armed || self.turtle_active || up.y < 0.25 || vertical_lift <= GRAVITY * 1.01);
 
         // 4. Rotational control (Acro / Horizon / Angle / Grounded Yaw / Turtle)
         let (center_sens, max_rate, expo) = cfg.actual_rates();
 
         if turtle_flipping {
             if self.turtle_cooldown <= 0.0 {
-                self.combo_text = "TURTLE FLIP";
+                self.combo_text = "CRASH FLIP";
                 self.combo_timer = 0.8;
-                self.turtle_cooldown = 0.9;
+                self.turtle_cooldown = 0.7;
             }
-            if self.on_ground && self.vel.y < 0.45 {
-                self.vel.y = 0.65;
+            // Crisp ground kick so the quad has room to complete a full 180-deg flip upright
+            if self.on_ground && self.vel.y < 0.60 {
+                self.vel.y = 1.95;
             }
-            let r_cmd = if input.roll.abs() > 0.40 { -input.roll.signum() * 5.8 } else { 0.0 };
-            let p_cmd = if input.pitch.abs() > 0.40 { input.pitch.signum() * 5.8 } else { 0.0 };
+            let r_cmd = if input.roll.abs() > 0.22 { -input.roll.signum() * 13.5 } else { 0.0 };
+            let p_cmd = if input.pitch.abs() > 0.22 { input.pitch.signum() * 13.5 } else { 0.0 };
             let target_omega = Vec3::new(p_cmd, 0.0, r_cmd);
-            let rot_alpha = (16.0 * dt).min(1.0);
+            let rot_alpha = (28.0 * dt).min(1.0);
             self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
+            self.rot = self.rot.integrate_body_omega(self.omega, dt);
+        } else if self.turtle_active && !self.on_ground {
+            // Finished flipping upright (or stick released mid-hop): level smoothly as it lands!
+            let target_up = if up.y >= 0.0 { 1.0f32 } else { -1.0f32 };
+            let cur_pitch = clampf(-forward.y * target_up, -1.0, 1.0).asin();
+            let cur_roll = clampf(-right.y * target_up, -1.0, 1.0).asin();
+            let level_omega = Vec3::new(-cur_pitch * 12.0, 0.0, cur_roll * 12.0);
+            self.omega = self.omega.add(level_omega.sub(self.omega).scale((18.0 * dt).min(1.0)));
             self.rot = self.rot.integrate_body_omega(self.omega, dt);
         } else if pinned_on_ground {
             let target_up = if up.y >= 0.0 { 1.0f32 } else { -1.0f32 };
             let cur_pitch = clampf(-forward.y * target_up, -1.0, 1.0).asin();
             let cur_roll = clampf(-right.y * target_up, -1.0, 1.0).asin();
 
-            let yaw_rate = if self.armed && up.y >= 0.25 && !turtle_ready {
+            let yaw_rate = if self.armed && up.y >= 0.25 && !self.turtle_active {
                 Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.70, expo)
             } else {
                 0.0
@@ -944,5 +982,50 @@ mod tests {
             q_hor.step(center, &mut cfg_hor, track);
         }
         assert!(q_hor.rot.basis().1.y > 0.92, "HORIZON mode should self-level when stick centered!");
+    }
+
+    #[test]
+    fn test_touching_outside_of_gate_scores_no_points() {
+        let mut cfg = Config::default();
+        cfg.game_mode = GameMode::Freestyle;
+        let track = &TRACKS[0]; // Gate 0 at (0, 0, 22), width=4.8 (posts at x = +-2.4)
+        let mut quad = QuadState::spawn(track, &cfg);
+        quad.pos = Vec3::new(2.55, 1.8, 21.5); // Outside right post!
+        quad.vel = Vec3::new(0.0, 0.0, 12.0);
+        quad.on_ground = false;
+        let input = StickInput { throttle: 0.40, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..30 {
+            quad.step(input, &mut cfg, track);
+        }
+        assert_eq!(quad.score, 0, "Touching/flying outside a gate post must NOT score points!");
+    }
+
+    #[test]
+    fn test_crash_flip_ignores_throttle_and_flips_upright() {
+        let mut cfg = Config::default();
+        cfg.aux_turtle = AuxBinding::Button { code: 304 };
+        let track = &TRACKS[0];
+        let mut quad = QuadState::spawn(track, &cfg);
+        // Flip quad upside down on the ground and engage Crash Flip
+        quad.rot = Quat::from_axis_angle(Vec3::FORWARD, std::f32::consts::PI);
+        quad.on_ground = true;
+        quad.turtle_mode = true;
+
+        // 1. Full throttle with centered roll/pitch must do NOTHING (zero motor_thr, stays on ground)
+        let full_thr = StickInput { throttle: 1.0, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..60 {
+            quad.step(full_thr, &mut cfg, track);
+        }
+        assert!(quad.turtle_active, "Crash Flip should be active on the ground");
+        assert!(quad.motor_thr < 0.02, "Throttle must be silenced in Crash Flip, got motor_thr={}", quad.motor_thr);
+        assert!(quad.on_ground, "Throttle must not lift quad in Crash Flip");
+
+        // 2. Push roll to flip cleanly 180 deg upright!
+        let push_roll = StickInput { throttle: 0.0, yaw: 0.0, pitch: 0.0, roll: 1.0 };
+        for _ in 0..120 {
+            quad.step(push_roll, &mut cfg, track);
+        }
+        let (_, up, _) = quad.rot.basis();
+        assert!(up.y > 0.75, "Crash Flip must flip inverted quad upright, got up.y={}", up.y);
     }
 }

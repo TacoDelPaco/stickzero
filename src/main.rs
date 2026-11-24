@@ -289,7 +289,8 @@ fn main() {
         last_frame = frame_start;
 
         let in_menu = screen != AppScreen::Flying;
-        audio.set_flying(!in_menu && quad.armed, cfg.analog_filter);
+        let motors_sounding = !in_menu && quad.armed && (!quad.turtle_active || quad.motor_thr > 0.03);
+        audio.set_flying(motors_sounding, cfg.analog_filter);
         input.poll(dt, in_menu, &cfg);
         let act = input.take_menu_actions();
 

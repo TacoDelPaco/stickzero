@@ -7,7 +7,7 @@ set -euo pipefail
 #   ./deploy.sh adb
 
 TARGET="${1:-}"
-DEB="dist/stickzero_0.1.8_arm64.deb"
+DEB="dist/stickzero_0.1.9_arm64.deb"
 
 if [ ! -f "$DEB" ]; then
     bash ./package.sh
