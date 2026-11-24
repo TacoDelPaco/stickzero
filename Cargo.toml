@@ -1,6 +1,6 @@
 [package]
 name = "stickzero"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "Minimal native Rust 3D FPV quadcopter simulator for M5Stack CardputerZero"
 license = "GPL-3.0-or-later"

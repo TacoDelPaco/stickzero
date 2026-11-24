@@ -43,6 +43,13 @@ pub struct QuadState {
     pub prop_wash_level: f32,
     pub turtle_cooldown: f32,
 
+    // Object-collision angled wall-slide state
+    pub wall_slide: bool,
+    pub wall_normal: Vec3,
+    pub wall_slide_time: f32,
+    pub wall_contact_age: f32,
+    pub wall_escape_cooldown: f32,
+
     // Betaflight arming & mode state
     pub armed: bool,
     pub arm_blocked_throttle: bool,
@@ -98,6 +105,11 @@ impl QuadState {
             prop_wash_phase: 0.0,
             prop_wash_level: 0.0,
             turtle_cooldown: 0.0,
+            wall_slide: false,
+            wall_normal: Vec3::ZERO,
+            wall_slide_time: 0.0,
+            wall_contact_age: 0.0,
+            wall_escape_cooldown: 0.0,
             armed: start_armed,
             arm_blocked_throttle: false,
             arm_aux_connected: false,
@@ -245,8 +257,128 @@ impl QuadState {
         }
     }
 
+    /// Extract horizontal (XZ) right and forward unit vectors from the quad's basis,
+    /// avoiding degeneracy when pitched or rolled steeply.
+    #[inline]
+    fn horizontal_basis(right: Vec3, forward: Vec3) -> (Vec3, Vec3) {
+        let f_sq = forward.x * forward.x + forward.z * forward.z;
+        let r_sq = right.x * right.x + right.z * right.z;
+        if f_sq >= r_sq && f_sq > 1e-4 {
+            let fwd_h = Vec3::new(forward.x, 0.0, forward.z).scale(1.0 / f_sq.sqrt());
+            let right_h = Vec3::UP.cross(fwd_h);
+            (right_h, fwd_h)
+        } else if r_sq > 1e-4 {
+            let right_h = Vec3::new(right.x, 0.0, right.z).scale(1.0 / r_sq.sqrt());
+            let fwd_h = right_h.cross(Vec3::UP);
+            (right_h, fwd_h)
+        } else {
+            (Vec3::RIGHT, Vec3::FORWARD)
+        }
+    }
+
+    /// Resolve a collision against a solid 3D object (structure face or gate frame).
+    /// Side/overhang impacts absorb rebound and enter/refresh the angled wall-slide state
+    /// so the drone slowly falls angled towards the ground against the object until grounded,
+    /// unless the pilot flies away to regain balance.
+    fn resolve_object_contact(
+        &mut self,
+        normal: Vec3,
+        flying_away: bool,
+        was_wall_sliding: bool,
+        substep_wall_norm: &mut Vec3,
+        substep_wall_hits: &mut u32,
+    ) {
+        let vn = self.vel.dot(normal);
+
+        // Flat top / roof surface: settle cleanly on top instead of wall-sliding
+        if normal.y >= 0.70 {
+            if vn < -5.5 {
+                self.hit_flash = 0.25;
+                self.vel = self.vel.sub(normal.scale(vn * 1.08));
+            } else if vn < 0.0 {
+                self.vel = self.vel.sub(normal.scale(vn));
+            }
+            let friction = (11.0 * PHYSICS_DT).min(0.95);
+            self.vel.x *= 1.0 - friction;
+            self.vel.z *= 1.0 - friction;
+            if self.vel.x.abs() < 0.03 { self.vel.x = 0.0; }
+            if self.vel.z.abs() < 0.03 { self.vel.z = 0.0; }
+            if self.vel.y <= 0.1 {
+                self.on_ground = true;
+                self.wall_slide = false;
+                self.wall_slide_time = 0.0;
+                self.flip_accum = 0.0;
+                self.roll_accum = 0.0;
+                self.inverted_time = 0.0;
+            }
+            return;
+        }
+
+        // Side wall / pillar / gate post / crossbar / underside impact
+        if vn < -1.5 || (!was_wall_sliding && vn < -0.5) {
+            self.hit_flash = 0.25;
+        }
+
+        // Absorb inward velocity cleanly so the quad stays against the object instead of bouncing away
+        if vn < 0.0 {
+            self.vel = self.vel.sub(normal.scale(vn));
+        }
+
+        // Already grounded at the base of an object: stay grounded rather than starting a wall-slide
+        if self.on_ground || self.pos.y <= QUAD_RADIUS + 0.05 {
+            return;
+        }
+
+        // Pilot is actively flying away after peeling off: block clipping without re-latching
+        // unless slamming hard inward again.
+        if self.wall_escape_cooldown > 0.0 && flying_away && vn > -3.0 {
+            return;
+        }
+
+        // On fresh airborne contact, damp tangential & upward speed so the drone settles into
+        // a slow fall against the object rather than shooting sideways or climbing the wall.
+        if !was_wall_sliding && *substep_wall_hits == 0 {
+            self.vel.x *= 0.45;
+            self.vel.z *= 0.45;
+            if self.vel.y > 0.0 {
+                self.vel.y *= 0.25;
+            }
+            self.flip_accum = 0.0;
+            self.roll_accum = 0.0;
+            self.inverted_time = 0.0;
+        }
+
+        // Horizontal outward normal pointing away from the object
+        let horiz_sq = normal.x * normal.x + normal.z * normal.z;
+        let wall_n = if horiz_sq > 0.04 {
+            let inv = 1.0 / horiz_sq.sqrt();
+            Vec3::new(normal.x * inv, 0.0, normal.z * inv)
+        } else {
+            let (_, _, fwd) = self.rot.basis();
+            let f_sq = fwd.x * fwd.x + fwd.z * fwd.z;
+            if f_sq > 1e-4 {
+                let inv = 1.0 / f_sq.sqrt();
+                Vec3::new(-fwd.x * inv, 0.0, -fwd.z * inv)
+            } else {
+                Vec3::new(0.0, 0.0, -1.0)
+            }
+        };
+
+        *substep_wall_norm = substep_wall_norm.add(wall_n);
+        *substep_wall_hits += 1;
+    }
+
     /// Collide quad sphere against a 3D line segment (gate posts, crossbars, stilts).
-    fn collide_segment(&mut self, a: Vec3, b: Vec3, tube_radius: f32) {
+    fn collide_segment(
+        &mut self,
+        a: Vec3,
+        b: Vec3,
+        tube_radius: f32,
+        flying_away: bool,
+        was_wall_sliding: bool,
+        substep_wall_norm: &mut Vec3,
+        substep_wall_hits: &mut u32,
+    ) {
         let ab = b.sub(a);
         let len_sq = ab.len_sq();
         if len_sq < 1e-6 {
@@ -265,16 +397,13 @@ impl QuadState {
                 Vec3::UP
             };
             self.pos = closest.add(normal.scale(min_dist));
-            let vn = self.vel.dot(normal);
-            if vn < 0.0 {
-                self.vel = self.vel.sub(normal.scale(vn * 1.30));
-                self.vel = self.vel.scale(0.75);
-                if vn < -2.0 {
-                    self.omega.x += normal.z * 3.5;
-                    self.omega.z -= normal.x * 3.5;
-                    self.hit_flash = 0.25;
-                }
-            }
+            self.resolve_object_contact(
+                normal,
+                flying_away,
+                was_wall_sliding,
+                substep_wall_norm,
+                substep_wall_hits,
+            );
         }
     }
 
@@ -291,6 +420,9 @@ impl QuadState {
         }
         if self.turtle_cooldown > 0.0 {
             self.turtle_cooldown = (self.turtle_cooldown - dt).max(0.0);
+        }
+        if self.wall_escape_cooldown > 0.0 {
+            self.wall_escape_cooldown = (self.wall_escape_cooldown - dt).max(0.0);
         }
 
         let prev_pos = self.pos;
@@ -310,6 +442,40 @@ impl QuadState {
         // Orientation & body-frame airflow decomposition (computed first so Crash Flip can silence throttle!)
         let (right, up, forward) = self.rot.basis();
         self.inverted = up.y < -0.35;
+
+        // Track ongoing wall-slide contact and check if pilot is actively flying away to regain balance
+        if self.wall_slide {
+            self.wall_slide_time += dt;
+            self.wall_contact_age += dt;
+            if self.on_ground || self.wall_contact_age > 0.22 {
+                self.wall_slide = false;
+                self.wall_slide_time = 0.0;
+            }
+        }
+
+        let (right_h, fwd_h) = Self::horizontal_basis(right, forward);
+        let stick_world = fwd_h.scale(input.pitch).add(right_h.scale(input.roll));
+        let stick_mag = (input.pitch * input.pitch + input.roll * input.roll).sqrt();
+        let away_cmd = stick_world.dot(self.wall_normal);
+        let can_fly_away = self.armed && !self.turtle_active && (!self.battery_empty || !batt_on);
+        let flying_away = can_fly_away
+            && input.throttle > 0.20
+            && (away_cmd > 0.18 || (stick_mag > 0.35 && away_cmd >= -0.05));
+
+        if self.wall_slide && self.wall_slide_time > 0.08 && flying_away {
+            self.wall_slide = false;
+            self.wall_slide_time = 0.0;
+            self.wall_escape_cooldown = 0.45;
+            // Peel cleanly off the object surface and assist un-tipping away from the wall
+            let vn = self.vel.dot(self.wall_normal);
+            if vn < 1.25 {
+                self.vel = self.vel.add(self.wall_normal.scale(1.25 - vn));
+            }
+            let tx = Vec3::UP.dot(right);
+            let tz = Vec3::UP.dot(forward);
+            self.omega.x += clampf(tz * 3.5, -2.5, 2.5);
+            self.omega.z += clampf(-tx * 3.5, -2.5, 2.5);
+        }
 
         // Crash Flip / Turtle Mode latch:
         // - If Crash Flip is bound on a connected controller (turtle_aux_connected), require that switch/button.
@@ -519,6 +685,46 @@ impl QuadState {
             let ground_omega = Vec3::new(-cur_pitch * 18.0, yaw_rate, cur_roll * 18.0);
             self.rot = self.rot.integrate_body_omega(ground_omega, dt);
             self.omega = Vec3::new(0.0, yaw_rate, 0.0);
+        } else if self.wall_slide {
+            // Angled towards the ground against the object: lean `up` into `-wall_normal`
+            // so the wall-facing side tips downward until grounded (unless flying away).
+            let tilt_rad = ((cfg.camera_tilt_deg as f32) + 23.0).clamp(42.0, 56.0).to_radians();
+            let (sin_t, cos_t) = tilt_rad.sin_cos();
+            let target_up = Vec3::new(
+                -self.wall_normal.x * sin_t,
+                cos_t,
+                -self.wall_normal.z * sin_t,
+            )
+            .normalized();
+
+            let tx = target_up.dot(right);
+            let ty = target_up.dot(up);
+            let tz = target_up.dot(forward);
+            let cross_len = (tz * tz + tx * tx).sqrt();
+            let err_angle = clampf(ty, -1.0, 1.0).acos();
+            let (err_x, err_z) = if cross_len > 1e-4 {
+                let s = err_angle / cross_len;
+                (tz * s, -tx * s)
+            } else if ty < 0.0 {
+                (std::f32::consts::PI, 0.0)
+            } else {
+                (0.0, 0.0)
+            };
+
+            let yaw_cmd = if self.armed && !self.turtle_active {
+                Self::betaflight_actual(input.yaw, center_sens * 0.65, max_rate * 0.55, expo)
+            } else {
+                0.0
+            };
+
+            let target_omega = Vec3::new(
+                clampf(err_x * 6.0, -5.5, 5.5),
+                yaw_cmd,
+                clampf(err_z * 6.0, -5.5, 5.5),
+            );
+            let rot_alpha = (14.0 * dt).min(1.0);
+            self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
+            self.rot = self.rot.integrate_body_omega(self.omega, dt);
         } else {
             let acro_omega = Vec3::new(
                 Self::betaflight_actual(input.pitch, center_sens, max_rate, expo),
@@ -635,30 +841,58 @@ impl QuadState {
         }
 
         // 5. Linear Forces: Thrust + Aerodynamic Body Drag + In-Plane Rotor Grip + Gravity
-        let (right_now, up_now, fwd_now) = self.rot.basis();
-        let thrust_mag = if pinned_on_ground { 0.0 } else { aero_thrust };
+        if self.wall_slide {
+            // Slowly fall against the object with wall-scrape drag and gentle inward lean
+            // so the drone stays against the object until grounded (unless flying away).
+            let target_fall = if self.armed && !self.turtle_active {
+                2.6 - 0.9 * self.motor_thr.clamp(0.0, 1.0)
+            } else {
+                4.2
+            };
+            let fall_rate = if self.vel.y > 0.0 { 9.0 } else { 5.5 };
+            self.vel.y += (-target_fall - self.vel.y) * (fall_rate * dt).min(1.0);
 
-        let thrust_accel = up_now.scale(thrust_mag);
-        let speed = self.vel.len();
-        let eff_drag = (cfg.air_drag as f32) / 1000.0; // e.g. 29 (0.29) -> 0.029
-        let drag_accel = self.vel.scale(-eff_drag * speed - eff_drag * 1.4);
+            let vn = self.vel.dot(self.wall_normal);
+            let v_horiz = Vec3::new(self.vel.x, 0.0, self.vel.z);
+            let v_tan = v_horiz.sub(self.wall_normal.scale(vn));
+            let new_vn = vn + (-0.35 - vn) * (8.0 * dt).min(1.0);
+            let new_v_tan = v_tan.scale((1.0 - 6.0 * dt).max(0.0));
+            let new_horiz = new_v_tan.add(self.wall_normal.scale(new_vn));
+            self.vel.x = new_horiz.x;
+            self.vel.z = new_horiz.z;
+            self.pos = self.pos.add(self.vel.scale(dt));
+        } else {
+            let (right_now, up_now, fwd_now) = self.rot.basis();
+            let thrust_mag = if pinned_on_ground { 0.0 } else { aero_thrust };
 
-        // In-plane rotor H-force grip (carves turns cleanly without icy drift)
-        let v_plane = right_now
-            .scale(self.vel.dot(right_now))
-            .add(fwd_now.scale(self.vel.dot(fwd_now)));
-        let eff_grip = (cfg.rotor_grip as f32) / 100.0; // e.g. 34 -> 0.34
-        let grip_coeff = eff_grip * ((thrust_mag / (5.0 * GRAVITY) + 0.04).sqrt());
-        let grip_accel = v_plane.scale(-grip_coeff);
+            let mut thrust_accel = up_now.scale(thrust_mag);
+            if self.wall_escape_cooldown > 0.0 && flying_away {
+                let tn = thrust_accel.dot(self.wall_normal);
+                if tn < 0.0 {
+                    thrust_accel = thrust_accel.sub(self.wall_normal.scale(tn));
+                }
+            }
+            let speed = self.vel.len();
+            let eff_drag = (cfg.air_drag as f32) / 1000.0; // e.g. 29 (0.29) -> 0.029
+            let drag_accel = self.vel.scale(-eff_drag * speed - eff_drag * 1.4);
 
-        let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);
+            // In-plane rotor H-force grip (carves turns cleanly without icy drift)
+            let v_plane = right_now
+                .scale(self.vel.dot(right_now))
+                .add(fwd_now.scale(self.vel.dot(fwd_now)));
+            let eff_grip = (cfg.rotor_grip as f32) / 100.0; // e.g. 34 -> 0.34
+            let grip_coeff = eff_grip * ((thrust_mag / (5.0 * GRAVITY) + 0.04).sqrt());
+            let grip_accel = v_plane.scale(-grip_coeff);
 
-        let total_accel = thrust_accel
-            .add(drag_accel)
-            .add(grip_accel)
-            .add(gravity_accel);
-        self.vel = self.vel.add(total_accel.scale(dt));
-        self.pos = self.pos.add(self.vel.scale(dt));
+            let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);
+
+            let total_accel = thrust_accel
+                .add(drag_accel)
+                .add(grip_accel)
+                .add(gravity_accel);
+            self.vel = self.vel.add(total_accel.scale(dt));
+            self.pos = self.pos.add(self.vel.scale(dt));
+        }
 
         // 6. Ground collision (smooth zero-bounce touchdown + realistic skids drag)
         if self.pos.y <= QUAD_RADIUS {
@@ -675,6 +909,8 @@ impl QuadState {
             if self.vel.x.abs() < 0.03 { self.vel.x = 0.0; }
             if self.vel.z.abs() < 0.03 { self.vel.z = 0.0; }
             self.on_ground = true;
+            self.wall_slide = false;
+            self.wall_slide_time = 0.0;
             self.flip_accum = 0.0;
             self.roll_accum = 0.0;
             self.inverted_time = 0.0;
@@ -683,6 +919,10 @@ impl QuadState {
         }
 
         // 7. Structure AABB collisions
+        let was_wall_sliding = self.wall_slide;
+        let mut substep_wall_norm = Vec3::ZERO;
+        let mut substep_wall_hits: u32 = 0;
+
         for s in track.structures {
             let ex_min = Vec3::new(s.min.x - QUAD_RADIUS, s.min.y - QUAD_RADIUS, s.min.z - QUAD_RADIUS);
             let ex_max = Vec3::new(s.max.x + QUAD_RADIUS, s.max.y + QUAD_RADIUS, s.max.z + QUAD_RADIUS);
@@ -700,26 +940,32 @@ impl QuadState {
                 let dz0 = self.pos.z - ex_min.z;
                 let dz1 = ex_max.z - self.pos.z;
                 let min_pen = dx0.min(dx1).min(dy0).min(dy1).min(dz0).min(dz1);
-                if min_pen == dx0 {
+                let normal = if min_pen == dx0 {
                     self.pos.x = ex_min.x;
-                    self.vel.x = -self.vel.x * 0.28;
+                    Vec3::new(-1.0, 0.0, 0.0)
                 } else if min_pen == dx1 {
                     self.pos.x = ex_max.x;
-                    self.vel.x = -self.vel.x * 0.28;
+                    Vec3::new(1.0, 0.0, 0.0)
                 } else if min_pen == dy0 {
                     self.pos.y = ex_min.y;
-                    self.vel.y = -self.vel.y * 0.28;
+                    Vec3::new(0.0, -1.0, 0.0)
                 } else if min_pen == dy1 {
                     self.pos.y = ex_max.y;
-                    self.vel.y = -self.vel.y * 0.20;
+                    Vec3::new(0.0, 1.0, 0.0)
                 } else if min_pen == dz0 {
                     self.pos.z = ex_min.z;
-                    self.vel.z = -self.vel.z * 0.28;
+                    Vec3::new(0.0, 0.0, -1.0)
                 } else {
                     self.pos.z = ex_max.z;
-                    self.vel.z = -self.vel.z * 0.28;
-                }
-                self.hit_flash = 0.25;
+                    Vec3::new(0.0, 0.0, 1.0)
+                };
+                self.resolve_object_contact(
+                    normal,
+                    flying_away,
+                    was_wall_sliding,
+                    &mut substep_wall_norm,
+                    &mut substep_wall_hits,
+                );
             }
         }
 
@@ -732,14 +978,14 @@ impl QuadState {
                     let p_br = g.pos.add(r);
                     let p_tl = Vec3::new(p_bl.x, g.pos.y + g.height, p_bl.z);
                     let p_tr = Vec3::new(p_br.x, g.pos.y + g.height, p_br.z);
-                    self.collide_segment(p_bl, p_tl, 0.16);
-                    self.collide_segment(p_br, p_tr, 0.16);
-                    self.collide_segment(p_tl, p_tr, 0.20);
+                    self.collide_segment(p_bl, p_tl, 0.16, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
+                    self.collide_segment(p_br, p_tr, 0.16, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
+                    self.collide_segment(p_tl, p_tr, 0.20, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
                     if g.pos.y > 0.2 {
                         let g_bl = Vec3::new(p_bl.x, 0.0, p_bl.z);
                         let g_br = Vec3::new(p_br.x, 0.0, p_br.z);
-                        self.collide_segment(g_bl, p_bl, 0.12);
-                        self.collide_segment(g_br, p_br, 0.12);
+                        self.collide_segment(g_bl, p_bl, 0.12, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
+                        self.collide_segment(g_br, p_br, 0.12, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
                     }
                 }
                 GateKind::Dive => {
@@ -748,16 +994,28 @@ impl QuadState {
                     let c1 = Vec3::new(g.pos.x + hw, g.pos.y, g.pos.z - hw);
                     let c2 = Vec3::new(g.pos.x + hw, g.pos.y, g.pos.z + hw);
                     let c3 = Vec3::new(g.pos.x - hw, g.pos.y, g.pos.z + hw);
-                    self.collide_segment(c0, c1, 0.18);
-                    self.collide_segment(c1, c2, 0.18);
-                    self.collide_segment(c2, c3, 0.18);
-                    self.collide_segment(c3, c0, 0.18);
+                    self.collide_segment(c0, c1, 0.18, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
+                    self.collide_segment(c1, c2, 0.18, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
+                    self.collide_segment(c2, c3, 0.18, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
+                    self.collide_segment(c3, c0, 0.18, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
                 }
                 GateKind::Flag => {
                     let top = Vec3::new(g.pos.x, g.height, g.pos.z);
-                    self.collide_segment(g.pos, top, 0.14);
+                    self.collide_segment(g.pos, top, 0.14, flying_away, was_wall_sliding, &mut substep_wall_norm, &mut substep_wall_hits);
                 }
             }
+        }
+
+        if substep_wall_hits > 0 {
+            let avg_n = substep_wall_norm.normalized();
+            if avg_n.len_sq() > 0.5 {
+                self.wall_normal = avg_n;
+            }
+            if !self.wall_slide {
+                self.wall_slide = true;
+                self.wall_slide_time = 0.0;
+            }
+            self.wall_contact_age = 0.0;
         }
 
         // World boundary soft fence (180m radius)
@@ -1189,5 +1447,228 @@ mod tests {
             "Horizon should smoothly recover upright from 145-deg pitch, got up.y={}",
             q_flip.rot.basis().1.y
         );
+    }
+
+    #[test]
+    fn test_object_collision_slow_angled_fall_until_grounded() {
+        // Dive Tower core AABB: x=-3..3, y=0..26, z=44..50 (front face at z = 44.0 - QUAD_RADIUS = 43.78)
+        let track = &TRACKS[2];
+
+        for mode in [FlightMode::Acro, FlightMode::Horizon, FlightMode::Angle] {
+            let mut cfg = Config::default();
+            cfg.flight_mode = mode;
+            let mut quad = QuadState::spawn(track, &cfg);
+            quad.pos = Vec3::new(0.0, 5.0, 43.2);
+            quad.vel = Vec3::new(0.0, 0.0, 12.0);
+            quad.on_ground = false;
+
+            // Keep neutral sticks & hover-like throttle (pilot does NOT fly away)
+            let hold_hover = StickInput { throttle: 0.42, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+
+            // After 0.6s (144 steps), quad should be sliding slowly angled towards the ground against the wall
+            for _ in 0..144 {
+                quad.step(hold_hover, &mut cfg, track);
+            }
+            let (_, up, fwd) = quad.rot.basis();
+            assert!(
+                quad.wall_slide,
+                "{:?}: should remain in wall_slide against wall while falling",
+                mode
+            );
+            assert!(
+                (quad.pos.z - (44.0 - QUAD_RADIUS)).abs() < 0.12,
+                "{:?}: should stay against the object face (z≈43.78), got z={:.3}",
+                mode,
+                quad.pos.z
+            );
+            assert!(
+                fwd.y < -0.55 && up.y > 0.35,
+                "{:?}: should angle nose towards the ground against object, fwd.y={:.3}, up.y={:.3}",
+                mode,
+                fwd.y,
+                up.y
+            );
+            assert!(
+                quad.vel.y < -1.0 && quad.vel.y > -3.2,
+                "{:?}: should fall slowly against object, got vy={:.3}",
+                mode,
+                quad.vel.y
+            );
+            assert!(
+                !quad.on_ground && quad.pos.y < 4.5 && quad.pos.y > 2.0,
+                "{:?}: fall from 5m should be gradual at 0.6s, got y={:.3}",
+                mode,
+                quad.pos.y
+            );
+
+            // Continue without flying away: should stay angled against the wall all the way until grounded
+            let mut grounded = false;
+            for _ in 0..960 {
+                quad.step(hold_hover, &mut cfg, track);
+                if quad.on_ground {
+                    grounded = true;
+                    break;
+                }
+            }
+            assert!(
+                grounded && quad.on_ground && !quad.wall_slide,
+                "{:?}: should slowly fall all the way until grounded, y={:.3}, on_ground={}, wall_slide={}",
+                mode,
+                quad.pos.y,
+                quad.on_ground,
+                quad.wall_slide
+            );
+        }
+    }
+
+    #[test]
+    fn test_object_collision_fly_away_regains_balance() {
+        let track = &TRACKS[2]; // Dive Tower front face at z = 44.0
+
+        for mode in [FlightMode::Acro, FlightMode::Horizon, FlightMode::Angle] {
+            let mut cfg = Config::default();
+            cfg.flight_mode = mode;
+            let mut quad = QuadState::spawn(track, &cfg);
+            quad.pos = Vec3::new(0.0, 8.0, 43.2);
+            quad.vel = Vec3::new(0.0, 0.0, 12.0);
+            quad.on_ground = false;
+
+            let neutral = StickInput { throttle: 0.42, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+            for _ in 0..120 {
+                quad.step(neutral, &mut cfg, track);
+            }
+            assert!(quad.wall_slide, "{:?}: expected wall_slide after impact", mode);
+
+            // Pull pitch back + throttle to fly away from the wall
+            let pull_away = StickInput { throttle: 0.58, yaw: 0.0, pitch: -0.60, roll: 0.0 };
+            for _ in 0..160 {
+                quad.step(pull_away, &mut cfg, track);
+            }
+            assert!(
+                !quad.wall_slide,
+                "{:?}: flying away should exit wall_slide",
+                mode
+            );
+            assert!(
+                quad.pos.z < 42.5,
+                "{:?}: should fly clearly away from wall (z=43.78), got z={:.3}",
+                mode,
+                quad.pos.z
+            );
+            assert!(
+                !quad.on_ground && quad.pos.y > 4.0,
+                "{:?}: should stay airborne after flying away, got y={:.3}",
+                mode,
+                quad.pos.y
+            );
+
+            // Center sticks to verify balance recovery
+            let level_hover = StickInput { throttle: 0.48, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+            for _ in 0..180 {
+                quad.step(level_hover, &mut cfg, track);
+            }
+            let (_, up_after, _) = quad.rot.basis();
+            if mode != FlightMode::Acro {
+                assert!(
+                    up_after.y > 0.92,
+                    "{:?}: should regain upright balance after flying away, up.y={:.3}",
+                    mode,
+                    up_after.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pushing_into_wall_with_throttle_still_slowly_falls() {
+        let track = &TRACKS[2]; // Dive Tower front face at z = 44.0
+        let mut cfg = Config::default();
+        cfg.flight_mode = FlightMode::Angle;
+        let mut quad = QuadState::spawn(track, &cfg);
+        quad.pos = Vec3::new(0.0, 4.0, 43.2);
+        quad.vel = Vec3::new(0.0, 1.5, 10.0);
+        quad.on_ground = false;
+
+        // Keep pushing forward into the wall with 65% throttle (NOT flying away)
+        let push_into_wall = StickInput { throttle: 0.65, yaw: 0.0, pitch: 0.55, roll: 0.0 };
+        for _ in 0..240 {
+            quad.step(push_into_wall, &mut cfg, track);
+        }
+        assert!(
+            quad.wall_slide && quad.pos.y < 3.0 && quad.vel.y < -0.5,
+            "Pushing into wall with high throttle must still slowly fall (not climb!), y={:.3}, vy={:.3}, wall_slide={}",
+            quad.pos.y,
+            quad.vel.y,
+            quad.wall_slide
+        );
+    }
+
+    #[test]
+    fn test_sideways_wall_slide_and_gate_post_slide() {
+        // 1. Sideways hit into Bando right wall (x: 7.5..10.0, y: 0..12, z: 22..54)
+        let bando = &TRACKS[3];
+        let mut cfg = Config::default();
+        cfg.flight_mode = FlightMode::Horizon;
+        let mut q = QuadState::spawn(bando, &cfg);
+        q.pos = Vec3::new(6.9, 6.0, 35.0);
+        q.vel = Vec3::new(10.0, 0.0, 0.0);
+        q.on_ground = false;
+
+        let hover = StickInput { throttle: 0.42, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..120 {
+            q.step(hover, &mut cfg, bando);
+        }
+        let (right, _, _) = q.rot.basis();
+        assert!(q.wall_slide, "Sideways wall hit should engage wall_slide");
+        assert!(
+            right.y < -0.55,
+            "Right side hitting wall should dip right side towards ground, right.y={:.3}",
+            right.y
+        );
+
+        // Roll left away from right wall -> flies away cleanly
+        let roll_away = StickInput { throttle: 0.58, yaw: 0.0, pitch: 0.0, roll: -0.60 };
+        for _ in 0..160 {
+            q.step(roll_away, &mut cfg, bando);
+        }
+        assert!(!q.wall_slide && q.pos.x < 5.8, "Rolling left should fly away from right wall, x={:.3}", q.pos.x);
+
+        // 2. Gate post hit (Meadow Gate 0 left post at x=-2.4, z=22.0, height=3.6)
+        let meadow = &TRACKS[0];
+        let mut qg = QuadState::spawn(meadow, &cfg);
+        qg.pos = Vec3::new(-2.4, 2.8, 21.3);
+        qg.vel = Vec3::new(0.0, 0.0, 10.0);
+        qg.on_ground = false;
+        let mut reached_ground = false;
+        let mut saw_angled_slide = false;
+        for _ in 0..600 {
+            qg.step(hover, &mut cfg, meadow);
+            if qg.wall_slide && qg.rot.basis().2.y < -0.45 && qg.vel.y < -0.8 {
+                saw_angled_slide = true;
+            }
+            if qg.on_ground {
+                reached_ground = true;
+                break;
+            }
+        }
+        assert!(saw_angled_slide, "Hitting a gate post should trigger slow angled slide");
+        assert!(reached_ground, "Sliding down gate post without escaping should ground the quad");
+    }
+
+    #[test]
+    fn test_roof_landing_does_not_wall_slide() {
+        let dive = &TRACKS[2]; // Tower crown top at y = 28.5, x: -4.5..4.5, z: 42.5..51.5
+        let mut cfg = Config::default();
+        let mut q = QuadState::spawn(dive, &cfg);
+        q.pos = Vec3::new(0.0, 29.1, 47.0);
+        q.vel = Vec3::new(0.0, -1.5, 0.0);
+        q.on_ground = false;
+        let idle = StickInput { throttle: 0.0, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..120 {
+            q.step(idle, &mut cfg, dive);
+        }
+        assert!(!q.wall_slide, "Landing on top of a flat roof should NOT trigger wall_slide");
+        assert!(q.on_ground, "Drone should settle grounded on top of the flat roof");
+        assert!((q.pos.y - (28.5 + QUAD_RADIUS)).abs() < 0.05, "Should rest on roof surface, y={:.3}", q.pos.y);
     }
 }
