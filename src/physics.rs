@@ -460,41 +460,58 @@ impl QuadState {
                 -Self::betaflight_actual(input.roll, center_sens, max_rate, expo),
             );
 
-            let angle_omega = {
-                let max_tilt = 45.0_f32.to_radians();
-                let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
-                let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
-                // Handle inverted recovery cleanly in Horizon/Angle
-                let (cur_pitch, cur_roll) = if up.y >= 0.0 {
-                    (
-                        clampf(-forward.y, -1.0, 1.0).asin(),
-                        clampf(-right.y, -1.0, 1.0).asin(),
-                    )
-                } else {
-                    // Upside down -> command fast roll back upright
-                    let roll_sign = if right.y >= 0.0 { -1.0 } else { 1.0 };
-                    (0.0, roll_sign * std::f32::consts::PI * 0.75)
-                };
-                let pitch_err = desired_pitch - cur_pitch;
-                let roll_err = desired_roll - cur_roll;
-                Vec3::new(
-                    clampf(pitch_err * 7.5, -7.0, 7.0),
-                    Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.75, expo),
-                    clampf(-roll_err * 7.5, -7.0, 7.0),
-                )
-            };
-
             let target_omega = match cfg.flight_mode {
                 FlightMode::Acro => acro_omega,
-                FlightMode::Angle => angle_omega,
-                FlightMode::Horizon => {
-                    // Authentic Betaflight Horizon: self-level below 55% stick, full Acro flip above 85%!
-                    let def = input.pitch.abs().max(input.roll.abs());
-                    let blend = ((def - 0.55) / 0.30).clamp(0.0, 1.0);
+                FlightMode::Angle => {
+                    // Strict Betaflight ANGLE mode: stick directly commands tilt angle (capped at 55 deg, never flips)
+                    let max_tilt = 55.0_f32.to_radians();
+                    let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
+                    let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
+                    let (cur_pitch, cur_roll) = if up.y >= 0.0 {
+                        (
+                            clampf(-forward.y, -1.0, 1.0).asin(),
+                            clampf(-right.y, -1.0, 1.0).asin(),
+                        )
+                    } else {
+                        let roll_sign = if right.y >= 0.0 { -1.0 } else { 1.0 };
+                        (0.0, roll_sign * std::f32::consts::PI * 0.75)
+                    };
+                    let pitch_err = desired_pitch - cur_pitch;
+                    let roll_err = desired_roll - cur_roll;
                     Vec3::new(
-                        angle_omega.x + (acro_omega.x - angle_omega.x) * blend,
+                        clampf(pitch_err * 8.5, -7.5, 7.5),
+                        Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.75, expo),
+                        clampf(-roll_err * 8.5, -7.5, 7.5),
+                    )
+                }
+                FlightMode::Horizon => {
+                    // Authentic Betaflight HORIZON mode:
+                    // Always uses fluid Acro angular rate response + a self-leveling spring that fades smoothly
+                    // to 0 by 70% stick deflection (and fades at steep bank angles while steering) so you can
+                    // bank freely past 55 deg and execute full flips/rolls, then self-level upright when centered!
+                    let def = input.pitch.abs().max(input.roll.abs());
+                    let stick_level = (1.0 - def / 0.70).clamp(0.0, 1.0);
+                    let tilt_factor = if def < 0.25 {
+                        1.0
+                    } else {
+                        clampf((up.y - 0.15) / 0.75, 0.0, 1.0)
+                    };
+                    let level_strength = stick_level * stick_level * tilt_factor;
+
+                    let (level_x, level_z) = if up.y >= 0.0 {
+                        let cur_pitch = clampf(-forward.y, -1.0, 1.0).asin();
+                        let cur_roll = clampf(-right.y, -1.0, 1.0).asin();
+                        (-cur_pitch * 5.2, cur_roll * 5.2)
+                    } else {
+                        // Upside down with centered stick -> smoothly roll back upright
+                        let roll_sign = if right.y >= 0.0 { -1.0 } else { 1.0 };
+                        (0.0, roll_sign * 7.0)
+                    };
+
+                    Vec3::new(
+                        acro_omega.x + clampf(level_x, -6.5, 6.5) * level_strength,
                         acro_omega.y,
-                        angle_omega.z + (acro_omega.z - angle_omega.z) * blend,
+                        acro_omega.z + clampf(level_z, -6.5, 6.5) * level_strength,
                     )
                 }
             };
@@ -886,5 +903,46 @@ mod tests {
             quad.step(input, &mut cfg, track);
         }
         assert!(quad.motor_thr > 0.3, "Sideways low flight must NOT cut throttle via turtle mode!");
+    }
+
+    #[test]
+    fn test_angle_capped_while_horizon_flips() {
+        let track = &TRACKS[0];
+
+        // 1. ANGLE mode at 100% roll stick must stay capped upright (never flip!)
+        let mut cfg_angle = Config::default();
+        cfg_angle.flight_mode = FlightMode::Angle;
+        let mut q_angle = QuadState::spawn(track, &cfg_angle);
+        q_angle.pos = Vec3::new(0.0, 15.0, 0.0);
+        q_angle.on_ground = false;
+        let full_roll = StickInput { throttle: 0.5, yaw: 0.0, pitch: 0.0, roll: 1.0 };
+        for _ in 0..160 {
+            q_angle.step(full_roll, &mut cfg_angle, track);
+        }
+        let (_, up_angle, _) = q_angle.rot.basis();
+        assert!(up_angle.y > 0.45, "ANGLE mode must stay capped near 55 deg, got up.y={}", up_angle.y);
+
+        // 2. HORIZON mode at 75% roll stick must freely roll past 90 deg and flip inverted!
+        let mut cfg_hor = Config::default();
+        cfg_hor.flight_mode = FlightMode::Horizon;
+        let mut q_hor = QuadState::spawn(track, &cfg_hor);
+        q_hor.pos = Vec3::new(0.0, 15.0, 0.0);
+        q_hor.on_ground = false;
+        let roll_75 = StickInput { throttle: 0.5, yaw: 0.0, pitch: 0.0, roll: 0.75 };
+        let mut went_inverted = false;
+        for _ in 0..160 {
+            q_hor.step(roll_75, &mut cfg_hor, track);
+            if q_hor.rot.basis().1.y < -0.2 {
+                went_inverted = true;
+            }
+        }
+        assert!(went_inverted, "HORIZON mode at 75% stick should smoothly flip inverted!");
+
+        // 3. Releasing stick in HORIZON must self-level back upright
+        let center = StickInput { throttle: 0.45, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..240 {
+            q_hor.step(center, &mut cfg_hor, track);
+        }
+        assert!(q_hor.rot.basis().1.y > 0.92, "HORIZON mode should self-level when stick centered!");
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 PKG_NAME="stickzero"
 ARCH="arm64"
 BIN="target/aarch64-unknown-linux-musl/release/stickzero"
