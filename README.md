@@ -24,9 +24,9 @@ StickTime-Pi runs `StickTime.lua` inside an embedded Lua 5.3 interpreter (design
 - **Per-Pixel 16-bit Z-Buffered 3D Engine & 4 Tracks**:
   - `Meadow Loop`, `Figure 8`, `Dive Tower`, and `Bando` — solid 3D gate posts & beams that never clip or vanish.
 - **4 Flight Themes + 2 Menu UI Themes**:
-  - Flight: `Summer`, `Evening`, `Night`, and redesigned hidden-line neon `Wireframe` (dark occluded cyan/violet/magenta cross-braced walls vs glowing orange/yellow gates and emerald green ground grid).
-  - Menus: Toggleable **Classic** and **Monokai** UI themes in Settings.
-- **Authentic Betaflight OSD + Post-Flight Stats**: Clean flight timer, throttle %, mAh used, cell voltage, ELRS link quality, craft name, speed/altitude, toggleable `Debug OSD` (FPS/ms), optional NTSC/RF `Analog FX`, and Betaflight post-flight stats card on disarm or empty pack.
+  - Flight: `Summer`, `Evening`, `Night`, and two-pass hidden-line neon `Wireframe` (strictly occluded dark hologram walls with neon edges vs glowing orange/yellow gates and emerald green ground grid).
+  - Menus: **Monokai** (default) and **StickTime** UI themes toggleable in Settings.
+- **Authentic Betaflight OSD + Trailing Sticks + Post-Flight Stats**: Clean flight timer, throttle %, mAh used, cell voltage, ELRS link quality, craft name, speed/altitude, toggleable **Stick OSD** (`Off` / `On (Dot)` / `Trails`), toggleable `Debug OSD` (FPS/ms), optional NTSC/RF `Analog FX`, and Betaflight post-flight stats card on disarm or empty pack.
 - **Bluetooth & USB-C Controller Support (EdgeTX / ELRS / Gamepads)**:
   - Hot-plugs standard Linux `evdev` controllers automatically every 1.5s, including **RadioMaster Pocket** (`RM Pocket`), EdgeTX USB Joysticks, ELRS BLE Joysticks, Xbox, PlayStation, Switch Pro, and 8BitDo.
   - Built-in 4-step **Stick Calibration (`C`)** and 3-step **AUX Switch/Button Binder (`B`)** for **Arm/Disarm**, **3-pos Flight Mode (`ACRO`/`HORIZON`/`ANGLE`)**, and **Turtle Mode**.
@@ -51,8 +51,8 @@ bash ./package.sh
 ### Option A: One-line install directly on CardputerZero (over Wi-Fi)
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.3_arm64.deb \
-  && sudo dpkg -i stickzero_0.1.3_arm64.deb \
+curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.4_arm64.deb \
+  && sudo dpkg -i stickzero_0.1.4_arm64.deb \
   && systemctl --user restart APPLaunch.service
 ```
 

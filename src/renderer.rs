@@ -2,7 +2,7 @@
 //! per-pixel 16-bit perspective-correct Z-buffer, solid 3D racing gates,
 //! authentic Betaflight OSD + post-flight statistics, and CardputerZero 1.9" menus.
 
-use crate::config::{AuxBinding, BatteryPack, Config, GameMode, UiTheme, VisualTheme};
+use crate::config::{AuxBinding, BatteryPack, Config, GameMode, StickOverlay, UiTheme, VisualTheme};
 use crate::display::{SCREEN_H, SCREEN_W};
 use crate::font::{glyph, GLYPH_H, GLYPH_W};
 use crate::input::{ControllerKind, InputManager};
@@ -17,6 +17,7 @@ const HALF_H: f32 = (SCREEN_H as f32) * 0.5;
 const NEAR_Z: f32 = 0.16;
 /// Scale factor mapping 1/z (0 ..= 6.25) into u16 Z-buffer (0 ..= 65000). Larger = closer.
 const IZ_SCALE: f32 = 10400.0;
+const STICK_TRAIL_LEN: usize = 18;
 
 #[inline(always)]
 pub const fn rgb565(r: u8, g: u8, b: u8) -> u16 {
@@ -59,24 +60,7 @@ struct UiColors {
 
 fn ui_colors(theme: UiTheme) -> UiColors {
     match theme {
-        UiTheme::Classic => UiColors {
-            bg: rgb565(12, 16, 26),
-            header_bg: rgb565(22, 32, 52),
-            header_line: rgb565(65, 140, 240),
-            title: rgb565(255, 255, 255),
-            tag: rgb565(120, 220, 255),
-            sel_bg: rgb565(36, 66, 118),
-            sel_border: rgb565(90, 190, 255),
-            sel_label: rgb565(255, 230, 80),
-            sel_val: rgb565(255, 255, 255),
-            label: rgb565(180, 195, 215),
-            val: rgb565(135, 200, 235),
-            muted: rgb565(145, 160, 180),
-            ok: rgb565(70, 240, 110),
-            warn: rgb565(240, 160, 50),
-            accent: rgb565(90, 220, 255),
-        },
-        // Authentic Monokai palette tuned for crisp 1.9" 320x170 RGB565 readability
+        // Authentic Monokai palette tuned for crisp 1.9" 320x170 RGB565 readability (Default)
         UiTheme::Monokai => UiColors {
             bg: rgb565(39, 40, 34),           // #272822 Monokai background
             header_bg: rgb565(29, 30, 26),    // #1D1E1A deeper header bar
@@ -93,6 +77,24 @@ fn ui_colors(theme: UiTheme) -> UiColors {
             ok: rgb565(166, 226, 46),         // #A6E22E green
             warn: rgb565(253, 151, 31),       // #FD971F orange
             accent: rgb565(174, 129, 255),    // #AE81FF Monokai purple
+        },
+        // Classic StickTime blue-slate palette
+        UiTheme::StickTime => UiColors {
+            bg: rgb565(12, 16, 26),
+            header_bg: rgb565(22, 32, 52),
+            header_line: rgb565(65, 140, 240),
+            title: rgb565(255, 255, 255),
+            tag: rgb565(120, 220, 255),
+            sel_bg: rgb565(36, 66, 118),
+            sel_border: rgb565(90, 190, 255),
+            sel_label: rgb565(255, 230, 80),
+            sel_val: rgb565(255, 255, 255),
+            label: rgb565(180, 195, 215),
+            val: rgb565(135, 200, 235),
+            muted: rgb565(145, 160, 180),
+            ok: rgb565(70, 240, 110),
+            warn: rgb565(240, 160, 50),
+            accent: rgb565(90, 220, 255),
         },
     }
 }
@@ -178,6 +180,10 @@ pub struct Renderer {
     zbuf: Box<[u16; SCREEN_W * SCREEN_H]>,
     focal: f32,
     rng_state: u32,
+    /// Zero-allocation ring buffer storing recent (lx, ly, rx, ry) stick positions for OSD trails.
+    stick_trail: [(f32, f32, f32, f32); STICK_TRAIL_LEN],
+    trail_head: usize,
+    trail_len: usize,
 }
 
 impl Renderer {
@@ -187,6 +193,22 @@ impl Renderer {
             zbuf: Box::new([0u16; SCREEN_W * SCREEN_H]),
             focal: 160.0,
             rng_state: 0x51A7_1C09,
+            stick_trail: [(0.0, 0.0, 0.0, 0.0); STICK_TRAIL_LEN],
+            trail_head: 0,
+            trail_len: 0,
+        }
+    }
+
+    pub fn reset_stick_trail(&mut self) {
+        self.trail_head = 0;
+        self.trail_len = 0;
+    }
+
+    pub fn push_stick_trail(&mut self, lx: f32, ly: f32, rx: f32, ry: f32) {
+        self.stick_trail[self.trail_head] = (lx, ly, rx, ry);
+        self.trail_head = (self.trail_head + 1) % STICK_TRAIL_LEN;
+        if self.trail_len < STICK_TRAIL_LEN {
+            self.trail_len += 1;
         }
     }
 
@@ -273,7 +295,8 @@ impl Renderer {
         }
     }
 
-    /// Z-buffered Bresenham line with linear `1/z` interpolation.
+    /// Z-buffered Bresenham line with linear `1/z` interpolation and proportional Z-bias
+    /// so foreground outlines never Z-fight their own face and distant back edges NEVER bleed through nearer walls.
     fn draw_line_z(
         &mut self,
         mut x0: i32,
@@ -283,7 +306,7 @@ impl Renderer {
         y1: i32,
         iz1: f32,
         color: u16,
-        z_bias: f32,
+        write_z: bool,
     ) {
         let dx = (x1 - x0).abs();
         let dy_abs = (y1 - y0).abs();
@@ -293,14 +316,22 @@ impl Renderer {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
         let diz = if steps > 0 { (iz1 - iz0) / (steps as f32) } else { 0.0 };
-        let mut iz = iz0 + z_bias;
+        let mut iz = iz0;
 
         for _ in 0..=steps {
             if x0 >= 0 && x0 < W && y0 >= 0 && y0 < H {
                 let idx = (y0 as usize) * SCREEN_W + (x0 as usize);
-                let zu = (iz as i32).clamp(1, 65535) as u16;
-                if zu >= self.zbuf[idx] {
-                    self.zbuf[idx] = zu;
+                // Proportional ~0.5% depth tolerance (at least 2 u16 units, max 6) beats own-face quantization
+                // while rejecting any back wall behind the foreground surface!
+                let bias = (iz * 0.005).clamp(2.0, 6.0);
+                let z_test = ((iz + bias) as i32).clamp(1, 65535) as u16;
+                if z_test >= self.zbuf[idx] {
+                    if write_z {
+                        let z_store = (iz as i32).clamp(1, 65535) as u16;
+                        if z_store > self.zbuf[idx] {
+                            self.zbuf[idx] = z_store;
+                        }
+                    }
                     self.fb[idx] = color;
                 }
             }
@@ -533,7 +564,7 @@ impl Renderer {
         }
     }
 
-    /// Draw a Z-buffered 3D line (optional 2px thickness for wireframe gates/edges).
+    /// Draw a Z-buffered 3D line (optional 2px thickness for flags/stilts).
     fn draw_3d_line_z(&mut self, a: Vec3, b: Vec3, cam_pos: Vec3, cam_inv: Quat, color: u16, thick: bool) {
         let mut ca = Self::world_to_cam(a, cam_pos, cam_inv);
         let mut cb = Self::world_to_cam(b, cam_pos, cam_inv);
@@ -550,24 +581,26 @@ impl Renderer {
         let sa = self.project_sv(ca);
         let sb = self.project_sv(cb);
         if let Some((x0, y0, iz0, x1, y1, iz1)) = Self::clip_line_2d_z(sa.x, sa.y, sa.iz, sb.x, sb.y, sb.iz) {
-            self.draw_line_z(x0, y0, iz0, x1, y1, iz1, color, 28.0);
+            self.draw_line_z(x0, y0, iz0, x1, y1, iz1, color, true);
             if thick {
-                self.draw_line_z(x0 + 1, y0, iz0, x1 + 1, y1, iz1, color, 28.0);
-                self.draw_line_z(x0, y0 + 1, iz0, x1, y1 + 1, iz1, color, 28.0);
+                self.draw_line_z(x0 + 1, y0, iz0, x1 + 1, y1, iz1, color, false);
+                self.draw_line_z(x0, y0 + 1, iz0, x1, y1 + 1, iz1, color, false);
             }
         }
     }
 
-    /// Clip and rasterize a 3D quad directly into the framebuffer + 16-bit Z-buffer.
-    /// In `wireframe` mode, fills the interior with dark hidden-line occlusion so walls solidly
-    /// block objects behind them, adds a subtle X-brace panel line, and outlines in bright neon!
-    fn draw_3d_quad_z(&mut self, verts: [Vec3; 4], cam_pos: Vec3, cam_inv: Quat, fill: u16, edge: u16, wireframe: bool) {
+    /// Sutherland-Hodgman clip a 3D quad against `z >= NEAR_Z` and project to screen vertices.
+    fn clip_project_quad(
+        &self,
+        verts: [Vec3; 4],
+        cam_pos: Vec3,
+        cam_inv: Quat,
+    ) -> Option<([Vec3; 5], [ScreenVert; 5], usize)> {
         let mut c = [Vec3::ZERO; 4];
         for i in 0..4 {
             c[i] = Self::world_to_cam(verts[i], cam_pos, cam_inv);
         }
 
-        // Sutherland-Hodgman clip against z >= NEAR_Z (yields 0..=5 vertices)
         let mut clipped = [Vec3::ZERO; 5];
         let mut count = 0usize;
         for i in 0..4 {
@@ -592,7 +625,7 @@ impl Renderer {
             }
         }
         if count < 3 {
-            return;
+            return None;
         }
 
         let mut sv = [ScreenVert { x: 0.0, y: 0.0, iz: 0.0 }; 5];
@@ -609,32 +642,54 @@ impl Renderer {
             max_y = max_y.max(p.y);
         }
         if max_x < 0.0 || min_x >= W as f32 || max_y < 0.0 || min_y >= H as f32 {
-            return;
+            return None;
         }
+        Some((clipped, sv, count))
+    }
 
-        for k in 1..(count - 1) {
-            self.fill_tri_z(sv[0], sv[k], sv[k + 1], fill);
-        }
-        // In Wireframe mode, draw subtle inner panel X-brace so solid walls are unmistakable vs open gates
-        if wireframe && count >= 4 {
-            let brace_col = lerp_rgb565(fill, edge, 0.42);
-            if let Some((x0, y0, iz0, x1, y1, iz1)) =
-                Self::clip_line_2d_z(sv[0].x, sv[0].y, sv[0].iz, sv[2].x, sv[2].y, sv[2].iz)
-            {
-                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, brace_col, 16.0);
-            }
-            if let Some((x0, y0, iz0, x1, y1, iz1)) =
-                Self::clip_line_2d_z(sv[1].x, sv[1].y, sv[1].iz, sv[3].x, sv[3].y, sv[3].iz)
-            {
-                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, brace_col, 16.0);
+    /// Pass 1: Fill a 3D quad into framebuffer + 16-bit Z-buffer.
+    fn draw_3d_quad_fill_z(&mut self, verts: [Vec3; 4], cam_pos: Vec3, cam_inv: Quat, fill: u16) {
+        if let Some((_, sv, count)) = self.clip_project_quad(verts, cam_pos, cam_inv) {
+            for k in 1..(count - 1) {
+                self.fill_tri_z(sv[0], sv[k], sv[k + 1], fill);
             }
         }
-        for k in 0..count {
-            let n = (k + 1) % count;
-            if let Some((x0, y0, iz0, x1, y1, iz1)) =
-                Self::clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
-            {
-                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, 26.0);
+    }
+
+    /// Pass 2: Draw strictly hidden-line occluded 3D quad edges against the completed Z-buffer.
+    fn draw_3d_quad_edges_z(&mut self, verts: [Vec3; 4], cam_pos: Vec3, cam_inv: Quat, edge: u16) {
+        if let Some((clipped, sv, count)) = self.clip_project_quad(verts, cam_pos, cam_inv) {
+            for k in 0..count {
+                let n = (k + 1) % count;
+                // Skip artificial edge generated along the camera near clip plane
+                if (clipped[k].z - NEAR_Z).abs() < 1e-3 && (clipped[n].z - NEAR_Z).abs() < 1e-3 {
+                    continue;
+                }
+                if let Some((x0, y0, iz0, x1, y1, iz1)) =
+                    Self::clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
+                {
+                    self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, false);
+                }
+            }
+        }
+    }
+
+    /// Clip and rasterize both fill + outline of a 3D quad (used for gate beams & banners).
+    fn draw_3d_quad_z(&mut self, verts: [Vec3; 4], cam_pos: Vec3, cam_inv: Quat, fill: u16, edge: u16, _wireframe: bool) {
+        if let Some((clipped, sv, count)) = self.clip_project_quad(verts, cam_pos, cam_inv) {
+            for k in 1..(count - 1) {
+                self.fill_tri_z(sv[0], sv[k], sv[k + 1], fill);
+            }
+            for k in 0..count {
+                let n = (k + 1) % count;
+                if (clipped[k].z - NEAR_Z).abs() < 1e-3 && (clipped[n].z - NEAR_Z).abs() < 1e-3 {
+                    continue;
+                }
+                if let Some((x0, y0, iz0, x1, y1, iz1)) =
+                    Self::clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
+                {
+                    self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, false);
+                }
             }
         }
     }
@@ -903,37 +958,39 @@ impl Renderer {
             );
         }
 
-        // 3. Structures (solid shaded 3D boxes; dark-occluded neon cross-braced walls in Wireframe!)
-        for s in track.structures {
-            let (c_top, c_side_a, c_side_b, c_edge) = if pal.wireframe {
-                match s.color {
+        // 3. Structures — Two-pass Z-buffered hidden-line rendering:
+        //    Pass 3A fills all solid faces into the Z-buffer first;
+        //    Pass 3B draws all visible outlines against the completed Z-buffer so NO back edges ever overlap!
+        let struct_colors = |color: StructureColor, wf: bool| -> (u16, u16, u16, u16) {
+            if wf {
+                match color {
                     StructureColor::Concrete => (
-                        rgb565(16, 40, 62),
-                        rgb565(11, 28, 46),
-                        rgb565(8, 20, 34),
-                        rgb565(60, 232, 255), // Electric Cyan walls
+                        rgb565(18, 46, 70),
+                        rgb565(12, 32, 52),
+                        rgb565(8, 22, 38),
+                        rgb565(65, 235, 255), // Electric Cyan walls
                     ),
                     StructureColor::Steel => (
-                        rgb565(26, 22, 58),
-                        rgb565(18, 15, 42),
-                        rgb565(12, 10, 30),
-                        rgb565(155, 145, 255), // Electric Indigo/Violet pillars
+                        rgb565(30, 24, 66),
+                        rgb565(20, 16, 48),
+                        rgb565(14, 11, 34),
+                        rgb565(160, 148, 255), // Electric Indigo/Violet pillars
                     ),
                     StructureColor::RedWhite => (
-                        rgb565(48, 14, 36),
-                        rgb565(34, 10, 26),
+                        rgb565(52, 14, 38),
+                        rgb565(36, 10, 28),
                         rgb565(24, 7, 18),
-                        rgb565(255, 80, 185), // Neon Magenta towers
+                        rgb565(255, 82, 188), // Neon Magenta towers
                     ),
                     StructureColor::Wood => (
-                        rgb565(44, 28, 10),
-                        rgb565(32, 20, 8),
-                        rgb565(22, 14, 6),
-                        rgb565(255, 185, 65), // Neon Amber barriers
+                        rgb565(48, 30, 10),
+                        rgb565(34, 22, 8),
+                        rgb565(24, 14, 6),
+                        rgb565(255, 188, 68), // Neon Amber barriers
                     ),
                 }
             } else {
-                match s.color {
+                match color {
                     StructureColor::Concrete => (
                         rgb565(175, 178, 182),
                         rgb565(138, 142, 148),
@@ -959,44 +1016,91 @@ impl Renderer {
                         rgb565(72, 50, 28),
                     ),
                 }
-            };
+            }
+        };
+
+        // Pass 3A: Rasterize all visible structure faces into framebuffer + Z-buffer
+        for s in track.structures {
+            let (c_top, c_side_a, c_side_b, _) = struct_colors(s.color, pal.wireframe);
             let (x0, y0, z0) = (s.min.x, s.min.y, s.min.z);
             let (x1, y1, z1) = (s.max.x, s.max.y, s.max.z);
-            let wf = pal.wireframe;
             if cam_pos.y > y1 {
-                self.draw_3d_quad_z(
+                self.draw_3d_quad_fill_z(
                     [Vec3::new(x0, y1, z0), Vec3::new(x1, y1, z0), Vec3::new(x1, y1, z1), Vec3::new(x0, y1, z1)],
-                    cam_pos, cam_inv, c_top, c_edge, wf,
+                    cam_pos, cam_inv, c_top,
                 );
             }
             if cam_pos.y < y0 {
-                self.draw_3d_quad_z(
+                self.draw_3d_quad_fill_z(
                     [Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y0, z1), Vec3::new(x0, y0, z1)],
-                    cam_pos, cam_inv, c_side_b, c_edge, wf,
+                    cam_pos, cam_inv, c_side_b,
                 );
             }
             if cam_pos.z < z0 {
-                self.draw_3d_quad_z(
+                self.draw_3d_quad_fill_z(
                     [Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y1, z0), Vec3::new(x0, y1, z0)],
-                    cam_pos, cam_inv, c_side_a, c_edge, wf,
+                    cam_pos, cam_inv, c_side_a,
                 );
             }
             if cam_pos.z > z1 {
-                self.draw_3d_quad_z(
+                self.draw_3d_quad_fill_z(
                     [Vec3::new(x0, y0, z1), Vec3::new(x1, y0, z1), Vec3::new(x1, y1, z1), Vec3::new(x0, y1, z1)],
-                    cam_pos, cam_inv, c_side_a, c_edge, wf,
+                    cam_pos, cam_inv, c_side_a,
                 );
             }
             if cam_pos.x < x0 {
-                self.draw_3d_quad_z(
+                self.draw_3d_quad_fill_z(
                     [Vec3::new(x0, y0, z0), Vec3::new(x0, y0, z1), Vec3::new(x0, y1, z1), Vec3::new(x0, y1, z0)],
-                    cam_pos, cam_inv, c_side_b, c_edge, wf,
+                    cam_pos, cam_inv, c_side_b,
                 );
             }
             if cam_pos.x > x1 {
-                self.draw_3d_quad_z(
+                self.draw_3d_quad_fill_z(
                     [Vec3::new(x1, y0, z0), Vec3::new(x1, y0, z1), Vec3::new(x1, y1, z1), Vec3::new(x1, y1, z0)],
-                    cam_pos, cam_inv, c_side_b, c_edge, wf,
+                    cam_pos, cam_inv, c_side_b,
+                );
+            }
+        }
+
+        // Pass 3B: Draw all visible structure edges strictly occluded against the completed Z-buffer
+        for s in track.structures {
+            let (_, _, _, c_edge) = struct_colors(s.color, pal.wireframe);
+            let (x0, y0, z0) = (s.min.x, s.min.y, s.min.z);
+            let (x1, y1, z1) = (s.max.x, s.max.y, s.max.z);
+            if cam_pos.y > y1 {
+                self.draw_3d_quad_edges_z(
+                    [Vec3::new(x0, y1, z0), Vec3::new(x1, y1, z0), Vec3::new(x1, y1, z1), Vec3::new(x0, y1, z1)],
+                    cam_pos, cam_inv, c_edge,
+                );
+            }
+            if cam_pos.y < y0 {
+                self.draw_3d_quad_edges_z(
+                    [Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y0, z1), Vec3::new(x0, y0, z1)],
+                    cam_pos, cam_inv, c_edge,
+                );
+            }
+            if cam_pos.z < z0 {
+                self.draw_3d_quad_edges_z(
+                    [Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y1, z0), Vec3::new(x0, y1, z0)],
+                    cam_pos, cam_inv, c_edge,
+                );
+            }
+            if cam_pos.z > z1 {
+                self.draw_3d_quad_edges_z(
+                    [Vec3::new(x0, y0, z1), Vec3::new(x1, y0, z1), Vec3::new(x1, y1, z1), Vec3::new(x0, y1, z1)],
+                    cam_pos, cam_inv, c_edge,
+                );
+            }
+            if cam_pos.x < x0 {
+                self.draw_3d_quad_edges_z(
+                    [Vec3::new(x0, y0, z0), Vec3::new(x0, y0, z1), Vec3::new(x0, y1, z1), Vec3::new(x0, y1, z0)],
+                    cam_pos, cam_inv, c_edge,
+                );
+            }
+            if cam_pos.x > x1 {
+                self.draw_3d_quad_edges_z(
+                    [Vec3::new(x1, y0, z0), Vec3::new(x1, y0, z1), Vec3::new(x1, y1, z1), Vec3::new(x1, y1, z0)],
+                    cam_pos, cam_inv, c_edge,
                 );
             }
         }
@@ -1227,7 +1331,7 @@ impl Renderer {
         }
 
         // Bottom-left: Betaflight Cell Voltage + ELRS LQ
-        let batt_y = if cfg.show_sticks { H - 41 } else { H - 11 };
+        let batt_y = if cfg.stick_overlay.is_visible() { H - 41 } else { H - 11 };
         if batt_on {
             let v_col = if quad.cell_voltage < 3.38 {
                 red
@@ -1239,7 +1343,7 @@ impl Renderer {
             let v_str = format!("{:.2}V", quad.cell_voltage);
             self.draw_text(4, batt_y, &v_str, v_col, 1, true);
         }
-        let lq_y = if cfg.show_sticks { H - 41 } else { H - 11 };
+        let lq_y = if cfg.stick_overlay.is_visible() { H - 41 } else { H - 11 };
         self.draw_text(W - 44, lq_y, "1:100%", white, 1, true);
 
         // Bottom-center: Betaflight Craft Name + Speed / Altitude
@@ -1272,10 +1376,18 @@ impl Renderer {
             self.draw_text(cx - 33, 32, "LOW BATTERY", yellow, 1, true);
         }
 
-        // Optional compact live gimbal stick overlay in bottom corners
-        if cfg.show_sticks {
-            self.draw_stick_box(4, H - 30, 26, sticks.yaw, sticks.throttle * 2.0 - 1.0);
-            self.draw_stick_box(W - 30, H - 30, 26, sticks.roll, sticks.pitch);
+        // Optional compact live gimbal stick overlay in bottom corners (Off / Dot / Trails)
+        let lx = sticks.yaw;
+        let ly = sticks.throttle * 2.0 - 1.0;
+        let rx = sticks.roll;
+        let ry = sticks.pitch;
+        if cfg.stick_overlay == StickOverlay::Trails {
+            self.push_stick_trail(lx, ly, rx, ry);
+            self.draw_stick_box_trails(4, H - 30, 26, lx, ly, true);
+            self.draw_stick_box_trails(W - 30, H - 30, 26, rx, ry, false);
+        } else if cfg.stick_overlay == StickOverlay::Dot {
+            self.draw_stick_box(4, H - 30, 26, lx, ly);
+            self.draw_stick_box(W - 30, H - 30, 26, rx, ry);
         }
     }
 
@@ -1334,6 +1446,48 @@ impl Renderer {
         let cy = y + size / 2;
         self.put_pixel(cx, cy, rgb565(80, 90, 105));
         let half = (size / 2 - 2) as f32;
+        let dx = cx + (clampf(sx, -1.0, 1.0) * half) as i32;
+        let dy = cy - (clampf(sy, -1.0, 1.0) * half) as i32;
+        self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
+    }
+
+    /// Zero-allocation fading stick-trail gimbal box (~0.002 ms per frame).
+    fn draw_stick_box_trails(&mut self, x: i32, y: i32, size: i32, sx: f32, sy: f32, left_stick: bool) {
+        let border = rgb565(150, 165, 185);
+        let bg = rgb565(18, 22, 30);
+        let dot = rgb565(255, 232, 90);
+        let (trail_old, trail_new) = if left_stick {
+            (rgb565(28, 78, 108), rgb565(102, 232, 255)) // Deep -> bright cyan trail for throttle/yaw
+        } else {
+            (rgb565(115, 52, 18), rgb565(255, 165, 50))  // Deep -> bright orange trail for pitch/roll
+        };
+        self.fill_rect(x, y, size, size, bg);
+        self.draw_rect(x, y, size, size, border);
+        let cx = x + size / 2;
+        let cy = y + size / 2;
+        self.put_pixel(cx, cy, rgb565(75, 85, 100));
+        let half = (size / 2 - 2) as f32;
+
+        let n = self.trail_len;
+        if n >= 2 {
+            let start = (self.trail_head + STICK_TRAIL_LEN - n) % STICK_TRAIL_LEN;
+            let mut prev: Option<(i32, i32)> = None;
+            for i in 0..n {
+                let sample = self.stick_trail[(start + i) % STICK_TRAIL_LEN];
+                let (px_f, py_f) = if left_stick { (sample.0, sample.1) } else { (sample.2, sample.3) };
+                let px = cx + (clampf(px_f, -1.0, 1.0) * half) as i32;
+                let py = cy - (clampf(py_f, -1.0, 1.0) * half) as i32;
+                let age_t = (i as f32) / ((n - 1) as f32);
+                let col = lerp_rgb565(trail_old, trail_new, age_t);
+                if let Some((ox, oy)) = prev {
+                    self.draw_line(ox, oy, px, py, col);
+                } else {
+                    self.put_pixel(px, py, col);
+                }
+                prev = Some((px, py));
+            }
+        }
+
         let dx = cx + (clampf(sx, -1.0, 1.0) * half) as i32;
         let dy = cy - (clampf(sy, -1.0, 1.0) * half) as i32;
         self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
@@ -1459,7 +1613,7 @@ impl Renderer {
 
     pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize) {
         let ui = ui_colors(cfg.ui_theme);
-        let rows: [(&str, String); 16] = [
+        let rows: [(&str, String); 17] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", cfg.flight_mode.name().to_string()),
             ("Rate Preset", cfg.rates.name().to_string()),
@@ -1470,19 +1624,13 @@ impl Renderer {
             ("FOV", format!("{} deg", cfg.fov_deg)),
             ("Analog FX", if cfg.analog_filter { "On (NTSC/RF)" } else { "Off" }.to_string()),
             ("UI Theme", cfg.ui_theme.name().to_string()),
+            ("Stick OSD", cfg.stick_overlay.name().to_string()),
             ("Sound", if cfg.sound_on { "On (Whoop Audio)" } else { "Off" }.to_string()),
             ("Debug OSD", if cfg.debug_osd { "On (FPS/ms)" } else { "Off" }.to_string()),
             ("Gfx Detail", if cfg.detail_high { "High" } else { "Low" }.to_string()),
             ("Sky Detail", if cfg.sky_detail { "On (Sun/Stars)" } else { "Off" }.to_string()),
             ("Stick Mode", cfg.stick_mode.name().to_string()),
-            (
-                "Thr / Sticks",
-                format!(
-                    "{} | Stk:{}",
-                    cfg.throttle_mode.name(),
-                    if cfg.show_sticks { "On" } else { "Off" }
-                ),
-            ),
+            ("Throttle Mode", cfg.throttle_mode.name().to_string()),
         ];
 
         let tag = format!("{}/{}", selected + 1, rows.len());

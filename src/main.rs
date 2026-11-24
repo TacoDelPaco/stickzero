@@ -16,7 +16,7 @@ mod renderer;
 mod tracks;
 
 use audio::AudioEngine;
-use config::{AuxBinding, BatteryPack, Config, FlightMode, RatesPreset, ThrottleMode, UiTheme, VisualTheme};
+use config::{AuxBinding, BatteryPack, Config, FlightMode, RatesPreset, StickOverlay, ThrottleMode, UiTheme, VisualTheme};
 use display::{FbDisplay, SCREEN_H, SCREEN_W};
 use input::InputManager;
 use linux_sys::{signal, SIGINT, SIGTERM};
@@ -52,35 +52,57 @@ fn run_benchmark() {
     quad.pos = Vec3::new(0.0, 5.0, 10.0);
     quad.vel = Vec3::new(0.0, 0.0, 18.0);
     quad.on_ground = false;
-    let sticks = StickInput { throttle: 0.52, yaw: 0.08, pitch: 0.12, roll: 0.05 };
 
     const FRAMES: usize = 600;
-    let t0 = Instant::now();
-    for _ in 0..FRAMES {
-        for _ in 0..4 {
-            quad.step(sticks, &mut cfg, track);
+    for overlay in [StickOverlay::Dot, StickOverlay::Trails] {
+        cfg.stick_overlay = overlay;
+        renderer.reset_stick_trail();
+        let t0 = Instant::now();
+        for f in 0..FRAMES {
+            let phase = (f as f32) * 0.12;
+            let sticks = StickInput {
+                throttle: 0.52 + 0.12 * phase.sin(),
+                yaw: 0.18 * phase.cos(),
+                pitch: 0.22 * (phase * 1.3).sin(),
+                roll: 0.28 * (phase * 0.9).cos(),
+            };
+            for _ in 0..4 {
+                quad.step(sticks, &mut cfg, track);
+            }
+            renderer.render_flight(&quad, &cfg, track, sticks, 60, 1.0);
         }
-        renderer.render_flight(&quad, &cfg, track, sticks, 60, 1.0);
+        let elapsed = t0.elapsed();
+        let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / (FRAMES as f64);
+        let fps = 1000.0 / ms_per_frame;
+        println!(
+            "StickZero benchmark [Stick OSD: {:8}] ({} frames @ 320x170 Z-buf + 240Hz): {:.3} ms/frame ({:.0} FPS)",
+            overlay.name(), FRAMES, ms_per_frame, fps
+        );
     }
-    let elapsed = t0.elapsed();
-    let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / (FRAMES as f64);
-    let fps = 1000.0 / ms_per_frame;
-    println!(
-        "StickZero benchmark ({} frames @ 320x170 RGB565 Z-buffered + 240Hz physics): {:.3} ms/frame ({:.0} theoretical FPS)",
-        FRAMES, ms_per_frame, fps
-    );
+}
+
+fn seed_demo_stick_trail(renderer: &mut Renderer, end_sticks: StickInput) {
+    renderer.reset_stick_trail();
+    for i in 0..16 {
+        let t = (i as f32) / 15.0;
+        let lx = end_sticks.yaw - 0.55 * (1.0 - t);
+        let ly = (end_sticks.throttle * 2.0 - 1.0) - 0.55 * (1.0 - t) * (1.0 - 0.35 * t);
+        let rx = end_sticks.roll - 0.65 * (1.0 - t) * (1.0 - 0.3 * t);
+        let ry = end_sticks.pitch - 0.55 * (1.0 - t) * (t * 2.0).cos();
+        renderer.push_stick_trail(lx, ly, rx, ry);
+    }
 }
 
 fn generate_screenshots(dir: &Path) -> Result<(), String> {
-    let mut cfg = Config::default();
+    let mut cfg = Config::default(); // Monokai default + StickOverlay::Trails
     let mut renderer = Renderer::new();
     let input = InputManager::new();
 
-    // 1. Main Menu
+    // 1. Main Menu (Monokai default)
     renderer.render_main_menu(&cfg, 0, &input);
     png::save_rgb565_png(&dir.join("01-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 2. Summer Meadow Race Flight (with Analog FX + Betaflight OSD)
+    // 2. Summer Meadow Race Flight (with Analog FX + Betaflight OSD + Trailing Sticks)
     cfg.theme = VisualTheme::Summer;
     cfg.track_index = 0;
     cfg.game_mode = config::GameMode::Race;
@@ -95,7 +117,8 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     quad.mah_used = 128.0;
     quad.throttle_pct = 54;
     quad.cell_voltage = 3.94;
-    let sticks = StickInput { throttle: 0.54, yaw: 0.08, pitch: 0.24, roll: 0.18 };
+    let sticks = StickInput { throttle: 0.54, yaw: 0.12, pitch: 0.28, roll: 0.22 };
+    seed_demo_stick_trail(&mut renderer, sticks);
     renderer.render_flight(&quad, &cfg, track, sticks, 60, 0.9);
     png::save_rgb565_png(&dir.join("02-meadow-summer.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
@@ -116,10 +139,12 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     q2.combo_text = "POWER FLIP +250";
     q2.combo_timer = 1.0;
     q2.cell_voltage = 3.78;
-    renderer.render_flight(&q2, &cfg, bando, sticks, 60, 1.1);
+    let sticks2 = StickInput { throttle: 0.62, yaw: -0.14, pitch: 0.36, roll: -0.32 };
+    seed_demo_stick_trail(&mut renderer, sticks2);
+    renderer.render_flight(&q2, &cfg, bando, sticks2, 60, 1.1);
     png::save_rgb565_png(&dir.join("03-bando-night.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 4. Controller Monitor & AUX Switch Binder screen
+    // 4. Controller Monitor & AUX Switch Binder screen (Monokai)
     cfg.throttle_mode = ThrottleMode::RcFull;
     renderer.render_controller_screen(&cfg, &input);
     png::save_rgb565_png(&dir.join("04-controller.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
@@ -133,26 +158,24 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     let mut renderer = Renderer::new();
     let input = InputManager::new();
 
-    // 1. Classic Main Menu (reference comparison)
-    cfg.ui_theme = UiTheme::Classic;
-    renderer.render_main_menu(&cfg, 0, &input);
-    png::save_rgb565_png(&dir.join("classic-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
-
-    // 2. Monokai Main Menu
+    // 1. Monokai Main Menu (Default)
     cfg.ui_theme = UiTheme::Monokai;
     renderer.render_main_menu(&cfg, 0, &input);
     png::save_rgb565_png(&dir.join("monokai-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 3. Monokai Drone Tuning Menu
-    renderer.render_drone_tuning_menu(&cfg, 3);
-    png::save_rgb565_png(&dir.join("monokai-drone-tuning.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+    // 2. StickTime Main Menu (Alternate)
+    cfg.ui_theme = UiTheme::StickTime;
+    renderer.render_main_menu(&cfg, 0, &input);
+    png::save_rgb565_png(&dir.join("sticktime-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 4. Monokai Settings Menu (scrolled to show UI Theme = Monokai)
+    // 3. Monokai Settings showing UI Theme + Stick OSD: Trails
+    cfg.ui_theme = UiTheme::Monokai;
     cfg.flight_mode = FlightMode::Horizon;
-    renderer.render_settings_menu(&cfg, 9);
+    cfg.stick_overlay = StickOverlay::Trails;
+    renderer.render_settings_menu(&cfg, 10);
     png::save_rgb565_png(&dir.join("monokai-settings.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 5. Redesigned Wireframe Bando (hidden-line occluded neon cyan/violet/magenta walls vs glowing orange/yellow gates)
+    // 4. Clean zero-overlap Wireframe Bando + Trailing Sticks OSD
     cfg.theme = VisualTheme::Wireframe;
     cfg.track_index = 3;
     cfg.game_mode = config::GameMode::Freestyle;
@@ -168,11 +191,31 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     q.score = 820;
     q.flight_time = 51.0;
     q.mah_used = 165.0;
-    q.throttle_pct = 48;
+    q.throttle_pct = 52;
     q.cell_voltage = 3.88;
-    let sticks = StickInput { throttle: 0.48, yaw: 0.05, pitch: 0.15, roll: -0.10 };
-    renderer.render_flight(&q, &cfg, bando, sticks, 60, 0.5);
+    let sticks = StickInput { throttle: 0.52, yaw: 0.25, pitch: 0.34, roll: -0.28 };
+    seed_demo_stick_trail(&mut renderer, sticks);
+    renderer.render_flight(&q, &cfg, bando, sticks, 60, 0.4);
     png::save_rgb565_png(&dir.join("wireframe-bando.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 5. Clean zero-overlap Wireframe Dive Tower + Trailing Sticks OSD
+    cfg.track_index = 2;
+    let dive = &TRACKS[2];
+    let mut qd = QuadState::spawn(dive, &cfg);
+    qd.pos = Vec3::new(6.0, 9.5, 22.0);
+    qd.vel = Vec3::new(-1.0, 0.5, 16.0);
+    qd.on_ground = false;
+    qd.rot = Quat::from_axis_angle(Vec3::UP, -0.18)
+        .mul(Quat::from_axis_angle(Vec3::RIGHT, 0.16));
+    qd.score = 640;
+    qd.flight_time = 38.0;
+    qd.mah_used = 112.0;
+    qd.throttle_pct = 58;
+    qd.cell_voltage = 3.92;
+    let sticks_d = StickInput { throttle: 0.58, yaw: -0.22, pitch: 0.40, roll: 0.35 };
+    seed_demo_stick_trail(&mut renderer, sticks_d);
+    renderer.render_flight(&qd, &cfg, dive, sticks_d, 60, 0.4);
+    png::save_rgb565_png(&dir.join("wireframe-dive-tower.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     println!("Saved 5 CardputerZero 320x170 preview PNGs to {}", dir.display());
     Ok(())
@@ -257,6 +300,7 @@ fn main() {
                     match menu_idx {
                         0 if act.select => {
                             quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
+                            renderer.reset_stick_trail();
                             phys_accum = 0.0;
                             if quad.armed {
                                 audio.trigger_arm();
@@ -384,6 +428,7 @@ fn main() {
                     let track = &TRACKS[cfg.track_index];
                     if act.respawn {
                         quad.respawn_at_start(track, &cfg);
+                        renderer.reset_stick_trail();
                         if quad.armed {
                             audio.trigger_arm();
                         }
@@ -435,6 +480,7 @@ fn main() {
                             0 => screen = AppScreen::Flying,
                             1 => {
                                 quad.respawn_at_start(track, &cfg);
+                                renderer.reset_stick_trail();
                                 if quad.armed {
                                     audio.trigger_arm();
                                 }
@@ -461,7 +507,7 @@ fn main() {
                 renderer.render_pause_menu(&cfg, pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 16;
+                const NUM_SETTINGS: usize = 17;
                 if act.back {
                     cfg.save();
                     screen = sub_return;
@@ -523,20 +569,22 @@ fn main() {
                             8 => cfg.analog_filter = !cfg.analog_filter,
                             9 => cfg.ui_theme = cfg.ui_theme.toggle(),
                             10 => {
+                                cfg.stick_overlay = if act.left {
+                                    cfg.stick_overlay.prev()
+                                } else {
+                                    cfg.stick_overlay.next()
+                                };
+                                renderer.reset_stick_trail();
+                            }
+                            11 => {
                                 cfg.sound_on = !cfg.sound_on;
                                 audio.set_enabled(cfg.sound_on);
                             }
-                            11 => cfg.debug_osd = !cfg.debug_osd,
-                            12 => cfg.detail_high = !cfg.detail_high,
-                            13 => cfg.sky_detail = !cfg.sky_detail,
-                            14 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            15 => {
-                                if act.left {
-                                    cfg.throttle_mode = cfg.throttle_mode.toggle();
-                                } else {
-                                    cfg.show_sticks = !cfg.show_sticks;
-                                }
-                            }
+                            12 => cfg.debug_osd = !cfg.debug_osd,
+                            13 => cfg.detail_high = !cfg.detail_high,
+                            14 => cfg.sky_detail = !cfg.sky_detail,
+                            15 => cfg.stick_mode = cfg.stick_mode.toggle(),
+                            16 => cfg.throttle_mode = cfg.throttle_mode.toggle(),
                             _ => {}
                         }
                         cfg.save();

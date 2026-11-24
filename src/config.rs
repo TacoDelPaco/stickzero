@@ -339,22 +339,59 @@ impl VisualTheme {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UiTheme {
-    Classic,
     Monokai,
+    StickTime,
 }
 
 impl UiTheme {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Classic => "Classic",
             Self::Monokai => "Monokai",
+            Self::StickTime => "StickTime",
         }
     }
 
     pub fn toggle(self) -> Self {
         match self {
-            Self::Classic => Self::Monokai,
-            Self::Monokai => Self::Classic,
+            Self::Monokai => Self::StickTime,
+            Self::StickTime => Self::Monokai,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StickOverlay {
+    Off,
+    Dot,
+    Trails,
+}
+
+impl StickOverlay {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Dot => "On (Dot)",
+            Self::Trails => "Trails",
+        }
+    }
+
+    pub fn is_visible(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Dot,
+            Self::Dot => Self::Trails,
+            Self::Trails => Self::Off,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Off => Self::Trails,
+            Self::Dot => Self::Off,
+            Self::Trails => Self::Dot,
         }
     }
 }
@@ -514,7 +551,7 @@ pub struct Config {
     pub aux_arm: AuxBinding,
     pub aux_mode: AuxBinding,
     pub aux_turtle: AuxBinding,
-    pub show_sticks: bool,
+    pub stick_overlay: StickOverlay,
     pub best_laps_ms: [u32; 4],
 }
 
@@ -537,7 +574,7 @@ impl Default for Config {
             rate_expo: 20,
             camera_tilt_deg: 25,
             theme: VisualTheme::Summer,
-            ui_theme: UiTheme::Classic,
+            ui_theme: UiTheme::Monokai,
             detail_high: true,
             sky_detail: true,
             analog_filter: true,
@@ -559,7 +596,7 @@ impl Default for Config {
             aux_arm: AuxBinding::None,
             aux_mode: AuxBinding::None,
             aux_turtle: AuxBinding::None,
-            show_sticks: true,
+            stick_overlay: StickOverlay::Trails,
             best_laps_ms: [0; 4],
         }
     }
@@ -671,7 +708,10 @@ impl Config {
                     "wireframe" => VisualTheme::Wireframe,
                     _ => VisualTheme::Summer,
                 },
-                "ui_theme" => cfg.ui_theme = if v == "monokai" { UiTheme::Monokai } else { UiTheme::Classic },
+                "ui_theme" => cfg.ui_theme = match v {
+                    "sticktime" | "classic" => UiTheme::StickTime,
+                    _ => UiTheme::Monokai,
+                },
                 "detail_high" => cfg.detail_high = v != "0",
                 "sky_detail" => cfg.sky_detail = v != "0",
                 "analog_filter" => cfg.analog_filter = v != "0",
@@ -693,7 +733,12 @@ impl Config {
                 "aux_arm" => cfg.aux_arm = AuxBinding::parse(v),
                 "aux_mode" => cfg.aux_mode = AuxBinding::parse(v),
                 "aux_turtle" => cfg.aux_turtle = AuxBinding::parse(v),
-                "show_sticks" => cfg.show_sticks = v != "0",
+                "stick_overlay" => cfg.stick_overlay = match v {
+                    "off" => StickOverlay::Off,
+                    "dot" => StickOverlay::Dot,
+                    _ => StickOverlay::Trails,
+                },
+                "show_sticks" => cfg.stick_overlay = if v == "0" { StickOverlay::Off } else { StickOverlay::Trails },
                 "best0" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[0] = ms; },
                 "best1" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[1] = ms; },
                 "best2" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[2] = ms; },
@@ -746,8 +791,13 @@ impl Config {
             VisualTheme::Wireframe => "wireframe",
         };
         let ui = match self.ui_theme {
-            UiTheme::Classic => "classic",
             UiTheme::Monokai => "monokai",
+            UiTheme::StickTime => "sticktime",
+        };
+        let so = match self.stick_overlay {
+            StickOverlay::Off => "off",
+            StickOverlay::Dot => "dot",
+            StickOverlay::Trails => "trails",
         };
         let gm = match self.game_mode {
             GameMode::Race => "race",
@@ -763,7 +813,7 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nthrust_pct={}\nweight_pct={}\ndrag_pct={}\ngrip_pct={}\nmotor_pct={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nthrust_pct={}\nweight_pct={}\ndrag_pct={}\ngrip_pct={}\nmotor_pct={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
             self.thrust_pct,
             self.weight_pct,
             self.drag_pct,
@@ -792,7 +842,6 @@ impl Config {
             self.aux_arm.serialize(),
             self.aux_mode.serialize(),
             self.aux_turtle.serialize(),
-            self.show_sticks as u8,
             self.best_laps_ms[0],
             self.best_laps_ms[1],
             self.best_laps_ms[2],

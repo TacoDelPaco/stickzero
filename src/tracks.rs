@@ -227,13 +227,14 @@ static DIVE_GATES: [Gate; 7] = [
 ];
 
 static DIVE_STRUCTURES: [Structure; 5] = [
-    // 28m Dive Tower core
-    Structure::aabb(-3.0, 0.0, 44.0, 3.0, 28.0, 50.0, StructureColor::Concrete),
-    // Tower top crown
+    // 26m Dive Tower core (sits cleanly beneath the crown)
+    Structure::aabb(-3.0, 0.0, 44.0, 3.0, 26.0, 50.0, StructureColor::Concrete),
+    // Tower top crown (sits cleanly on top of core at y=26.0)
     Structure::aabb(-4.5, 26.0, 42.5, 4.5, 28.5, 51.5, StructureColor::RedWhite),
-    // Side underpass pillars
-    Structure::aabb(14.0, 0.0, 48.0, 16.0, 8.0, 50.0, StructureColor::Steel),
-    Structure::aabb(14.0, 0.0, 58.0, 16.0, 8.0, 60.0, StructureColor::Steel),
+    // Side underpass pillars (sit cleanly beneath roof slab at y=7.5)
+    Structure::aabb(14.0, 0.0, 48.0, 16.0, 7.5, 50.0, StructureColor::Steel),
+    Structure::aabb(14.0, 0.0, 58.0, 16.0, 7.5, 60.0, StructureColor::Steel),
+    // Underpass roof slab (sits cleanly on top of pillars)
     Structure::aabb(13.5, 7.5, 47.5, 16.5, 9.5, 60.5, StructureColor::Concrete),
 ];
 
@@ -250,12 +251,12 @@ static BANDO_GATES: [Gate; 6] = [
 ];
 
 static BANDO_STRUCTURES: [Structure; 8] = [
-    // Main bando hall left & right walls
-    Structure::aabb(-10.0, 0.0, 22.0, -7.5, 13.0, 54.0, StructureColor::Concrete),
-    Structure::aabb(7.5, 0.0, 22.0, 10.0, 13.0, 54.0, StructureColor::Concrete),
-    // Roof beams across the hall (leave a huge powerloop gap in the middle!)
-    Structure::aabb(-10.0, 11.5, 22.0, 10.0, 13.5, 28.0, StructureColor::Concrete),
-    Structure::aabb(-10.0, 11.5, 48.0, 10.0, 13.5, 54.0, StructureColor::Concrete),
+    // Main bando hall left & right walls (y = 0..12.0)
+    Structure::aabb(-10.0, 0.0, 22.0, -7.5, 12.0, 54.0, StructureColor::Concrete),
+    Structure::aabb(7.5, 0.0, 22.0, 10.0, 12.0, 54.0, StructureColor::Concrete),
+    // Roof beams resting cleanly on top of the hall walls (y = 12.0..14.0, huge powerloop gap in middle!)
+    Structure::aabb(-10.0, 12.0, 22.0, 10.0, 14.0, 28.0, StructureColor::Concrete),
+    Structure::aabb(-10.0, 12.0, 48.0, 10.0, 14.0, 54.0, StructureColor::Concrete),
     // Smokestack tower
     Structure::aabb(24.0, 0.0, 40.0, 28.5, 32.0, 44.5, StructureColor::Concrete),
     // Exterior concrete pillars for slalom / trippy spins
