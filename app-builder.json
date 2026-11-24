@@ -1,7 +1,7 @@
 {
   "app_name": "StickZero",
   "package_name": "stickzero",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Minimal native Rust 3D FPV quadcopter simulator for CardputerZero",
 
   "store": {

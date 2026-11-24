@@ -1342,7 +1342,7 @@ impl Renderer {
             self.draw_text(W - pw - 4, 23, &perf_str, rgb565(180, 195, 210), 1, true);
         }
 
-        // Bottom-left: Betaflight Cell Voltage + ELRS LQ
+        // Bottom-left: Betaflight Cell Voltage
         let batt_y = if cfg.stick_overlay.is_visible() { H - 41 } else { H - 11 };
         if batt_on {
             let v_col = if quad.cell_voltage < 3.38 {
@@ -1355,8 +1355,6 @@ impl Renderer {
             let v_str = format!("{:.2}V", quad.cell_voltage);
             self.draw_text(4, batt_y, &v_str, v_col, 1, true);
         }
-        let lq_y = if cfg.stick_overlay.is_visible() { H - 41 } else { H - 11 };
-        self.draw_text(W - 44, lq_y, "1:100%", white, 1, true);
 
         // Bottom-center: Betaflight Craft Name + Speed / Altitude
         let craft = cfg.quad.craft_name();
