@@ -25,6 +25,15 @@ pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_ABS: u16 = 0x03;
 
+// Linux evdev SYN codes
+pub const SYN_DROPPED: u16 = 3;
+
+// Linux poll(2) event masks
+pub const POLLIN: i16 = 0x0001;
+pub const POLLERR: i16 = 0x0008;
+pub const POLLHUP: i16 = 0x0010;
+pub const POLLNVAL: i16 = 0x0020;
+
 // Common evdev ABS codes
 pub const ABS_X: u16 = 0x00;
 pub const ABS_Y: u16 = 0x01;
@@ -87,6 +96,11 @@ pub const BTN_THUMB: u16 = 0x121;   // Generic joystick button 1
 #[inline]
 pub const fn eviocgname(len: usize) -> u64 {
     (2u64 << 30) | ((len as u64) << 16) | ((b'E' as u64) << 8) | 0x06
+}
+
+#[inline]
+pub const fn eviocgkey(len: usize) -> u64 {
+    (2u64 << 30) | ((len as u64) << 16) | ((b'E' as u64) << 8) | 0x18
 }
 
 #[inline]
@@ -188,10 +202,19 @@ pub struct InputAbsInfo {
     pub resolution: i32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
 extern "C" {
     pub fn open(pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
     pub fn close(fd: i32) -> i32;
     pub fn read(fd: i32, buf: *mut c_void, count: usize) -> isize;
+    pub fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
     pub fn ioctl(fd: i32, request: u64, ...) -> i32;
     pub fn mmap(
         addr: *mut c_void,

@@ -18,6 +18,9 @@ use crate::physics::StickInput;
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -59,30 +62,245 @@ pub enum ControllerKind {
 
 const MAX_KEY_CODE: usize = 768; // Covers keyboard, BTN_JOYSTICK (0x120..), BTN_GAMEPAD (0x130..), BTN_TRIGGER_HAPPY (0x2c0..)
 
-pub struct GamepadDevice {
+#[inline]
+fn set_key_bit(keys_down: &mut [u64; MAX_KEY_CODE / 64], code: u16, down: bool) {
+    let idx = code as usize;
+    if idx < MAX_KEY_CODE {
+        if down {
+            keys_down[idx / 64] |= 1u64 << (idx % 64);
+        } else {
+            keys_down[idx / 64] &= !(1u64 << (idx % 64));
+        }
+    }
+}
+
+#[inline]
+fn unpack_key_bitmap(key_bits: &[u8; MAX_KEY_CODE / 8], keys_down: &mut [u64; MAX_KEY_CODE / 64]) {
+    for word in 0..(MAX_KEY_CODE / 64) {
+        let base = word * 8;
+        keys_down[word] = u64::from_le_bytes([
+            key_bits[base],
+            key_bits[base + 1],
+            key_bits[base + 2],
+            key_bits[base + 3],
+            key_bits[base + 4],
+            key_bits[base + 5],
+            key_bits[base + 6],
+            key_bits[base + 7],
+        ]);
+    }
+}
+
+/// Resynchronize all axis values and button states directly from the kernel via
+/// `EVIOCGABS` and `EVIOCGKEY` (called on initial open and after any `SYN_DROPPED`).
+fn resync_device_state(
     fd: i32,
+    axes: &mut [AxisCal; ABS_MAX + 1],
+    keys_down: &mut [u64; MAX_KEY_CODE / 64],
+) {
+    for code in 0..=ABS_MAX {
+        if axes[code].present {
+            let mut info = InputAbsInfo::default();
+            if unsafe { ioctl(fd, eviocgabs(code as u32), &mut info) } >= 0 {
+                axes[code].value = info.value;
+                if info.maximum > info.minimum {
+                    axes[code].min = info.minimum;
+                    axes[code].max = info.maximum;
+                }
+            }
+        }
+    }
+    let mut key_bits = [0u8; MAX_KEY_CODE / 8];
+    if unsafe { ioctl(fd, eviocgkey(key_bits.len()), key_bits.as_mut_ptr()) } >= 0 {
+        unpack_key_bitmap(&key_bits, keys_down);
+    }
+}
+
+struct GamepadLiveState {
+    axes: [AxisCal; ABS_MAX + 1],
+    keys_down: [u64; MAX_KEY_CODE / 64],
+    pressed_buttons: Vec<u16>,
+    hat_up: bool,
+    hat_down: bool,
+    hat_left: bool,
+    hat_right: bool,
+    disconnected: bool,
+}
+
+/// Dedicated background evdev drain loop.
+///
+/// Sits on `poll(2)` (0% CPU when idle, <0.1 ms wakeup when a Bluetooth/USB HID packet
+/// arrives) and drains up to 64 events per `read(2)` syscall so the kernel evdev ring
+/// buffer never overflows during 60 Hz rendering/fbdev blits. Automatically resyncs
+/// axes and buttons on `SYN_DROPPED` and detects clean Bluetooth disconnects.
+fn gamepad_reader_thread(fd: i32, shared: Arc<Mutex<GamepadLiveState>>, stop: Arc<AtomicBool>) {
+    let mut ev_buf = [InputEvent::default(); 64];
+    let ev_size = std::mem::size_of::<InputEvent>();
+    let buf_bytes = ev_buf.len() * ev_size;
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let pr = unsafe { poll(&mut pfd as *mut PollFd, 1, 15) };
+        if pr < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == 4 {
+                // EINTR
+                continue;
+            }
+            if let Ok(mut st) = shared.lock() {
+                st.disconnected = true;
+            }
+            break;
+        }
+        if pr == 0 {
+            continue;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 && (pfd.revents & POLLIN) == 0 {
+            if let Ok(mut st) = shared.lock() {
+                st.disconnected = true;
+            }
+            break;
+        }
+
+        let mut disconnected = false;
+        loop {
+            let n = unsafe { read(fd, ev_buf.as_mut_ptr() as *mut std::ffi::c_void, buf_bytes) };
+            if n > 0 {
+                let count = (n as usize) / ev_size;
+                if let Ok(mut guard) = shared.lock() {
+                    let st = &mut *guard;
+                    for ev in &ev_buf[..count] {
+                        match ev.type_ {
+                            EV_SYN if ev.code == SYN_DROPPED => {
+                                resync_device_state(fd, &mut st.axes, &mut st.keys_down);
+                            }
+                            EV_ABS => {
+                                let c = ev.code as usize;
+                                if c <= ABS_MAX {
+                                    st.axes[c].value = ev.value;
+                                    if !st.axes[c].present {
+                                        st.axes[c].present = true;
+                                        st.axes[c].min = -32768;
+                                        st.axes[c].max = 32767;
+                                    }
+                                }
+                                if ev.code == ABS_HAT0Y {
+                                    if ev.value < 0 {
+                                        st.hat_up = true;
+                                    }
+                                    if ev.value > 0 {
+                                        st.hat_down = true;
+                                    }
+                                } else if ev.code == ABS_HAT0X {
+                                    if ev.value < 0 {
+                                        st.hat_left = true;
+                                    }
+                                    if ev.value > 0 {
+                                        st.hat_right = true;
+                                    }
+                                }
+                            }
+                            EV_KEY => {
+                                let pressed = ev.value == 1;
+                                let held = ev.value != 0;
+                                set_key_bit(&mut st.keys_down, ev.code, held);
+                                if pressed && st.pressed_buttons.len() < 32 {
+                                    st.pressed_buttons.push(ev.code);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if count < ev_buf.len() {
+                    break;
+                }
+            } else if n == 0 {
+                disconnected = true;
+                break;
+            } else {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == 11 || err == 4 {
+                    // EAGAIN / EINTR -> fully drained
+                    break;
+                }
+                // ENODEV (19), EIO (5), EBADF (9) -> device disconnected
+                disconnected = true;
+                break;
+            }
+        }
+
+        if disconnected {
+            if let Ok(mut st) = shared.lock() {
+                st.disconnected = true;
+            }
+            break;
+        }
+    }
+
+    unsafe { close(fd) };
+}
+
+pub struct GamepadDevice {
+    shared: Arc<Mutex<GamepadLiveState>>,
+    stop: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
     pub path: String,
     pub name: String,
     pub kind: ControllerKind,
     pub axes: [AxisCal; ABS_MAX + 1],
     /// Bitset of currently held EV_KEY button codes (0..768)
     pub keys_down: [u64; MAX_KEY_CODE / 64],
-    /// Most recent EV_KEY button pressed this frame (edge-triggered)
+    /// All EV_KEY button codes pressed during the current frame (edge-triggered)
+    pub frame_btns_pressed: Vec<u16>,
+    /// Most recent EV_KEY button pressed this frame (edge-triggered, used by AUX wizard)
     pub frame_btn_pressed: Option<u16>,
     /// Last button code ever pressed (for live diagnostics on Controller screen)
     pub last_btn_seen: Option<u16>,
 }
 
 impl GamepadDevice {
-    #[inline]
-    pub fn set_key(&mut self, code: u16, down: bool) {
-        let idx = code as usize;
-        if idx < MAX_KEY_CODE {
-            if down {
-                self.keys_down[idx / 64] |= 1u64 << (idx % 64);
-            } else {
-                self.keys_down[idx / 64] &= !(1u64 << (idx % 64));
-            }
+    fn spawn(
+        fd: i32,
+        path: String,
+        name: String,
+        kind: ControllerKind,
+        mut axes: [AxisCal; ABS_MAX + 1],
+    ) -> Self {
+        let mut keys_down = [0u64; MAX_KEY_CODE / 64];
+        resync_device_state(fd, &mut axes, &mut keys_down);
+
+        let shared = Arc::new(Mutex::new(GamepadLiveState {
+            axes,
+            keys_down,
+            pressed_buttons: Vec::with_capacity(8),
+            hat_up: false,
+            hat_down: false,
+            hat_left: false,
+            hat_right: false,
+            disconnected: false,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let bg_shared = Arc::clone(&shared);
+        let bg_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || gamepad_reader_thread(fd, bg_shared, bg_stop));
+
+        Self {
+            shared,
+            stop,
+            reader: Some(reader),
+            path,
+            name,
+            kind,
+            axes,
+            keys_down,
+            frame_btns_pressed: Vec::with_capacity(8),
+            frame_btn_pressed: None,
+            last_btn_seen: None,
         }
     }
 
@@ -95,12 +313,18 @@ impl GamepadDevice {
             false
         }
     }
+
+    #[inline]
+    pub fn was_btn_pressed(&self, code: u16) -> bool {
+        self.frame_btns_pressed.contains(&code)
+    }
 }
 
 impl Drop for GamepadDevice {
     fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe { close(self.fd) };
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -682,16 +906,13 @@ impl InputManager {
             for c in candidates {
                 unsafe { close(c.fd) };
             }
-            self.gamepad = Some(GamepadDevice {
-                fd: chosen.fd,
-                path: chosen.path,
-                name: chosen.name,
-                kind: chosen.kind,
-                axes: chosen.axes,
-                keys_down: [0u64; MAX_KEY_CODE / 64],
-                frame_btn_pressed: None,
-                last_btn_seen: None,
-            });
+            self.gamepad = Some(GamepadDevice::spawn(
+                chosen.fd,
+                chosen.path,
+                chosen.name,
+                chosen.kind,
+                chosen.axes,
+            ));
         }
     }
 
@@ -720,62 +941,50 @@ impl InputManager {
 
         let wizard_active = self.calib.is_some() || self.aux_wiz.is_some();
 
-        // 1. Poll gamepad / RC controller
+        // 1. Snapshot latest state from the dedicated background gamepad reader thread
+        //    (zero syscalls on the 60 Hz render thread — evdev is drained continuously).
         let mut disconnect = false;
         if let Some(ref mut gp) = self.gamepad {
+            gp.frame_btns_pressed.clear();
             gp.frame_btn_pressed = None;
-            let mut ev = InputEvent::default();
-            let ev_size = std::mem::size_of::<InputEvent>();
-            loop {
-                let n = unsafe { read(gp.fd, &mut ev as *mut _ as *mut std::ffi::c_void, ev_size) };
-                if n == ev_size as isize {
-                    match ev.type_ {
-                        EV_ABS => {
-                            let c = ev.code as usize;
-                            if c <= ABS_MAX {
-                                gp.axes[c].value = ev.value;
-                                if !gp.axes[c].present {
-                                    gp.axes[c].present = true;
-                                    gp.axes[c].min = -32768;
-                                    gp.axes[c].max = 32767;
-                                }
-                            }
-                            if in_menu && !wizard_active {
-                                if ev.code == ABS_HAT0Y {
-                                    if ev.value < 0 { self.pending.up = true; }
-                                    if ev.value > 0 { self.pending.down = true; }
-                                } else if ev.code == ABS_HAT0X {
-                                    if ev.value < 0 { self.pending.left = true; }
-                                    if ev.value > 0 { self.pending.right = true; }
-                                }
-                            }
-                        }
-                        EV_KEY => {
-                            let pressed = ev.value == 1;
-                            let held = ev.value != 0;
-                            gp.set_key(ev.code, held);
-                            if pressed {
-                                gp.frame_btn_pressed = Some(ev.code);
-                                gp.last_btn_seen = Some(ev.code);
-                            }
-                            // Only map generic menu/respawn shortcuts if button isn't bound to an AUX flight switch
-                            let skip_shortcut = wizard_active || (!in_menu && Self::is_bound_button(cfg, ev.code));
-                            if !skip_shortcut && pressed {
-                                match ev.code {
-                                    BTN_SOUTH | BTN_TRIGGER => if in_menu { self.pending.select = true; },
-                                    BTN_EAST | BTN_THUMB | BTN_START | BTN_MODE => self.pending.back = true,
-                                    BTN_SELECT | BTN_NORTH | BTN_TL => self.pending.respawn = true,
-                                    _ => {}
-                                }
-                            }
-                        }
+
+            let (hat_up, hat_down, hat_left, hat_right) = if let Ok(mut st) = gp.shared.lock() {
+                gp.axes = st.axes;
+                gp.keys_down = st.keys_down;
+                gp.frame_btns_pressed.extend(st.pressed_buttons.drain(..));
+                disconnect = st.disconnected;
+                let hats = (st.hat_up, st.hat_down, st.hat_left, st.hat_right);
+                st.hat_up = false;
+                st.hat_down = false;
+                st.hat_left = false;
+                st.hat_right = false;
+                hats
+            } else {
+                (false, false, false, false)
+            };
+
+            if in_menu && !wizard_active {
+                if hat_up { self.pending.up = true; }
+                if hat_down { self.pending.down = true; }
+                if hat_left { self.pending.left = true; }
+                if hat_right { self.pending.right = true; }
+            }
+
+            if let Some(&last_btn) = gp.frame_btns_pressed.last() {
+                gp.frame_btn_pressed = Some(last_btn);
+                gp.last_btn_seen = Some(last_btn);
+            }
+
+            for &code in &gp.frame_btns_pressed {
+                // Only map generic menu/respawn shortcuts if button isn't bound to an AUX flight switch
+                let skip_shortcut = wizard_active || (!in_menu && Self::is_bound_button(cfg, code));
+                if !skip_shortcut {
+                    match code {
+                        BTN_SOUTH | BTN_TRIGGER => if in_menu { self.pending.select = true; },
+                        BTN_EAST | BTN_THUMB | BTN_START | BTN_MODE => self.pending.back = true,
+                        BTN_SELECT | BTN_NORTH | BTN_TL => self.pending.respawn = true,
                         _ => {}
                     }
-                } else if n == 0 {
-                    disconnect = true;
-                    break;
-                } else {
-                    break;
                 }
             }
         }
@@ -785,16 +994,23 @@ impl InputManager {
             self.aux_wiz = None;
         }
 
-        // 2. Poll keyboards
+        // 2. Poll keyboards (batched reads)
         let mut kb_events: Vec<(u16, i32)> = Vec::new();
+        let mut kb_buf = [InputEvent::default(); 32];
+        let ev_size = std::mem::size_of::<InputEvent>();
+        let kb_bytes = kb_buf.len() * ev_size;
         for (fd, _) in &self.keyboards {
-            let mut ev = InputEvent::default();
-            let ev_size = std::mem::size_of::<InputEvent>();
             loop {
-                let n = unsafe { read(*fd, &mut ev as *mut _ as *mut std::ffi::c_void, ev_size) };
-                if n == ev_size as isize {
-                    if ev.type_ == EV_KEY {
-                        kb_events.push((ev.code, ev.value));
+                let n = unsafe { read(*fd, kb_buf.as_mut_ptr() as *mut std::ffi::c_void, kb_bytes) };
+                if n > 0 {
+                    let count = (n as usize) / ev_size;
+                    for ev in &kb_buf[..count] {
+                        if ev.type_ == EV_KEY {
+                            kb_events.push((ev.code, ev.value));
+                        }
+                    }
+                    if count < kb_buf.len() {
+                        break;
                     }
                 } else {
                     break;
@@ -969,7 +1185,7 @@ impl InputManager {
         match cfg.aux_arm {
             AuxBinding::Axis { code, invert } => out.arm_switch = Some(eval_axis(code, invert)),
             AuxBinding::Button { code } => {
-                if gp.frame_btn_pressed == Some(code) {
+                if gp.was_btn_pressed(code) {
                     out.arm_toggle = true;
                 }
             }
@@ -995,7 +1211,7 @@ impl InputManager {
                 }
             }
             AuxBinding::Button { code } => {
-                if gp.frame_btn_pressed == Some(code) {
+                if gp.was_btn_pressed(code) {
                     out.mode_toggle = true;
                 }
             }
@@ -1118,5 +1334,39 @@ impl Drop for InputManager {
         for (fd, _) in &self.keyboards {
             unsafe { close(*fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eviocgkey_bitmap_unpack_matches_set_key_bit() {
+        let codes = [KEY_ESC, BTN_TRIGGER, BTN_SOUTH, BTN_NORTH, 0x2c0];
+        let mut raw_bits = [0u8; MAX_KEY_CODE / 8];
+        for &c in &codes {
+            let idx = c as usize;
+            raw_bits[idx / 8] |= 1u8 << (idx % 8);
+        }
+        let mut unpacked = [0u64; MAX_KEY_CODE / 64];
+        unpack_key_bitmap(&raw_bits, &mut unpacked);
+
+        let mut expected = [0u64; MAX_KEY_CODE / 64];
+        for &c in &codes {
+            set_key_bit(&mut expected, c, true);
+        }
+        assert_eq!(unpacked, expected);
+
+        // Clearing one bit works cleanly
+        set_key_bit(&mut unpacked, BTN_SOUTH, false);
+        assert_eq!(
+            (unpacked[BTN_SOUTH as usize / 64] & (1u64 << (BTN_SOUTH as usize % 64))),
+            0
+        );
+        assert_ne!(
+            (unpacked[BTN_TRIGGER as usize / 64] & (1u64 << (BTN_TRIGGER as usize % 64))),
+            0
+        );
     }
 }

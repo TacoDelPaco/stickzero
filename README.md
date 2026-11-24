@@ -51,8 +51,8 @@ bash ./package.sh
 ### Option A: One-line install directly on CardputerZero (over Wi-Fi)
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.9_arm64.deb \
-  && sudo dpkg -i stickzero_0.1.9_arm64.deb \
+curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.10_arm64.deb \
+  && sudo dpkg -i stickzero_0.1.10_arm64.deb \
   && systemctl --user restart APPLaunch.service
 ```
 
@@ -63,6 +63,19 @@ curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stic
 # or
 ./deploy.sh adb
 ```
+
+### Low-Latency Bluetooth Controller Setup (ELRS BLE & Gamepads)
+
+StickZero drains controller `evdev` events on a dedicated background thread (`poll()` + 64-event batch reads + `SYN_DROPPED` resync) so the app itself adds < 1 ms input latency. If you still see 1–2 s delay over Bluetooth on CardputerZero, it is caused by BLE packet backlog in the transmitter or BlueZ stack:
+
+1. **ExpressLRS BLE Joystick (RadioMaster Pocket, etc.)**: Before starting **BLE Joystick**, open `SYS → ExpressLRS` and lower **Packet Rate** to **`100Hz Full`** (or `50Hz`). Running 250–500 Hz floods BLE faster than the link can drain and builds up a multi-second queue.
+2. **Lower BlueZ's BLE connection interval** (default Linux BlueZ uses 30–50 ms ≈ 22 Hz; tighten to 7.5–11.25 ms ≈ 90–133 Hz):
+   ```bash
+   sudo sed -i 's/^#*MinConnectionInterval=.*/MinConnectionInterval=6/; s/^#*MaxConnectionInterval=.*/MaxConnectionInterval=9/; s/^#*ConnectionLatency=.*/ConnectionLatency=0/' /etc/bluetooth/main.conf \
+     && sudo systemctl restart bluetooth \
+     && bluetoothctl scan off
+   ```
+3. **2.4 GHz Wi-Fi / BT Coexistence**: CardputerZero's Pi CM0 shares one 2.4 GHz antenna for Wi-Fi and Bluetooth — turning Wi-Fi off while flying over BT (`sudo rfkill block wifi`) removes wireless stalls, or flip the USB switch to **Host** and use a USB-C cable for ~2 ms wired latency.
 
 ### Display Detection
 
