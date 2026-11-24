@@ -716,8 +716,8 @@ impl Renderer {
         self.draw_3d_quad_z([a.sub(v), a.add(v), b.add(v), b.sub(v)], cam_pos, cam_inv, fill, edge, false);
     }
 
-    /// Ultra-fast zero-per-pixel-float horizon renderer using scanline `slice::fill()`,
-    /// plus crisp horizon glow line in Night / Wireframe / Evening themes for instant flip orientation!
+    /// Ultra-fast zero-per-pixel-float smooth sky & ground gradient renderer at EVERY roll angle (0-360 deg),
+    /// using a 128-entry precomputed RGB565 LUT + 16.16 fixed-point scanlines, plus an unbroken horizon line!
     fn draw_sky_and_ground(&mut self, cam_rot: Quat, pal: ThemePalette, detail_high: bool) {
         let (cam_right, cam_up, cam_fwd) = cam_rot.basis();
         let ux = cam_right.y;
@@ -725,106 +725,118 @@ impl Renderer {
         let uz = cam_fwd.y * self.focal;
         let inv_f = 1.0 / self.focal;
 
-        let sky_mid = if detail_high {
-            lerp_rgb565(pal.sky_horizon, pal.sky_top, 0.45)
-        } else {
-            pal.sky_top
-        };
-        let gnd_mid = if detail_high {
-            lerp_rgb565(pal.ground_far, pal.ground_near, 0.45)
-        } else {
-            pal.ground_near
-        };
-
-        if ux.abs() < 0.002 {
-            let mut prev_sky: Option<bool> = None;
-            for y in 0..SCREEN_H {
-                let ry = HALF_H - (y as f32);
-                let elev = (uy * ry + uz) * inv_f;
-                let is_sky = elev >= 0.0;
-                let color = if is_sky {
-                    if detail_high {
-                        lerp_rgb565(pal.sky_horizon, pal.sky_top, (elev * 1.8).min(1.0))
-                    } else {
-                        pal.sky_top
+        if !detail_high {
+            // Fast 2-tone flat mode when Gfx Detail = Low
+            if ux.abs() < 0.002 {
+                let mut prev_sky: Option<bool> = None;
+                for y in 0..SCREEN_H {
+                    let ry = HALF_H - (y as f32);
+                    let is_sky = (uy * ry + uz) >= 0.0;
+                    let row = y * SCREEN_W;
+                    self.fb[row..row + SCREEN_W].fill(if is_sky { pal.sky_top } else { pal.ground_near });
+                    if let (Some(was_sky), Some(hcol)) = (prev_sky, pal.horizon_line) {
+                        if was_sky != is_sky {
+                            self.fb[row..row + SCREEN_W].fill(hcol);
+                        }
                     }
-                } else if detail_high {
-                    lerp_rgb565(pal.ground_far, pal.ground_near, (-elev * 2.2).min(1.0))
-                } else {
-                    pal.ground_near
-                };
-                let row = y * SCREEN_W;
-                self.fb[row..row + SCREEN_W].fill(color);
-                if let (Some(was_sky), Some(hcol)) = (prev_sky, pal.horizon_line) {
-                    if was_sky != is_sky {
-                        self.fb[row..row + SCREEN_W].fill(hcol);
+                    prev_sky = Some(is_sky);
+                }
+            } else {
+                let inv_ux = 1.0 / ux;
+                let sky_on_right = ux > 0.0;
+                for y in 0..SCREEN_H {
+                    let ry = HALF_H - (y as f32);
+                    let x_hor = HALF_W - (uy * ry + uz) * inv_ux;
+                    let x_split = (x_hor.round() as i32).clamp(0, W) as usize;
+                    let row = y * SCREEN_W;
+                    let (left_col, right_col) = if sky_on_right {
+                        (pal.ground_near, pal.sky_top)
+                    } else {
+                        (pal.sky_top, pal.ground_near)
+                    };
+                    if x_split > 0 {
+                        self.fb[row..row + x_split].fill(left_col);
+                    }
+                    if x_split < SCREEN_W {
+                        self.fb[row + x_split..row + SCREEN_W].fill(right_col);
+                    }
+                    if let Some(hcol) = pal.horizon_line {
+                        let x_hor_next = HALF_W - (uy * (ry - 1.0) + uz) * inv_ux;
+                        let lx = x_hor.min(x_hor_next).round() as i32;
+                        let rx = x_hor.max(x_hor_next).round() as i32;
+                        if rx >= 0 && lx < W {
+                            self.draw_hline(lx.max(0), rx.min(W - 1), y as i32, hcol);
+                        }
                     }
                 }
-                prev_sky = Some(is_sky);
             }
             return;
         }
 
-        let inv_ux = 1.0 / ux;
-        let band_dx = (0.14 * self.focal * inv_ux).abs();
-        let sky_on_right = ux > 0.0;
+        // Build 128-entry elevation -> RGB565 LUT once per frame (256 bytes on stack).
+        // Index 64 corresponds to elev == 0.0 (horizon): [0..64) = ground gradient, [64..128) = sky gradient.
+        const LUT_SCALE: f32 = 112.0;
+        let mut lut = [0u16; 128];
+        for i in 0..64 {
+            let elev = (i as f32 - 64.0) / LUT_SCALE; // negative (below horizon)
+            let t = (-elev * 2.2).min(1.0);
+            lut[i] = lerp_rgb565(pal.ground_far, pal.ground_near, t);
+        }
+        for i in 64..128 {
+            let elev = (i as f32 - 64.0) / LUT_SCALE; // >= 0 (above horizon)
+            let t = (elev * 1.8).min(1.0);
+            lut[i] = lerp_rgb565(pal.sky_horizon, pal.sky_top, t);
+        }
+
+        // 16.16 fixed-point horizontal elevation step across each scanline
+        let step_fp: i32 = (ux * inv_f * LUT_SCALE * 65536.0).round() as i32;
+        let step_total = step_fp * ((SCREEN_W - 1) as i32);
+        let rolled = ux.abs() >= 0.002;
+        let inv_ux = if rolled { 1.0 / ux } else { 0.0 };
+        let mut prev_sky: Option<bool> = None;
 
         for y in 0..SCREEN_H {
             let ry = HALF_H - (y as f32);
             let base = uy * ry + uz;
             let row = y * SCREEN_W;
+            let e_left = (ux * (-HALF_W) + base) * inv_f;
+            let mut acc: i32 = ((64.0 + e_left * LUT_SCALE) * 65536.0) as i32;
+            let acc_right = acc + step_total;
 
-            let x_hor = HALF_W - base * inv_ux;
-            let x_split = (x_hor.round() as i32).clamp(0, W) as usize;
-
-            if sky_on_right {
-                if x_split > 0 {
-                    self.fb[row..row + x_split].fill(pal.ground_near);
-                    if detail_high {
-                        let g_start = ((x_hor - band_dx).round() as i32).clamp(0, x_split as i32) as usize;
-                        if g_start < x_split {
-                            self.fb[row + g_start..row + x_split].fill(gnd_mid);
-                        }
-                    }
-                }
-                if x_split < SCREEN_W {
-                    self.fb[row + x_split..row + SCREEN_W].fill(pal.sky_top);
-                    if detail_high {
-                        let s_end = ((x_hor + band_dx).round() as i32).clamp(x_split as i32, W) as usize;
-                        if s_end > x_split {
-                            self.fb[row + x_split..row + s_end].fill(sky_mid);
-                        }
-                    }
-                }
+            // Fast-path uniform scanlines (flat/upside-down or fully clamped sky/ground)
+            if step_fp == 0 {
+                let idx = (acc >> 16).clamp(0, 127) as usize;
+                self.fb[row..row + SCREEN_W].fill(lut[idx]);
+            } else if acc <= 0 && acc_right <= 0 {
+                self.fb[row..row + SCREEN_W].fill(lut[0]);
+            } else if acc >= (127 << 16) && acc_right >= (127 << 16) {
+                self.fb[row..row + SCREEN_W].fill(lut[127]);
             } else {
-                if x_split > 0 {
-                    self.fb[row..row + x_split].fill(pal.sky_top);
-                    if detail_high {
-                        let s_start = ((x_hor - band_dx).round() as i32).clamp(0, x_split as i32) as usize;
-                        if s_start < x_split {
-                            self.fb[row + s_start..row + x_split].fill(sky_mid);
-                        }
-                    }
-                }
-                if x_split < SCREEN_W {
-                    self.fb[row + x_split..row + SCREEN_W].fill(pal.ground_near);
-                    if detail_high {
-                        let g_end = ((x_hor + band_dx).round() as i32).clamp(x_split as i32, W) as usize;
-                        if g_end > x_split {
-                            self.fb[row + x_split..row + g_end].fill(gnd_mid);
-                        }
-                    }
+                // Smooth per-pixel rolled gradient using pure integer fixed-point LUT lookup (zero floats!)
+                for px in &mut self.fb[row..row + SCREEN_W] {
+                    let idx = (acc >> 16).clamp(0, 127) as usize;
+                    *px = lut[idx];
+                    acc += step_fp;
                 }
             }
 
-            // Crisp horizon boundary line only where the horizon actually crosses this scanline
+            // Crisp unbroken horizon glow line in Evening / Night / Wireframe themes
             if let Some(hcol) = pal.horizon_line {
-                let x_hor_i = x_hor.round() as i32;
-                if x_hor_i >= 0 && x_hor_i < W {
-                    let hx = x_hor_i as usize;
-                    self.fb[row + hx] = hcol;
-                    if hx + 1 < SCREEN_W {
-                        self.fb[row + hx + 1] = hcol;
+                if !rolled {
+                    let is_sky = base >= 0.0;
+                    if let Some(was_sky) = prev_sky {
+                        if was_sky != is_sky {
+                            self.fb[row..row + SCREEN_W].fill(hcol);
+                        }
+                    }
+                    prev_sky = Some(is_sky);
+                } else {
+                    let x0 = HALF_W - base * inv_ux;
+                    let x1 = HALF_W - (uy * (ry - 1.0) + uz) * inv_ux;
+                    let lx = x0.min(x1).round() as i32;
+                    let rx = x0.max(x1).round() as i32;
+                    if rx >= 0 && lx < W {
+                        self.draw_hline(lx.max(0), rx.min(W - 1), y as i32, hcol);
                     }
                 }
             }
