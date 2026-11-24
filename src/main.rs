@@ -16,7 +16,7 @@ mod renderer;
 mod tracks;
 
 use audio::AudioEngine;
-use config::{AuxBinding, BatteryPack, Config, RatesPreset, ThrottleMode, VisualTheme};
+use config::{AuxBinding, BatteryPack, Config, FlightMode, RatesPreset, ThrottleMode, UiTheme, VisualTheme};
 use display::{FbDisplay, SCREEN_H, SCREEN_W};
 use input::InputManager;
 use linux_sys::{signal, SIGINT, SIGTERM};
@@ -37,6 +37,7 @@ extern "C" fn handle_signal(_sig: i32) {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum AppScreen {
     MainMenu,
+    DroneTuning,
     Flying,
     Paused,
     Settings,
@@ -127,6 +128,56 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn generate_previews(dir: &Path) -> Result<(), String> {
+    let mut cfg = Config::default();
+    let mut renderer = Renderer::new();
+    let input = InputManager::new();
+
+    // 1. Classic Main Menu (reference comparison)
+    cfg.ui_theme = UiTheme::Classic;
+    renderer.render_main_menu(&cfg, 0, &input);
+    png::save_rgb565_png(&dir.join("classic-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 2. Monokai Main Menu
+    cfg.ui_theme = UiTheme::Monokai;
+    renderer.render_main_menu(&cfg, 0, &input);
+    png::save_rgb565_png(&dir.join("monokai-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 3. Monokai Drone Tuning Menu
+    renderer.render_drone_tuning_menu(&cfg, 3);
+    png::save_rgb565_png(&dir.join("monokai-drone-tuning.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 4. Monokai Settings Menu (scrolled to show UI Theme = Monokai)
+    cfg.flight_mode = FlightMode::Horizon;
+    renderer.render_settings_menu(&cfg, 9);
+    png::save_rgb565_png(&dir.join("monokai-settings.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 5. Redesigned Wireframe Bando (hidden-line occluded neon cyan/violet/magenta walls vs glowing orange/yellow gates)
+    cfg.theme = VisualTheme::Wireframe;
+    cfg.track_index = 3;
+    cfg.game_mode = config::GameMode::Freestyle;
+    cfg.analog_filter = false;
+    let bando = &TRACKS[3];
+    let mut q = QuadState::spawn(bando, &cfg);
+    q.pos = Vec3::new(-4.5, 4.2, 6.0);
+    q.vel = Vec3::new(1.5, 0.4, 15.0);
+    q.on_ground = false;
+    q.rot = Quat::from_axis_angle(Vec3::UP, 0.14)
+        .mul(Quat::from_axis_angle(Vec3::FORWARD, -0.14))
+        .mul(Quat::from_axis_angle(Vec3::RIGHT, 0.06));
+    q.score = 820;
+    q.flight_time = 51.0;
+    q.mah_used = 165.0;
+    q.throttle_pct = 48;
+    q.cell_voltage = 3.88;
+    let sticks = StickInput { throttle: 0.48, yaw: 0.05, pitch: 0.15, roll: -0.10 };
+    renderer.render_flight(&q, &cfg, bando, sticks, 60, 0.5);
+    png::save_rgb565_png(&dir.join("wireframe-bando.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    println!("Saved 5 CardputerZero 320x170 preview PNGs to {}", dir.display());
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--bench") {
@@ -137,6 +188,14 @@ fn main() {
         let dir = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("screenshots");
         if let Err(e) = generate_screenshots(Path::new(dir)) {
             eprintln!("screenshot error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--preview") {
+        let dir = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("previews");
+        if let Err(e) = generate_previews(Path::new(dir)) {
+            eprintln!("preview error: {e}");
             std::process::exit(1);
         }
         return;
@@ -161,7 +220,9 @@ fn main() {
     let mut input = InputManager::new();
     let mut renderer = Renderer::new();
     let mut screen = AppScreen::MainMenu;
+    let mut sub_return = AppScreen::MainMenu;
     let mut menu_idx: usize = 0;
+    let mut drone_idx: usize = 0;
     let mut pause_idx: usize = 0;
     let mut settings_idx: usize = 0;
     let mut quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
@@ -211,12 +272,14 @@ fn main() {
                             cfg.save();
                         }
                         2 => {
-                            if act.left {
-                                cfg.flight_mode = cfg.flight_mode.toggle();
+                            if act.select {
+                                drone_idx = 0;
+                                sub_return = AppScreen::MainMenu;
+                                screen = AppScreen::DroneTuning;
                             } else {
-                                cfg.quad = cfg.quad.next();
+                                cfg.quad = if act.left { cfg.quad.prev() } else { cfg.quad.next() };
+                                cfg.save();
                             }
-                            cfg.save();
                         }
                         3 => {
                             cfg.theme = cfg.theme.next();
@@ -224,6 +287,7 @@ fn main() {
                         }
                         4 if act.select => {
                             settings_idx = 0;
+                            sub_return = AppScreen::MainMenu;
                             screen = AppScreen::Settings;
                         }
                         5 if act.select => {
@@ -234,6 +298,83 @@ fn main() {
                     }
                 }
                 renderer.render_main_menu(&cfg, menu_idx, &input);
+            }
+            AppScreen::DroneTuning => {
+                const NUM_DRONE: usize = 10;
+                if act.back {
+                    cfg.save();
+                    screen = sub_return;
+                } else {
+                    if act.up { drone_idx = (drone_idx + NUM_DRONE - 1) % NUM_DRONE; }
+                    if act.down { drone_idx = (drone_idx + 1) % NUM_DRONE; }
+                    if act.left || act.right || act.select {
+                        match drone_idx {
+                            0 => cfg.quad = if act.left { cfg.quad.prev() } else { cfg.quad.next() },
+                            1 => {
+                                cfg.battery_pack = if act.left {
+                                    cfg.battery_pack.prev()
+                                } else {
+                                    cfg.battery_pack.next()
+                                };
+                            }
+                            2 => {
+                                cfg.prop_wash = if act.left {
+                                    cfg.prop_wash.prev()
+                                } else {
+                                    cfg.prop_wash.next()
+                                };
+                            }
+                            3 => {
+                                cfg.thrust_pct = if act.left {
+                                    cfg.thrust_pct.saturating_sub(5).max(60)
+                                } else {
+                                    (cfg.thrust_pct + 5).min(150)
+                                };
+                            }
+                            4 => {
+                                cfg.weight_pct = if act.left {
+                                    cfg.weight_pct.saturating_sub(5).max(70)
+                                } else {
+                                    (cfg.weight_pct + 5).min(150)
+                                };
+                            }
+                            5 => {
+                                cfg.drag_pct = if act.left {
+                                    cfg.drag_pct.saturating_sub(5).max(50)
+                                } else {
+                                    (cfg.drag_pct + 5).min(160)
+                                };
+                            }
+                            6 => {
+                                cfg.grip_pct = if act.left {
+                                    cfg.grip_pct.saturating_sub(10)
+                                } else {
+                                    (cfg.grip_pct + 10).min(160)
+                                };
+                            }
+                            7 => {
+                                cfg.motor_pct = if act.left {
+                                    cfg.motor_pct.saturating_sub(5).max(60)
+                                } else {
+                                    (cfg.motor_pct + 5).min(150)
+                                };
+                            }
+                            8 => {
+                                cfg.thr_expo = if act.left {
+                                    cfg.thr_expo.saturating_sub(5)
+                                } else {
+                                    (cfg.thr_expo + 5).min(60)
+                                };
+                            }
+                            9 if act.select => {
+                                cfg.reset_drone_tuning();
+                            }
+                            _ => {}
+                        }
+                        cfg.save();
+                    }
+                }
+                renderer.render_drone_tuning_menu(&cfg, drone_idx);
             }
             AppScreen::Flying => {
                 if act.back {
@@ -281,13 +422,14 @@ fn main() {
                 }
             }
             AppScreen::Paused => {
+                const NUM_PAUSE: usize = 5;
                 let track = &TRACKS[cfg.track_index];
                 let sticks = input.flight_sticks(&cfg);
                 if act.back {
                     screen = AppScreen::Flying;
                 } else {
-                    if act.up { pause_idx = (pause_idx + 3) % 4; }
-                    if act.down { pause_idx = (pause_idx + 1) % 4; }
+                    if act.up { pause_idx = (pause_idx + NUM_PAUSE - 1) % NUM_PAUSE; }
+                    if act.down { pause_idx = (pause_idx + 1) % NUM_PAUSE; }
                     if act.select {
                         match pause_idx {
                             0 => screen = AppScreen::Flying,
@@ -299,10 +441,16 @@ fn main() {
                                 screen = AppScreen::Flying;
                             }
                             2 => {
-                                settings_idx = 0;
-                                screen = AppScreen::Settings;
+                                drone_idx = 0;
+                                sub_return = AppScreen::Paused;
+                                screen = AppScreen::DroneTuning;
                             }
                             3 => {
+                                settings_idx = 0;
+                                sub_return = AppScreen::Paused;
+                                screen = AppScreen::Settings;
+                            }
+                            4 => {
                                 screen = AppScreen::MainMenu;
                             }
                             _ => {}
@@ -310,31 +458,31 @@ fn main() {
                     }
                 }
                 renderer.render_flight(&quad, &cfg, track, sticks, fps_display, last_render_ms);
-                renderer.render_pause_menu(pause_idx);
+                renderer.render_pause_menu(&cfg, pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 17;
+                const NUM_SETTINGS: usize = 16;
                 if act.back {
                     cfg.save();
-                    screen = AppScreen::MainMenu;
+                    screen = sub_return;
                 } else {
                     if act.up { settings_idx = (settings_idx + NUM_SETTINGS - 1) % NUM_SETTINGS; }
                     if act.down { settings_idx = (settings_idx + 1) % NUM_SETTINGS; }
                     if act.left || act.right || act.select {
                         match settings_idx {
                             0 => cfg.game_mode = cfg.game_mode.toggle(),
-                            1 => cfg.flight_mode = cfg.flight_mode.toggle(),
-                            2 => cfg.battery_pack = cfg.battery_pack.next(),
-                            3 => cfg.prop_wash = !cfg.prop_wash,
-                            4 => {
-                                cfg.sound_on = !cfg.sound_on;
-                                audio.set_enabled(cfg.sound_on);
+                            1 => {
+                                cfg.flight_mode = if act.left {
+                                    cfg.flight_mode.prev()
+                                } else {
+                                    cfg.flight_mode.next()
+                                };
                             }
-                            5 => {
+                            2 => {
                                 let next = cfg.rates.next_preset();
                                 cfg.apply_rate_preset(next);
                             }
-                            6 => {
+                            3 => {
                                 cfg.rate_center = if act.left {
                                     cfg.rate_center.saturating_sub(10).max(50)
                                 } else {
@@ -342,7 +490,7 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            7 => {
+                            4 => {
                                 cfg.rate_max = if act.left {
                                     cfg.rate_max.saturating_sub(20).max(300)
                                 } else {
@@ -350,7 +498,7 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            8 => {
+                            5 => {
                                 cfg.rate_expo = if act.left {
                                     cfg.rate_expo.saturating_sub(5)
                                 } else {
@@ -358,26 +506,31 @@ fn main() {
                                 };
                                 cfg.rates = RatesPreset::Custom;
                             }
-                            9 => {
+                            6 => {
                                 if act.left {
                                     cfg.camera_tilt_deg = cfg.camera_tilt_deg.saturating_sub(5);
                                 } else {
                                     cfg.camera_tilt_deg = (cfg.camera_tilt_deg + 5).min(50);
                                 }
                             }
-                            10 => {
+                            7 => {
                                 cfg.fov_deg = if act.left {
                                     cfg.fov_deg.saturating_sub(5).max(75)
                                 } else {
                                     (cfg.fov_deg + 5).min(105)
                                 };
                             }
-                            11 => cfg.analog_filter = !cfg.analog_filter,
-                            12 => cfg.debug_osd = !cfg.debug_osd,
-                            13 => cfg.detail_high = !cfg.detail_high,
-                            14 => cfg.sky_detail = !cfg.sky_detail,
-                            15 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            16 => {
+                            8 => cfg.analog_filter = !cfg.analog_filter,
+                            9 => cfg.ui_theme = cfg.ui_theme.toggle(),
+                            10 => {
+                                cfg.sound_on = !cfg.sound_on;
+                                audio.set_enabled(cfg.sound_on);
+                            }
+                            11 => cfg.debug_osd = !cfg.debug_osd,
+                            12 => cfg.detail_high = !cfg.detail_high,
+                            13 => cfg.sky_detail = !cfg.sky_detail,
+                            14 => cfg.stick_mode = cfg.stick_mode.toggle(),
+                            15 => {
                                 if act.left {
                                     cfg.throttle_mode = cfg.throttle_mode.toggle();
                                 } else {

@@ -2,7 +2,7 @@
 //! per-pixel 16-bit perspective-correct Z-buffer, solid 3D racing gates,
 //! authentic Betaflight OSD + post-flight statistics, and CardputerZero 1.9" menus.
 
-use crate::config::{AuxBinding, BatteryPack, Config, GameMode, VisualTheme};
+use crate::config::{AuxBinding, BatteryPack, Config, GameMode, UiTheme, VisualTheme};
 use crate::display::{SCREEN_H, SCREEN_W};
 use crate::font::{glyph, GLYPH_H, GLYPH_W};
 use crate::input::{ControllerKind, InputManager};
@@ -36,6 +36,65 @@ fn lerp_rgb565(a: u16, b: u16, t: f32) -> u16 {
     let g = (ag + (bg - ag) * t) as u16;
     let bl = (ab + (bb - ab) * t) as u16;
     ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (bl & 0x1F)
+}
+
+#[derive(Copy, Clone)]
+struct UiColors {
+    bg: u16,
+    header_bg: u16,
+    header_line: u16,
+    title: u16,
+    tag: u16,
+    sel_bg: u16,
+    sel_border: u16,
+    sel_label: u16,
+    sel_val: u16,
+    label: u16,
+    val: u16,
+    muted: u16,
+    ok: u16,
+    warn: u16,
+    accent: u16,
+}
+
+fn ui_colors(theme: UiTheme) -> UiColors {
+    match theme {
+        UiTheme::Classic => UiColors {
+            bg: rgb565(12, 16, 26),
+            header_bg: rgb565(22, 32, 52),
+            header_line: rgb565(65, 140, 240),
+            title: rgb565(255, 255, 255),
+            tag: rgb565(120, 220, 255),
+            sel_bg: rgb565(36, 66, 118),
+            sel_border: rgb565(90, 190, 255),
+            sel_label: rgb565(255, 230, 80),
+            sel_val: rgb565(255, 255, 255),
+            label: rgb565(180, 195, 215),
+            val: rgb565(135, 200, 235),
+            muted: rgb565(145, 160, 180),
+            ok: rgb565(70, 240, 110),
+            warn: rgb565(240, 160, 50),
+            accent: rgb565(90, 220, 255),
+        },
+        // Authentic Monokai palette tuned for crisp 1.9" 320x170 RGB565 readability
+        UiTheme::Monokai => UiColors {
+            bg: rgb565(39, 40, 34),           // #272822 Monokai background
+            header_bg: rgb565(29, 30, 26),    // #1D1E1A deeper header bar
+            header_line: rgb565(249, 38, 114),// #F92672 Monokai magenta/pink
+            title: rgb565(248, 248, 242),     // #F8F8F2 off-white
+            tag: rgb565(102, 217, 239),       // #66D9EF Monokai cyan
+            sel_bg: rgb565(62, 61, 50),       // #3E3D32 Monokai selection
+            sel_border: rgb565(230, 219, 116),// #E6DB74 Monokai yellow border
+            sel_label: rgb565(166, 226, 46),  // #A6E22E Monokai lime green
+            sel_val: rgb565(248, 248, 242),   // #F8F8F2 crisp white value
+            label: rgb565(230, 219, 116),     // #E6DB74 Monokai soft yellow
+            val: rgb565(253, 151, 31),        // #FD971F Monokai orange
+            muted: rgb565(152, 148, 128),     // Monokai comment (lifted for 1.9" LCD)
+            ok: rgb565(166, 226, 46),         // #A6E22E green
+            warn: rgb565(253, 151, 31),       // #FD971F orange
+            accent: rgb565(174, 129, 255),    // #AE81FF Monokai purple
+        },
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -78,7 +137,6 @@ fn palette(theme: VisualTheme) -> ThemePalette {
             idle_gate: rgb565(160, 145, 168),
             wireframe: false,
         },
-        // High-contrast Night: deep indigo sky + twilight horizon glow vs dark teal-olive ground!
         VisualTheme::Night => ThemePalette {
             sky_top: rgb565(8, 16, 48),
             sky_horizon: rgb565(30, 46, 104),
@@ -91,17 +149,18 @@ fn palette(theme: VisualTheme) -> ThemePalette {
             idle_gate: rgb565(90, 125, 225),
             wireframe: false,
         },
-        // High-contrast Wireframe: jet-black sky vs deep emerald ground + bright neon horizon!
+        // Redesigned Vector Wireframe:
+        // Black sky | Emerald green grid ground | Dark-occluded Neon Cyan/Magenta walls | Hot Orange/Yellow gates!
         VisualTheme::Wireframe => ThemePalette {
             sky_top: rgb565(0, 0, 0),
             sky_horizon: rgb565(4, 12, 24),
-            ground_near: rgb565(8, 38, 20),
-            ground_far: rgb565(12, 54, 28),
+            ground_near: rgb565(8, 34, 18),
+            ground_far: rgb565(12, 48, 24),
             horizon_line: Some(rgb565(95, 255, 185)),
-            grid_line: rgb565(64, 240, 124),
-            active_gate: rgb565(80, 255, 130),
-            active_gate_hi: rgb565(225, 255, 125),
-            idle_gate: rgb565(42, 155, 96),
+            grid_line: rgb565(48, 215, 105),
+            active_gate: rgb565(255, 115, 20),
+            active_gate_hi: rgb565(255, 242, 75),
+            idle_gate: rgb565(235, 165, 45),
             wireframe: true,
         },
     }
@@ -500,13 +559,9 @@ impl Renderer {
     }
 
     /// Clip and rasterize a 3D quad directly into the framebuffer + 16-bit Z-buffer.
+    /// In `wireframe` mode, fills the interior with dark hidden-line occlusion so walls solidly
+    /// block objects behind them, adds a subtle X-brace panel line, and outlines in bright neon!
     fn draw_3d_quad_z(&mut self, verts: [Vec3; 4], cam_pos: Vec3, cam_inv: Quat, fill: u16, edge: u16, wireframe: bool) {
-        if wireframe {
-            for i in 0..4 {
-                self.draw_3d_line_z(verts[i], verts[(i + 1) & 3], cam_pos, cam_inv, edge, false);
-            }
-            return;
-        }
         let mut c = [Vec3::ZERO; 4];
         for i in 0..4 {
             c[i] = Self::world_to_cam(verts[i], cam_pos, cam_inv);
@@ -560,12 +615,26 @@ impl Renderer {
         for k in 1..(count - 1) {
             self.fill_tri_z(sv[0], sv[k], sv[k + 1], fill);
         }
+        // In Wireframe mode, draw subtle inner panel X-brace so solid walls are unmistakable vs open gates
+        if wireframe && count >= 4 {
+            let brace_col = lerp_rgb565(fill, edge, 0.42);
+            if let Some((x0, y0, iz0, x1, y1, iz1)) =
+                Self::clip_line_2d_z(sv[0].x, sv[0].y, sv[0].iz, sv[2].x, sv[2].y, sv[2].iz)
+            {
+                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, brace_col, 16.0);
+            }
+            if let Some((x0, y0, iz0, x1, y1, iz1)) =
+                Self::clip_line_2d_z(sv[1].x, sv[1].y, sv[1].iz, sv[3].x, sv[3].y, sv[3].iz)
+            {
+                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, brace_col, 16.0);
+            }
+        }
         for k in 0..count {
             let n = (k + 1) % count;
             if let Some((x0, y0, iz0, x1, y1, iz1)) =
                 Self::clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
             {
-                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, 24.0);
+                self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, 26.0);
             }
         }
     }
@@ -585,12 +654,9 @@ impl Renderer {
         edge: u16,
         wireframe: bool,
     ) {
-        if wireframe {
-            self.draw_3d_line_z(a, b, cam_pos, cam_inv, edge, true);
-            return;
-        }
         let u = axis_u.scale(half_w);
         let v = axis_v.scale(half_w);
+        let _ = wireframe;
         self.draw_3d_quad_z([a.sub(u), a.add(u), b.add(u), b.sub(u)], cam_pos, cam_inv, fill, edge, false);
         self.draw_3d_quad_z([a.sub(v), a.add(v), b.add(v), b.sub(v)], cam_pos, cam_inv, fill, edge, false);
     }
@@ -837,33 +903,62 @@ impl Renderer {
             );
         }
 
-        // 3. Structures (solid shaded 3D boxes rendered directly with per-pixel Z-buffer!)
+        // 3. Structures (solid shaded 3D boxes; dark-occluded neon cross-braced walls in Wireframe!)
         for s in track.structures {
-            let (c_top, c_side_a, c_side_b, c_edge) = match s.color {
-                StructureColor::Concrete => (
-                    rgb565(175, 178, 182),
-                    rgb565(138, 142, 148),
-                    rgb565(106, 110, 118),
-                    rgb565(72, 76, 82),
-                ),
-                StructureColor::Steel => (
-                    rgb565(115, 132, 152),
-                    rgb565(82, 98, 118),
-                    rgb565(58, 72, 92),
-                    rgb565(40, 52, 68),
-                ),
-                StructureColor::RedWhite => (
-                    rgb565(235, 235, 235),
-                    rgb565(215, 58, 52),
-                    rgb565(170, 42, 40),
-                    rgb565(90, 22, 22),
-                ),
-                StructureColor::Wood => (
-                    rgb565(175, 134, 86),
-                    rgb565(145, 106, 62),
-                    rgb565(112, 80, 46),
-                    rgb565(72, 50, 28),
-                ),
+            let (c_top, c_side_a, c_side_b, c_edge) = if pal.wireframe {
+                match s.color {
+                    StructureColor::Concrete => (
+                        rgb565(16, 40, 62),
+                        rgb565(11, 28, 46),
+                        rgb565(8, 20, 34),
+                        rgb565(60, 232, 255), // Electric Cyan walls
+                    ),
+                    StructureColor::Steel => (
+                        rgb565(26, 22, 58),
+                        rgb565(18, 15, 42),
+                        rgb565(12, 10, 30),
+                        rgb565(155, 145, 255), // Electric Indigo/Violet pillars
+                    ),
+                    StructureColor::RedWhite => (
+                        rgb565(48, 14, 36),
+                        rgb565(34, 10, 26),
+                        rgb565(24, 7, 18),
+                        rgb565(255, 80, 185), // Neon Magenta towers
+                    ),
+                    StructureColor::Wood => (
+                        rgb565(44, 28, 10),
+                        rgb565(32, 20, 8),
+                        rgb565(22, 14, 6),
+                        rgb565(255, 185, 65), // Neon Amber barriers
+                    ),
+                }
+            } else {
+                match s.color {
+                    StructureColor::Concrete => (
+                        rgb565(175, 178, 182),
+                        rgb565(138, 142, 148),
+                        rgb565(106, 110, 118),
+                        rgb565(72, 76, 82),
+                    ),
+                    StructureColor::Steel => (
+                        rgb565(115, 132, 152),
+                        rgb565(82, 98, 118),
+                        rgb565(58, 72, 92),
+                        rgb565(40, 52, 68),
+                    ),
+                    StructureColor::RedWhite => (
+                        rgb565(235, 235, 235),
+                        rgb565(215, 58, 52),
+                        rgb565(170, 42, 40),
+                        rgb565(90, 22, 22),
+                    ),
+                    StructureColor::Wood => (
+                        rgb565(175, 134, 86),
+                        rgb565(145, 106, 62),
+                        rgb565(112, 80, 46),
+                        rgb565(72, 50, 28),
+                    ),
+                }
             };
             let (x0, y0, z0) = (s.min.x, s.min.y, s.min.z);
             let (x1, y1, z1) = (s.max.x, s.max.y, s.max.z);
@@ -910,7 +1005,13 @@ impl Renderer {
         for (idx, g) in track.gates.iter().enumerate() {
             let is_next = cfg.game_mode == GameMode::Freestyle || idx == quad.next_gate;
             let main_col = if is_next { pal.active_gate } else { pal.idle_gate };
-            let hi_col = if is_next { pal.active_gate_hi } else { rgb565(225, 230, 235) };
+            let hi_col = if is_next {
+                pal.active_gate_hi
+            } else if pal.wireframe {
+                rgb565(255, 200, 80)
+            } else {
+                rgb565(225, 230, 235)
+            };
             let wf = pal.wireframe;
 
             match g.kind {
@@ -1179,21 +1280,22 @@ impl Renderer {
     }
 
     fn draw_post_flight_stats(&mut self, quad: &QuadState, cfg: &Config) {
+        let ui = ui_colors(cfg.ui_theme);
         let mx = 46;
         let my = 20;
         let mw = W - 92;
         let mh = H - 40;
-        self.fill_rect(mx, my, mw, mh, rgb565(10, 14, 24));
-        self.draw_rect(mx, my, mw, mh, rgb565(90, 190, 255));
+        self.fill_rect(mx, my, mw, mh, ui.header_bg);
+        self.draw_rect(mx, my, mw, mh, ui.sel_border);
 
         let title = if quad.battery_empty {
             "BATTERY EMPTY"
         } else {
             "DISARMED - STATS"
         };
-        let tcol = if quad.battery_empty { rgb565(255, 80, 80) } else { rgb565(255, 230, 75) };
+        let tcol = if quad.battery_empty { rgb565(255, 80, 80) } else { ui.sel_label };
         self.draw_text(W / 2 - (title.len() as i32) * 3, my + 8, title, tcol, 1, false);
-        self.draw_hline(mx + 8, mx + mw - 9, my + 19, rgb565(55, 95, 145));
+        self.draw_hline(mx + 8, mx + mw - 9, my + 19, ui.header_line);
 
         let ft = quad.flight_time as u32;
         let mins = ft / 60;
@@ -1208,8 +1310,8 @@ impl Renderer {
 
         for (i, (k, v)) in lines.iter().enumerate() {
             let y = my + 26 + (i as i32) * 15;
-            self.draw_text(mx + 14, y, k, rgb565(175, 195, 220), 1, false);
-            self.draw_text(mx + 124, y, v, rgb565(255, 255, 255), 1, false);
+            self.draw_text(mx + 14, y, k, ui.label, 1, false);
+            self.draw_text(mx + 124, y, v, ui.sel_val, 1, false);
         }
 
         let footer = if quad.battery_empty {
@@ -1219,7 +1321,7 @@ impl Renderer {
         } else {
             "TAB:ARM | R:PACK | ESC:MENU"
         };
-        self.draw_text(W / 2 - (footer.len() as i32) * 3, my + mh - 14, footer, rgb565(115, 225, 255), 1, false);
+        self.draw_text(W / 2 - (footer.len() as i32) * 3, my + mh - 14, footer, ui.tag, 1, false);
     }
 
     fn draw_stick_box(&mut self, x: i32, y: i32, size: i32, sx: f32, sy: f32) {
@@ -1241,25 +1343,29 @@ impl Renderer {
     // Menu UIs (320 x 170 tailored for CardputerZero 1.9" display)
     // -----------------------------------------------------------------------
 
-    fn draw_header(&mut self, title: &str, right_tag: &str) {
-        self.clear(rgb565(12, 16, 26));
-        self.fill_rect(0, 0, W, 22, rgb565(22, 32, 52));
-        self.draw_hline(0, W - 1, 22, rgb565(65, 140, 240));
-        self.draw_text(8, 4, title, rgb565(255, 255, 255), 2, false);
+    fn draw_header(&mut self, title: &str, right_tag: &str, ui: UiColors) {
+        self.clear(ui.bg);
+        self.fill_rect(0, 0, W, 22, ui.header_bg);
+        self.draw_hline(0, W - 1, 22, ui.header_line);
+        self.draw_text(8, 4, title, ui.title, 2, false);
         let rw = (right_tag.len() as i32) * 6;
-        self.draw_text(W - rw - 6, 8, right_tag, rgb565(120, 220, 255), 1, false);
+        self.draw_text(W - rw - 6, 8, right_tag, ui.tag, 1, false);
     }
 
     pub fn render_main_menu(&mut self, cfg: &Config, selected: usize, input: &InputManager) {
-        self.draw_header("STICKZERO", "RUST FPV");
+        let ui = ui_colors(cfg.ui_theme);
+        self.draw_header("STICKZERO", "RUST FPV", ui);
 
         let track = &TRACKS[cfg.track_index.min(TRACKS.len() - 1)];
         let items: [(&str, String); 6] = [
             ("FLY NOW", format!("{} [{}]", track.name, cfg.game_mode.name())),
             ("TRACK", format!("{} ({})", track.name, track.subtitle)),
-            ("QUAD", format!("{} / {}", cfg.quad.name(), cfg.flight_mode.name())),
+            (
+                "DRONE",
+                format!("{} | {}", cfg.quad.craft_name(), cfg.battery_pack.short_name()),
+            ),
             ("THEME", format!("{} / {} deg", cfg.theme.name(), cfg.camera_tilt_deg)),
-            ("SETTINGS", "Rates, Batt, Gfx, OSD".to_string()),
+            ("SETTINGS", format!("{} | Rates, Gfx, OSD", cfg.flight_mode.name())),
             ("CONTROLLER", input.controller_name().chars().take(24).collect()),
         ];
 
@@ -1267,53 +1373,95 @@ impl Renderer {
             let y = 28 + (i as i32) * 20;
             let is_sel = i == selected;
             if is_sel {
-                self.fill_rect(6, y - 2, W - 12, 17, rgb565(36, 66, 118));
-                self.draw_rect(6, y - 2, W - 12, 17, rgb565(90, 190, 255));
+                self.fill_rect(6, y - 2, W - 12, 17, ui.sel_bg);
+                self.draw_rect(6, y - 2, W - 12, 17, ui.sel_border);
             }
-            let lcol = if is_sel { rgb565(255, 230, 80) } else { rgb565(180, 195, 215) };
-            let vcol = if is_sel { rgb565(255, 255, 255) } else { rgb565(135, 150, 170) };
+            let lcol = if is_sel { ui.sel_label } else { ui.label };
+            let vcol = if is_sel { ui.sel_val } else { ui.val };
             self.draw_text(12, y + 3, label, lcol, 1, false);
             self.draw_text(86, y + 3, val, vcol, 1, false);
         }
 
         let ctrl_ok = input.controller_kind() != ControllerKind::None;
-        let dot_col = if ctrl_ok { rgb565(70, 240, 110) } else { rgb565(240, 160, 50) };
+        let dot_col = if ctrl_ok { ui.ok } else { ui.warn };
         self.fill_rect(8, H - 14, 6, 6, dot_col);
         let hint = if ctrl_ok {
             "BT/USB Ready | Ent:Select | Hold Esc:Exit"
         } else {
             "FXZC/WASD | Ent:Select | Hold Esc:Exit"
         };
-        self.draw_text(18, H - 14, hint, rgb565(145, 160, 180), 1, false);
+        self.draw_text(18, H - 14, hint, ui.muted, 1, false);
     }
 
-    pub fn render_pause_menu(&mut self, selected: usize) {
-        let mx = 70;
-        let my = 32;
-        let mw = 180;
-        let mh = 104;
-        self.fill_rect(mx, my, mw, mh, rgb565(14, 18, 30));
-        self.draw_rect(mx, my, mw, mh, rgb565(90, 190, 255));
-        self.draw_text(mx + 56, my + 8, "PAUSED", rgb565(255, 255, 255), 2, false);
+    pub fn render_drone_tuning_menu(&mut self, cfg: &Config, selected: usize) {
+        let ui = ui_colors(cfg.ui_theme);
+        let rows: [(&str, String); 10] = [
+            ("Quad Preset", cfg.quad.name().to_string()),
+            ("Battery Pack", cfg.battery_pack.name().to_string()),
+            ("Prop Wash", cfg.prop_wash.name().to_string()),
+            ("Thrust", format!("{}% ({:.1}:1)", cfg.thrust_pct, cfg.effective_twr())),
+            ("Weight", format!("{}% ({:.0}g AUW)", cfg.weight_pct, cfg.effective_auw_grams())),
+            ("Air Drag", format!("{}%", cfg.drag_pct)),
+            ("Rotor Grip", format!("{}%", cfg.grip_pct)),
+            ("Motor Resp", format!("{}%", cfg.motor_pct)),
+            ("Thr Expo", format!("{:.2} (Hover)", cfg.thr_expo as f32 / 100.0)),
+            ("Reset Tuning", "Press Enter -> Stock".to_string()),
+        ];
 
-        let items = ["RESUME FLIGHT", "RESPAWN START", "SETTINGS", "MAIN MENU"];
+        let tag = format!("{}/{}", selected + 1, rows.len());
+        self.draw_header("DRONE TUNING", &tag, ui);
+
+        const VISIBLE: usize = 8;
+        let start = if selected >= VISIBLE {
+            (selected + 1 - VISIBLE).min(rows.len() - VISIBLE)
+        } else {
+            0
+        };
+
+        for (slot, i) in (start..(start + VISIBLE).min(rows.len())).enumerate() {
+            let (k, ref v) = rows[i];
+            let y = 27 + (slot as i32) * 16;
+            let is_sel = i == selected;
+            if is_sel {
+                self.fill_rect(6, y - 2, W - 12, 14, ui.sel_bg);
+                self.draw_rect(6, y - 2, W - 12, 14, ui.sel_border);
+            }
+            let kcol = if is_sel { ui.sel_label } else { ui.label };
+            let vcol = if is_sel { ui.sel_val } else { ui.val };
+            self.draw_text(12, y + 1, k, kcol, 1, false);
+            self.draw_text(120, y + 1, v, vcol, 1, false);
+        }
+
+        self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Tune | Esc:Save & Back", ui.muted, 1, false);
+    }
+
+    pub fn render_pause_menu(&mut self, cfg: &Config, selected: usize) {
+        let ui = ui_colors(cfg.ui_theme);
+        let mx = 68;
+        let my = 24;
+        let mw = 184;
+        let mh = 120;
+        self.fill_rect(mx, my, mw, mh, ui.header_bg);
+        self.draw_rect(mx, my, mw, mh, ui.sel_border);
+        self.draw_text(mx + 56, my + 8, "PAUSED", ui.title, 2, false);
+
+        let items = ["RESUME FLIGHT", "RESPAWN START", "DRONE TUNING", "SETTINGS", "MAIN MENU"];
         for (i, label) in items.iter().enumerate() {
             let y = my + 32 + (i as i32) * 16;
             if i == selected {
-                self.fill_rect(mx + 10, y - 2, mw - 20, 13, rgb565(40, 74, 130));
+                self.fill_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_bg);
+                self.draw_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_border);
             }
-            let col = if i == selected { rgb565(255, 230, 80) } else { rgb565(190, 200, 215) };
+            let col = if i == selected { ui.sel_label } else { ui.label };
             self.draw_text(mx + 22, y + 1, label, col, 1, false);
         }
     }
 
     pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize) {
-        let rows: [(&str, String); 17] = [
+        let ui = ui_colors(cfg.ui_theme);
+        let rows: [(&str, String); 16] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", cfg.flight_mode.name().to_string()),
-            ("Battery", cfg.battery_pack.name().to_string()),
-            ("Prop Wash", if cfg.prop_wash { "Stock" } else { "Off" }.to_string()),
-            ("Sound", if cfg.sound_on { "On (Whoop Audio)" } else { "Off" }.to_string()),
             ("Rate Preset", cfg.rates.name().to_string()),
             ("Center Sens", format!("{} deg/s", cfg.rate_center)),
             ("Max Rate", format!("{} deg/s", cfg.rate_max)),
@@ -1321,6 +1469,8 @@ impl Renderer {
             ("Camera Tilt", format!("{} deg", cfg.camera_tilt_deg)),
             ("FOV", format!("{} deg", cfg.fov_deg)),
             ("Analog FX", if cfg.analog_filter { "On (NTSC/RF)" } else { "Off" }.to_string()),
+            ("UI Theme", cfg.ui_theme.name().to_string()),
+            ("Sound", if cfg.sound_on { "On (Whoop Audio)" } else { "Off" }.to_string()),
             ("Debug OSD", if cfg.debug_osd { "On (FPS/ms)" } else { "Off" }.to_string()),
             ("Gfx Detail", if cfg.detail_high { "High" } else { "Low" }.to_string()),
             ("Sky Detail", if cfg.sky_detail { "On (Sun/Stars)" } else { "Off" }.to_string()),
@@ -1336,7 +1486,7 @@ impl Renderer {
         ];
 
         let tag = format!("{}/{}", selected + 1, rows.len());
-        self.draw_header("SETTINGS", &tag);
+        self.draw_header("SETTINGS", &tag, ui);
 
         const VISIBLE: usize = 8;
         let start = if selected >= VISIBLE {
@@ -1350,19 +1500,21 @@ impl Renderer {
             let y = 27 + (slot as i32) * 16;
             let is_sel = i == selected;
             if is_sel {
-                self.fill_rect(6, y - 2, W - 12, 14, rgb565(36, 66, 118));
+                self.fill_rect(6, y - 2, W - 12, 14, ui.sel_bg);
+                self.draw_rect(6, y - 2, W - 12, 14, ui.sel_border);
             }
-            let kcol = if is_sel { rgb565(255, 230, 80) } else { rgb565(180, 195, 215) };
-            let vcol = if is_sel { rgb565(255, 255, 255) } else { rgb565(135, 200, 235) };
+            let kcol = if is_sel { ui.sel_label } else { ui.label };
+            let vcol = if is_sel { ui.sel_val } else { ui.val };
             self.draw_text(12, y + 1, k, kcol, 1, false);
             self.draw_text(126, y + 1, v, vcol, 1, false);
         }
 
-        self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Adjust | Esc:Save", rgb565(145, 160, 180), 1, false);
+        self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Adjust | Esc:Save", ui.muted, 1, false);
     }
 
     pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {
-        self.draw_header("CONTROLLER", "BT / USB-C");
+        let ui = ui_colors(cfg.ui_theme);
+        self.draw_header("CONTROLLER", "BT / USB-C", ui);
 
         let name: String = input.controller_name().chars().take(36).collect();
         let dev_tag = if input.candidate_count > 1 {
@@ -1378,25 +1530,25 @@ impl Renderer {
             cfg.aux_turtle.short_label(),
         );
 
-        self.draw_text(8, 25, &dev_tag, rgb565(255, 230, 80), 1, false);
-        self.draw_text(8, 35, &aux_summary, rgb565(150, 215, 255), 1, false);
+        self.draw_text(8, 25, &dev_tag, ui.sel_label, 1, false);
+        self.draw_text(8, 35, &aux_summary, ui.tag, 1, false);
 
         if let Some(ref wiz) = input.calib {
-            self.fill_rect(10, 48, W - 20, 74, rgb565(20, 34, 62));
-            self.draw_rect(10, 48, W - 20, 74, rgb565(90, 220, 255));
-            self.draw_text(18, 56, "CALIBRATE STICKS", rgb565(120, 225, 255), 1, false);
-            self.draw_text(18, 72, wiz.step_prompt(), rgb565(255, 235, 70), 1, false);
+            self.fill_rect(10, 48, W - 20, 74, ui.header_bg);
+            self.draw_rect(10, 48, W - 20, 74, ui.accent);
+            self.draw_text(18, 56, "CALIBRATE STICKS", ui.tag, 1, false);
+            self.draw_text(18, 72, wiz.step_prompt(), ui.sel_label, 1, false);
             let msg: String = wiz.message.chars().take(44).collect();
-            self.draw_text(18, 90, &msg, rgb565(190, 240, 190), 1, false);
-            self.draw_text(18, 106, "Esc: Cancel Calibration", rgb565(160, 175, 195), 1, false);
+            self.draw_text(18, 90, &msg, ui.ok, 1, false);
+            self.draw_text(18, 106, "Esc: Cancel Calibration", ui.muted, 1, false);
         } else if let Some(ref aw) = input.aux_wiz {
-            self.fill_rect(10, 48, W - 20, 74, rgb565(20, 34, 62));
-            self.draw_rect(10, 48, W - 20, 74, rgb565(90, 255, 180));
-            self.draw_text(18, 56, "BIND RADIO AUX SWITCHES", rgb565(120, 255, 190), 1, false);
-            self.draw_text(18, 72, aw.step_prompt(), rgb565(255, 235, 70), 1, false);
+            self.fill_rect(10, 48, W - 20, 74, ui.header_bg);
+            self.draw_rect(10, 48, W - 20, 74, ui.ok);
+            self.draw_text(18, 56, "BIND RADIO AUX SWITCHES", ui.ok, 1, false);
+            self.draw_text(18, 72, aw.step_prompt(), ui.sel_label, 1, false);
             let msg: String = aw.message.chars().take(44).collect();
-            self.draw_text(18, 90, &msg, rgb565(190, 240, 190), 1, false);
-            self.draw_text(18, 106, "Enter: Skip Step | Esc: Cancel", rgb565(160, 175, 195), 1, false);
+            self.draw_text(18, 90, &msg, ui.tag, 1, false);
+            self.draw_text(18, 106, "Enter: Skip Step | Esc: Cancel", ui.muted, 1, false);
         } else {
             let sticks = input.flight_sticks(cfg);
             let bars: [(&str, f32); 4] = [
@@ -1408,28 +1560,28 @@ impl Renderer {
 
             for (i, (lbl, val)) in bars.iter().enumerate() {
                 let y = 49 + (i as i32) * 16;
-                self.draw_text(8, y + 2, lbl, rgb565(210, 220, 230), 1, false);
+                self.draw_text(8, y + 2, lbl, ui.label, 1, false);
                 let bx = 38;
                 let bw = 152;
-                self.fill_rect(bx, y, bw, 10, rgb565(24, 30, 44));
-                self.draw_rect(bx, y, bw, 10, rgb565(75, 95, 125));
+                self.fill_rect(bx, y, bw, 10, ui.header_bg);
+                self.draw_rect(bx, y, bw, 10, ui.muted);
                 let mid = bx + bw / 2;
-                self.draw_vline(mid, y + 1, y + 8, rgb565(90, 105, 130));
+                self.draw_vline(mid, y + 1, y + 8, ui.muted);
                 let pos = bx + ((clampf(*val, -1.0, 1.0) + 1.0) * 0.5 * (bw - 4) as f32) as i32;
-                self.fill_rect(pos, y + 2, 4, 6, rgb565(80, 255, 140));
+                self.fill_rect(pos, y + 2, 4, 6, ui.ok);
             }
 
             self.draw_stick_box(204, 51, 46, sticks.yaw, sticks.throttle * 2.0 - 1.0);
             self.draw_stick_box(260, 51, 46, sticks.roll, sticks.pitch);
-            self.draw_text(214, 101, "L-STK", rgb565(160, 175, 195), 1, false);
-            self.draw_text(270, 101, "R-STK", rgb565(160, 175, 195), 1, false);
+            self.draw_text(214, 101, "L-STK", ui.muted, 1, false);
+            self.draw_text(270, 101, "R-STK", ui.muted, 1, false);
         }
 
         let raw = format!("ABS {}", input.raw_axes_summary());
         let raw_trim: String = raw.chars().take(50).collect();
-        self.draw_text(8, 127, &raw_trim, rgb565(120, 210, 150), 1, false);
+        self.draw_text(8, 127, &raw_trim, ui.ok, 1, false);
 
-        self.draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", rgb565(255, 255, 255), 1, false);
-        self.draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", rgb565(145, 160, 180), 1, false);
+        self.draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", ui.sel_val, 1, false);
+        self.draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
     }
 }

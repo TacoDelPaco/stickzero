@@ -1,15 +1,17 @@
 //! 240 Hz 6-DOF FPV quadcopter physics engine with Betaflight Actual rates,
-//! Acro & Angle modes, radio AUX Arm/Mode/Turtle support, realistic ground friction & yaw-on-ground,
-//! solid gate & structure collisions, prop wash, battery weight/sag, and post-flight stats.
+//! Acro / Horizon / Angle modes, StickTime-inspired aerodynamic inflow damping (climb thrust loss,
+//! descent cushion, translational lift, rotor H-force grip), custom Drone Tuning sliders,
+//! radio AUX Arm/Mode/Turtle support, solid gate & structure collisions, and post-flight stats.
 
-use crate::config::{AuxBinding, BatteryPack, Config, FlightMode, GameMode};
+use crate::config::{AuxBinding, BatteryPack, Config, FlightMode, GameMode, PropWashLevel};
 use crate::input::AuxInputs;
 use crate::math::{clampf, Quat, Vec3};
 use crate::tracks::{GateKind, Track};
 
 pub const PHYSICS_HZ: f32 = 240.0;
 pub const PHYSICS_DT: f32 = 1.0 / PHYSICS_HZ;
-const GRAVITY: f32 = 9.81;
+/// ~1.08g planted gravity feel (similar to StickTime's 1.1g tuning)
+const GRAVITY: f32 = 10.6;
 const QUAD_RADIUS: f32 = 0.22;
 
 /// Normalized RC stick inputs.
@@ -79,7 +81,6 @@ impl QuadState {
             BatteryPack::LavaII580 | BatteryPack::LavaII680 | BatteryPack::Off => 4.35,
             BatteryPack::Stock => 4.20,
         };
-        // If user bound a dedicated radio ARM switch, start safely disarmed; otherwise start armed.
         let start_armed = cfg.aux_arm == AuxBinding::None;
         Self {
             pos: Vec3::new(track.start_pos.x, QUAD_RADIUS, track.start_pos.z),
@@ -134,16 +135,15 @@ impl QuadState {
     pub fn apply_aux(&mut self, aux: AuxInputs, input: StickInput, cfg: &mut Config) -> bool {
         let mut just_armed = false;
 
-        // 1. Flight Mode switch / toggle (Acro vs Angle)
-        if let Some(is_angle) = aux.mode_switch_angle {
-            let target = if is_angle { FlightMode::Angle } else { FlightMode::Acro };
+        // 1. Flight Mode switch / toggle (Acro / Horizon / Angle)
+        if let Some(target) = aux.mode_switch {
             if cfg.flight_mode != target {
                 cfg.flight_mode = target;
                 self.combo_text = target.name();
                 self.combo_timer = 0.8;
             }
         } else if aux.mode_toggle {
-            cfg.flight_mode = cfg.flight_mode.toggle();
+            cfg.flight_mode = cfg.flight_mode.next();
             self.combo_text = cfg.flight_mode.name();
             self.combo_timer = 0.8;
         }
@@ -173,7 +173,7 @@ impl QuadState {
         if let Some(want) = want_arm {
             if want && !self.armed {
                 if self.battery_empty && cfg.battery_pack != BatteryPack::Off {
-                    // Wait for respawn/fresh pack
+                    // Wait for fresh pack
                 } else if input.throttle > 0.15 && !self.turtle_mode {
                     self.arm_blocked_throttle = true;
                 } else {
@@ -200,6 +200,24 @@ impl QuadState {
         deg_s * (std::f32::consts::PI / 180.0)
     }
 
+    /// Betaflight throttle mid + expo curve (flattens sensitivity around hover `mid=0.40`).
+    #[inline]
+    fn apply_throttle_expo(raw: f32, expo_pct: u8) -> f32 {
+        let x = clampf(raw, 0.0, 1.0);
+        let e = (expo_pct as f32 / 100.0).clamp(0.0, 0.65);
+        if e < 1e-3 {
+            return x;
+        }
+        let mid = 0.40_f32;
+        if x < mid {
+            let u = (x - mid) / mid; // -1..0
+            mid + mid * ((1.0 - e) * u + e * u * u * u)
+        } else {
+            let u = (x - mid) / (1.0 - mid); // 0..1
+            mid + (1.0 - mid) * ((1.0 - e) * u + e * u * u * u)
+        }
+    }
+
     /// Collide quad sphere against a 3D line segment (gate posts, crossbars, stilts).
     fn collide_segment(&mut self, a: Vec3, b: Vec3, tube_radius: f32) {
         let ab = b.sub(a);
@@ -219,11 +237,9 @@ impl QuadState {
             } else {
                 Vec3::UP
             };
-            // Push cleanly out of the gate bar
             self.pos = closest.add(normal.scale(min_dist));
             let vn = self.vel.dot(normal);
             if vn < 0.0 {
-                // Bounce with realistic energy absorption + slight prop-clip angular kick
                 self.vel = self.vel.sub(normal.scale(vn * 1.30));
                 self.vel = self.vel.scale(0.75);
                 if vn < -2.0 {
@@ -253,17 +269,28 @@ impl QuadState {
         let prev_pos = self.pos;
         let batt_on = cfg.battery_pack != BatteryPack::Off;
         let (pack_mah, pack_mass_g, pack_sag) = cfg.battery_pack.specs(&params);
-        let mass_ratio = (params.dry_mass_g + pack_mass_g) / (params.dry_mass_g + params.ref_batt_g);
+
+        // Apply custom Drone Tuning multipliers ("The Zone"-style physics customization)
+        let thrust_scale = cfg.thrust_pct as f32 / 100.0;
+        let weight_scale = cfg.weight_pct as f32 / 100.0;
+        let drag_scale = cfg.drag_pct as f32 / 100.0;
+        let grip_scale = cfg.grip_pct as f32 / 100.0;
+        let motor_scale = cfg.motor_pct as f32 / 100.0;
+
+        let effective_dry_g = params.dry_mass_g * weight_scale;
+        let mass_ratio = (effective_dry_g + pack_mass_g) / (params.dry_mass_g + params.ref_batt_g);
+        let eff_motor_tau = (params.motor_tau / motor_scale).clamp(0.005, 0.05);
 
         self.throttle_pct = (clampf(input.throttle, 0.0, 1.0) * 100.0).round() as u8;
 
-        // 1. Motor spool lag (first-order filter; spools to 0 when disarmed or empty)
+        // 1. Betaflight throttle expo + motor spool lag
+        let shaped_thr = Self::apply_throttle_expo(input.throttle, cfg.thr_expo);
         let target_thr = if !self.armed || (self.battery_empty && batt_on) {
             0.0
         } else {
-            clampf(input.throttle, 0.0, 1.0)
+            shaped_thr
         };
-        let alpha = dt / (params.motor_tau + dt);
+        let alpha = dt / (eff_motor_tau + dt);
         self.motor_thr += (target_thr - self.motor_thr) * alpha;
         if !self.armed && self.motor_thr < 0.01 {
             self.motor_thr = 0.0;
@@ -273,9 +300,9 @@ impl QuadState {
         if batt_on {
             let draw_active = self.armed && !self.battery_empty;
             let amps = if draw_active {
-                (1.1 + params.full_amp * self.motor_thr * self.motor_thr) * mass_ratio.sqrt()
+                (1.1 + params.full_amp * thrust_scale * self.motor_thr * self.motor_thr) * mass_ratio.sqrt()
             } else {
-                0.35 // Idle VTX + FC draw while disarmed
+                0.35
             };
             if draw_active {
                 self.mah_used += amps * (dt / 3.6);
@@ -315,12 +342,17 @@ impl QuadState {
             }
         }
 
-        // 3. Determine orientation & ground / turtle status
+        // 3. Orientation & body-frame airflow decomposition (StickTime aerodynamic model!)
         let (right, up, forward) = self.rot.basis();
         self.inverted = up.y < -0.35;
 
-        // Turtle Mode ONLY ever activates when genuinely on the ground!
-        // Never conflicts with flying sideways or low banking turns!
+        let v_up = self.vel.dot(up);
+        let v_right = self.vel.dot(right);
+        let v_fwd = self.vel.dot(forward);
+        let edge_sq = v_right * v_right + v_fwd * v_fwd;
+        let edge_speed = edge_sq.sqrt();
+
+        // Turtle Mode ONLY activates when genuinely on the ground!
         let auto_turtle = cfg.aux_turtle == AuxBinding::None
             && self.on_ground
             && up.y < -0.55
@@ -328,40 +360,74 @@ impl QuadState {
         let turtle_ready = self.armed && self.on_ground && (self.turtle_mode || auto_turtle);
         let turtle_flipping = turtle_ready && (input.roll.abs() > 0.40 || input.pitch.abs() > 0.40);
 
-        // Compute candidate thrust first so we know if we have enough lift to leave the ground
-        let thr_curve = self.motor_thr.powf(1.45);
+        // Compute static + aerodynamic thrust (StickTime-style climb loss, descent cushion, translational lift)
+        let thr_curve = self.motor_thr.powf(1.18); // Closer to StickTime whoop curve (0.92..1.4) + thr_expo around hover!
         let sag_factor = if batt_on {
             (self.cell_voltage / 4.0).clamp(0.72, 1.05)
         } else {
             1.0
         };
-        // Smooth, gentle ground effect cushion (max +6% below 0.65m — predictable hover!)
-        let ge = if self.pos.y < 0.65 && up.y > 0.3 {
-            1.0 + 0.06 * (1.0 - (self.pos.y - QUAD_RADIUS).max(0.0) / 0.43).clamp(0.0, 1.0)
+        let ge = if self.pos.y < 0.60 && up.y > 0.3 {
+            let h = (self.pos.y - QUAD_RADIUS).max(0.0);
+            1.0 + 0.06 * (1.0 - h / 0.38).clamp(0.0, 1.0) / (1.0 + edge_sq / 80.0)
         } else {
             1.0
         };
-        let raw_thrust = if !self.armed || turtle_ready {
+        let base_thrust = if !self.armed || turtle_ready {
             0.0
         } else {
             ((params.idle_accel * self.motor_thr.signum()
-                + params.max_accel * thr_curve)
+                + params.max_accel * thrust_scale * thr_curve)
                 / mass_ratio)
                 * sag_factor
                 * ge
         };
 
-        let vertical_lift = up.y * raw_thrust;
-        // Grounded & not generating enough vertical lift to break contact with the floor
+        // StickTime-inspired axial inflow damping & translational lift:
+        // Makes hovering feel naturally planted instead of slippery!
+        let inflow_factor = if v_up > 0.0 {
+            // Climbing through air reduces effective prop angle of attack -> self-damps upward drift
+            1.0 / (1.0 + v_up * 0.045)
+        } else {
+            // Gentle descent cushions thrust slightly (peaks near -2.5 m/s), fades in fast dives
+            let sink = -v_up;
+            let x = (sink / 5.5).min(1.8);
+            let cushion = 1.0 + 0.10 * (2.0 * x - x * x).max(-0.12);
+            cushion.clamp(0.88, 1.11)
+        };
+        // Translational lift when flying forward/edgewise
+        let trans_lift = 1.0 + 0.11 * (edge_sq / (edge_sq + 36.0)) * (1.0 - 0.5 * self.motor_thr.powi(3));
+
+        // Smooth prop wash buildup (0.2s lag when descending vertically at low edgewise speed)
+        let target_wash = match cfg.prop_wash {
+            PropWashLevel::Off => 0.0,
+            PropWashLevel::Stock | PropWashLevel::Max => {
+                if self.armed && !self.on_ground && v_up < -0.6 && up.y > 0.25 {
+                    let sink_f = ((-v_up - 0.6) / 6.0).clamp(0.0, 1.0);
+                    let clear_f = 1.0 / (1.0 + edge_speed * 0.32);
+                    sink_f * clear_f
+                } else {
+                    0.0
+                }
+            }
+        };
+        let wash_alpha = (dt / 0.20).min(1.0);
+        self.prop_wash_level += (target_wash - self.prop_wash_level) * wash_alpha;
+        let (wash_loss_coeff, wash_shake_coeff) = match cfg.prop_wash {
+            PropWashLevel::Off => (0.0, 0.0),
+            PropWashLevel::Stock => (0.09, 0.26),
+            PropWashLevel::Max => (0.18, 0.52),
+        };
+        let wash_thrust_mult = 1.0 - self.prop_wash_level * wash_loss_coeff;
+
+        let aero_thrust = base_thrust * inflow_factor * trans_lift * wash_thrust_mult;
+        let vertical_lift = up.y * aero_thrust;
         let pinned_on_ground = self.on_ground && !turtle_flipping && (!self.armed || up.y < 0.25 || vertical_lift <= GRAVITY * 1.01);
 
-        // 4. Target body angular rates (rad/s)
+        // 4. Rotational control (Acro / Horizon / Angle / Grounded Yaw / Turtle)
         let (center_sens, max_rate, expo) = cfg.actual_rates();
-        self.prop_wash_level = 0.0;
-        let mut wash_thrust_loss = 1.0_f32;
 
         if turtle_flipping {
-            // Physical controlled crash-flip roll (~330 deg/s) with a modest pivot hop
             if self.turtle_cooldown <= 0.0 {
                 self.combo_text = "TURTLE FLIP";
                 self.combo_timer = 0.8;
@@ -377,9 +443,6 @@ impl QuadState {
             self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
             self.rot = self.rot.integrate_body_omega(self.omega, dt);
         } else if pinned_on_ground {
-            // Realistic ground contact:
-            // - Skids/canopy constrain pitch & roll FLAT against the ground (cannot fly at an angle on the ground!)
-            // - When ARMED and upright, pilot CAN yaw smoothly left/right to look around!
             let target_up = if up.y >= 0.0 { 1.0f32 } else { -1.0f32 };
             let cur_pitch = clampf(-forward.y * target_up, -1.0, 1.0).asin();
             let cur_roll = clampf(-right.y * target_up, -1.0, 1.0).asin();
@@ -394,48 +457,65 @@ impl QuadState {
             self.rot = self.rot.integrate_body_omega(ground_omega, dt);
             self.omega = Vec3::new(0.0, yaw_rate, 0.0);
         } else {
-            // Full 6-DOF airborne flight (or lifting off!)
+            let acro_omega = Vec3::new(
+                Self::betaflight_actual(input.pitch, center_sens, max_rate, expo),
+                Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.82, expo),
+                -Self::betaflight_actual(input.roll, center_sens, max_rate, expo),
+            );
+
+            let angle_omega = {
+                let max_tilt = 45.0_f32.to_radians();
+                let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
+                let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
+                // Handle inverted recovery cleanly in Horizon/Angle
+                let (cur_pitch, cur_roll) = if up.y >= 0.0 {
+                    (
+                        clampf(-forward.y, -1.0, 1.0).asin(),
+                        clampf(-right.y, -1.0, 1.0).asin(),
+                    )
+                } else {
+                    // Upside down -> command fast roll back upright
+                    let roll_sign = if right.y >= 0.0 { -1.0 } else { 1.0 };
+                    (0.0, roll_sign * std::f32::consts::PI * 0.75)
+                };
+                let pitch_err = desired_pitch - cur_pitch;
+                let roll_err = desired_roll - cur_roll;
+                Vec3::new(
+                    clampf(pitch_err * 7.5, -7.0, 7.0),
+                    Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.75, expo),
+                    clampf(-roll_err * 7.5, -7.0, 7.0),
+                )
+            };
+
             let target_omega = match cfg.flight_mode {
-                FlightMode::Acro => {
-                    let pitch_rate = Self::betaflight_actual(input.pitch, center_sens, max_rate, expo);
-                    let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.82, expo);
-                    let roll_rate = -Self::betaflight_actual(input.roll, center_sens, max_rate, expo);
-                    Vec3::new(pitch_rate, yaw_rate, roll_rate)
-                }
-                FlightMode::Angle => {
-                    let max_tilt = 45.0_f32.to_radians();
-                    let desired_pitch = clampf(input.pitch, -1.0, 1.0) * max_tilt;
-                    let desired_roll = clampf(input.roll, -1.0, 1.0) * max_tilt;
-
-                    let cur_pitch = clampf(-forward.y, -1.0, 1.0).asin();
-                    let cur_roll = clampf(-right.y, -1.0, 1.0).asin();
-                    let pitch_err = desired_pitch - cur_pitch;
-                    let roll_err = desired_roll - cur_roll;
-
-                    let yaw_rate = Self::betaflight_actual(input.yaw, center_sens * 0.85, max_rate * 0.7, expo);
+                FlightMode::Acro => acro_omega,
+                FlightMode::Angle => angle_omega,
+                FlightMode::Horizon => {
+                    // Authentic Betaflight Horizon: self-level below 55% stick, full Acro flip above 85%!
+                    let def = input.pitch.abs().max(input.roll.abs());
+                    let blend = ((def - 0.55) / 0.30).clamp(0.0, 1.0);
                     Vec3::new(
-                        clampf(pitch_err * 7.5, -6.0, 6.0),
-                        yaw_rate,
-                        clampf(-roll_err * 7.5, -6.0, 6.0),
+                        angle_omega.x + (acro_omega.x - angle_omega.x) * blend,
+                        acro_omega.y,
+                        angle_omega.z + (acro_omega.z - angle_omega.z) * blend,
                     )
                 }
             };
 
-            let rot_resp = if self.armed { 24.0 / mass_ratio.sqrt() } else { 1.0 };
+            let rot_resp = if self.armed {
+                (24.0 * motor_scale.sqrt()) / mass_ratio.sqrt()
+            } else {
+                1.0
+            };
             let rot_alpha = (rot_resp * dt).min(1.0);
             self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
 
-            // Realistic Stock Prop Wash (descending through own dirty air / dive pullout)
-            if cfg.prop_wash && self.armed && !self.on_ground && self.vel.y < -1.8 && up.y > 0.25 {
-                let horiz_speed = (self.vel.x * self.vel.x + self.vel.z * self.vel.z).sqrt();
-                let descent = ((-self.vel.y - 1.8) / 8.0).clamp(0.0, 1.0);
-                let slow_factor = (1.0 - horiz_speed / 16.0).clamp(0.15, 1.0);
-                let intensity = descent * slow_factor * (0.35 + 0.65 * self.motor_thr);
-                self.prop_wash_level = intensity;
-                self.prop_wash_phase += dt * 115.0;
-                self.omega.x += self.prop_wash_phase.sin() * intensity * 0.40;
-                self.omega.z += (self.prop_wash_phase * 1.37).cos() * intensity * 0.50;
-                wash_thrust_loss = 1.0 - intensity * 0.10;
+            // Prop wash high-frequency micro-shudder (tinywhoop ~38 Hz)
+            if self.prop_wash_level > 0.05 && wash_shake_coeff > 0.0 {
+                self.prop_wash_phase += dt * 235.0;
+                let amp = self.prop_wash_level * wash_shake_coeff * (0.4 + 0.6 * self.motor_thr);
+                self.omega.x += self.prop_wash_phase.sin() * amp;
+                self.omega.z += (self.prop_wash_phase * 1.31).cos() * amp * 1.2;
             }
 
             if self.armed || !self.on_ground {
@@ -443,34 +523,40 @@ impl QuadState {
             }
         }
 
-        // 5. Linear Forces: Thrust + Aerodynamic Drag + Gravity
-        let (_, up_now, _) = self.rot.basis();
-        let thrust_mag = if pinned_on_ground {
-            0.0
-        } else {
-            raw_thrust * wash_thrust_loss
-        };
+        // 5. Linear Forces: Thrust + Aerodynamic Body Drag + In-Plane Rotor Grip + Gravity
+        let (right_now, up_now, fwd_now) = self.rot.basis();
+        let thrust_mag = if pinned_on_ground { 0.0 } else { aero_thrust };
 
         let thrust_accel = up_now.scale(thrust_mag);
         let speed = self.vel.len();
-        let drag_accel = self.vel.scale(-(params.drag / mass_ratio) * speed - 0.05);
+        let eff_drag = (params.drag * drag_scale) / mass_ratio;
+        let drag_accel = self.vel.scale(-eff_drag * speed - 0.04 * drag_scale);
+
+        // In-plane rotor H-force grip (StickTime Grip setting: carves turns cleanly without icy drift)
+        let v_plane = right_now
+            .scale(self.vel.dot(right_now))
+            .add(fwd_now.scale(self.vel.dot(fwd_now)));
+        let grip_coeff = (params.grip * grip_scale / mass_ratio) * ((thrust_mag / (5.0 * GRAVITY) + 0.04).sqrt());
+        let grip_accel = v_plane.scale(-grip_coeff);
+
         let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);
 
-        let total_accel = thrust_accel.add(drag_accel).add(gravity_accel);
+        let total_accel = thrust_accel
+            .add(drag_accel)
+            .add(grip_accel)
+            .add(gravity_accel);
         self.vel = self.vel.add(total_accel.scale(dt));
         self.pos = self.pos.add(self.vel.scale(dt));
 
-        // 6. Ground collision (smooth zero-bounce touchdown + high realistic skids drag)
+        // 6. Ground collision (smooth zero-bounce touchdown + realistic skids drag)
         if self.pos.y <= QUAD_RADIUS {
             self.pos.y = QUAD_RADIUS;
             if self.vel.y < -5.5 {
                 self.hit_flash = 0.25;
                 self.vel.y = -self.vel.y * 0.08;
             } else if self.vel.y < 0.0 {
-                // Plant cleanly on the ground without unpredictable micro-bouncing
                 self.vel.y = 0.0;
             }
-            // High realistic ground sliding friction
             let friction = (11.0 * dt).min(0.95);
             self.vel.x *= 1.0 - friction;
             self.vel.z *= 1.0 - friction;
@@ -525,7 +611,7 @@ impl QuadState {
             }
         }
 
-        // 7b. Solid 3D Gate Frame Collisions (posts, top crossbars, stilts, dive rings!)
+        // 7b. Solid 3D Gate Frame Collisions
         for g in track.gates {
             match g.kind {
                 GateKind::Box => {
@@ -716,6 +802,31 @@ mod tests {
     }
 
     #[test]
+    fn test_horizon_levels_and_flips() {
+        let mut cfg = Config::default();
+        cfg.flight_mode = FlightMode::Horizon;
+        let track = &TRACKS[0];
+        let mut quad = QuadState::spawn(track, &cfg);
+        quad.pos.y = 20.0;
+        quad.on_ground = false;
+        // Start tilted 35 deg, release sticks -> should self-level!
+        quad.rot = Quat::from_axis_angle(Vec3::FORWARD, 35.0_f32.to_radians());
+        let neutral = StickInput { throttle: 0.45, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..180 {
+            quad.step(neutral, &mut cfg, track);
+        }
+        let (_, up, _) = quad.rot.basis();
+        assert!(up.y > 0.96, "Horizon mode must self-level at center stick, up.y={}", up.y);
+
+        // Now push full pitch -> should flip!
+        let flip = StickInput { throttle: 0.45, yaw: 0.0, pitch: 1.0, roll: 0.0 };
+        for _ in 0..240 {
+            quad.step(flip, &mut cfg, track);
+        }
+        assert!(quad.score >= 250, "Horizon mode must allow full flips at max stick!");
+    }
+
+    #[test]
     fn test_freestyle_gate_scoring() {
         let mut cfg = Config::default();
         cfg.game_mode = GameMode::Freestyle;
@@ -734,7 +845,7 @@ mod tests {
     #[test]
     fn test_gate_post_collision() {
         let mut cfg = Config::default();
-        let track = &TRACKS[0]; // Gate 0 is at (0, 0, 22), width 4.8 -> left post at x=-2.4, z=22
+        let track = &TRACKS[0];
         let mut quad = QuadState::spawn(track, &cfg);
         quad.pos = Vec3::new(-2.4, 1.8, 21.5);
         quad.vel = Vec3::new(0.0, 0.0, 12.0);
@@ -769,7 +880,6 @@ mod tests {
         let mut quad = QuadState::spawn(track, &cfg);
         quad.pos = Vec3::new(0.0, 0.45, 0.0);
         quad.on_ground = false;
-        // Bank 70 degrees sideways near ground with high throttle
         quad.rot = Quat::from_axis_angle(Vec3::FORWARD, 70.0_f32.to_radians());
         let input = StickInput { throttle: 0.85, yaw: 0.0, pitch: 0.0, roll: 0.8 };
         for _ in 0..10 {

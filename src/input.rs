@@ -11,7 +11,7 @@
 //! - Fn-free menu navigation (F/X/Z/C, ;/./,//, WASD, Arrows, Right-Stick)
 //! - CardputerZero short-Esc / long-Esc exit semantics
 
-use crate::config::{AuxBinding, Config, StickMode, ThrottleMode};
+use crate::config::{AuxBinding, Config, FlightMode, StickMode, ThrottleMode};
 use crate::linux_sys::*;
 use crate::math::clampf;
 use crate::physics::StickInput;
@@ -127,8 +127,8 @@ pub struct AuxInputs {
     pub arm_switch: Option<bool>,
     /// Edge-triggered toggle for ARM (bound EV_KEY button or keyboard Tab).
     pub arm_toggle: bool,
-    /// Latched FLIGHT MODE switch state (Some(true)=ANGLE, Some(false)=ACRO) if bound to an EV_ABS switch.
-    pub mode_switch_angle: Option<bool>,
+    /// Latched FLIGHT MODE switch state (supports 2-pos Acro/Angle and 3-pos Acro/Horizon/Angle).
+    pub mode_switch: Option<FlightMode>,
     /// Edge-triggered toggle for Flight Mode (bound EV_KEY button or keyboard M).
     pub mode_toggle: bool,
     /// Latched TURTLE switch state (Some(true)=TURTLE ON) if bound to an EV_ABS switch.
@@ -977,7 +977,23 @@ impl InputManager {
         }
 
         match cfg.aux_mode {
-            AuxBinding::Axis { code, invert } => out.mode_switch_angle = Some(eval_axis(code, invert)),
+            AuxBinding::Axis { code, invert } => {
+                let c = (code as usize).min(ABS_MAX);
+                if gp.axes[c].present {
+                    let mut v = gp.axes[c].raw_norm();
+                    if invert {
+                        v = -v;
+                    }
+                    let fm = if v > 0.35 {
+                        FlightMode::Angle
+                    } else if v < -0.35 {
+                        FlightMode::Acro
+                    } else {
+                        FlightMode::Horizon
+                    };
+                    out.mode_switch = Some(fm);
+                }
+            }
             AuxBinding::Button { code } => {
                 if gp.frame_btn_pressed == Some(code) {
                     out.mode_toggle = true;

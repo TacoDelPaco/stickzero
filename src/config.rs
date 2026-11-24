@@ -1,7 +1,8 @@
 //! Configuration, BetaFPV whoop & quad presets (Air75 II, Meteor75 Pro II),
-//! Lava II 580mAh / 680mAh battery packs with real weight/TWR physics,
-//! custom Betaflight Actual rates (default 100/480/0.20), prop wash,
-//! radio AUX switch/button bindings (Arm, Flight Mode, Turtle Mode), and OSD/graphics settings.
+//! optional "The Zone"-style Drone Tuning (Thrust, Weight, Air Drag, Rotor Grip, Motor Resp, Thr Expo),
+//! Lava II 580mAh / 680mAh battery packs, Prop Wash (Off/Stock/Max),
+//! Acro / Horizon / Angle flight modes, custom Betaflight Actual rates, UI Theme (Classic/Monokai),
+//! and radio AUX switch/button bindings.
 
 use std::fs;
 use std::path::PathBuf;
@@ -50,44 +51,59 @@ impl QuadClass {
         }
     }
 
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Air75II => Self::Racer5,
+            Self::Meteor75ProII => Self::Air75II,
+            Self::Whoop65 => Self::Meteor75ProII,
+            Self::Toothpick3 => Self::Whoop65,
+            Self::Freestyle5 => Self::Toothpick3,
+            Self::Racer5 => Self::Freestyle5,
+        }
+    }
+
     pub fn params(self) -> QuadParams {
         match self {
-            // BetaFPV Air75 II Freestyle 75mm (ultra-light ~21g dry, 40mm props, realistic 1S ~3.0:1 TWR)
+            // BetaFPV Air75 II Freestyle 75mm (~21g dry, 40mm props, nimble 1S ~3.4:1 TWR)
             Self::Air75II => QuadParams {
-                max_accel: 30.0,
-                drag: 0.030,
+                max_accel: 35.5,
+                drag: 0.029,
+                grip: 0.34,
                 motor_tau: 0.015,
-                idle_accel: 0.7,
+                idle_accel: 0.75,
                 dry_mass_g: 21.0,
                 ref_batt_g: 13.5,
                 mah: 450.0,
                 full_amp: 15.5,
             },
-            // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, heavier carry & momentum)
+            // BetaFPV Meteor75 Pro II 75mm (1S, 45mm props, ~31g dry, planted carry & stability)
             Self::Meteor75ProII => QuadParams {
-                max_accel: 27.5,
-                drag: 0.027,
+                max_accel: 33.0,
+                drag: 0.026,
+                grip: 0.38,
                 motor_tau: 0.017,
-                idle_accel: 0.7,
+                idle_accel: 0.75,
                 dry_mass_g: 31.0,
                 ref_batt_g: 13.5,
                 mah: 550.0,
                 full_amp: 17.5,
             },
             Self::Whoop65 => QuadParams {
-                max_accel: 24.5,
-                drag: 0.040,
-                motor_tau: 0.022,
-                idle_accel: 0.6,
+                max_accel: 28.0,
+                drag: 0.038,
+                grip: 0.42,
+                motor_tau: 0.021,
+                idle_accel: 0.65,
                 dry_mass_g: 18.0,
                 ref_batt_g: 8.5,
                 mah: 300.0,
                 full_amp: 12.0,
             },
             Self::Toothpick3 => QuadParams {
-                max_accel: 50.0,
-                drag: 0.042,
-                motor_tau: 0.015,
+                max_accel: 54.0,
+                drag: 0.036,
+                grip: 0.28,
+                motor_tau: 0.014,
                 idle_accel: 1.4,
                 dry_mass_g: 68.0,
                 ref_batt_g: 36.0,
@@ -95,9 +111,10 @@ impl QuadClass {
                 full_amp: 28.0,
             },
             Self::Freestyle5 => QuadParams {
-                max_accel: 60.0,
-                drag: 0.036,
-                motor_tau: 0.018,
+                max_accel: 68.0,
+                drag: 0.032,
+                grip: 0.26,
+                motor_tau: 0.016,
                 idle_accel: 1.8,
                 dry_mass_g: 410.0,
                 ref_batt_g: 220.0,
@@ -105,9 +122,10 @@ impl QuadClass {
                 full_amp: 78.0,
             },
             Self::Racer5 => QuadParams {
-                max_accel: 74.0,
-                drag: 0.032,
-                motor_tau: 0.014,
+                max_accel: 82.0,
+                drag: 0.028,
+                grip: 0.24,
+                motor_tau: 0.012,
                 idle_accel: 2.0,
                 dry_mass_g: 320.0,
                 ref_batt_g: 210.0,
@@ -122,6 +140,8 @@ impl QuadClass {
 pub struct QuadParams {
     pub max_accel: f32,
     pub drag: f32,
+    /// In-plane rotor H-force grip coefficient
+    pub grip: f32,
     pub motor_tau: f32,
     pub idle_accel: f32,
     pub dry_mass_g: f32,
@@ -148,6 +168,15 @@ impl BatteryPack {
         }
     }
 
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::LavaII580 => "Lava580",
+            Self::LavaII680 => "Lava680",
+            Self::Stock => "Stock",
+            Self::Off => "Inf",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::LavaII580 => Self::LavaII680,
@@ -157,12 +186,19 @@ impl BatteryPack {
         }
     }
 
+    pub fn prev(self) -> Self {
+        match self {
+            Self::LavaII580 => Self::Off,
+            Self::LavaII680 => Self::LavaII580,
+            Self::Stock => Self::LavaII680,
+            Self::Off => Self::Stock,
+        }
+    }
+
     /// Returns (capacity_mah, mass_g, sag_factor) where lower sag_factor = higher C-rating.
     pub fn specs(self, quad: &QuadParams) -> (f32, f32, f32) {
         match self {
-            // BetaFPV LAVA II 1S 580mAh folded cell (~13.5g, high C-rating, low sag)
             Self::LavaII580 => (580.0, 13.5, 0.24),
-            // BetaFPV LAVA II 1S 680mAh folded cell (~16.2g, longer flight, slightly heavier)
             Self::LavaII680 => (680.0, 16.2, 0.22),
             Self::Stock => (quad.mah, quad.ref_batt_g, 0.34),
             Self::Off => (quad.mah, quad.ref_batt_g, 0.0),
@@ -171,8 +207,42 @@ impl BatteryPack {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PropWashLevel {
+    Off,
+    Stock,
+    Max,
+}
+
+impl PropWashLevel {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Stock => "Stock",
+            Self::Max => "Max",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Stock,
+            Self::Stock => Self::Max,
+            Self::Max => Self::Off,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Off => Self::Max,
+            Self::Stock => Self::Off,
+            Self::Max => Self::Stock,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FlightMode {
     Acro,
+    Horizon,
     Angle,
 }
 
@@ -180,14 +250,24 @@ impl FlightMode {
     pub fn name(self) -> &'static str {
         match self {
             Self::Acro => "ACRO",
+            Self::Horizon => "HORIZON",
             Self::Angle => "ANGLE",
         }
     }
 
-    pub fn toggle(self) -> Self {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Acro => Self::Horizon,
+            Self::Horizon => Self::Angle,
+            Self::Angle => Self::Acro,
+        }
+    }
+
+    pub fn prev(self) -> Self {
         match self {
             Self::Acro => Self::Angle,
-            Self::Angle => Self::Acro,
+            Self::Horizon => Self::Acro,
+            Self::Angle => Self::Horizon,
         }
     }
 }
@@ -253,6 +333,28 @@ impl VisualTheme {
             Self::Evening => Self::Night,
             Self::Night => Self::Wireframe,
             Self::Wireframe => Self::Summer,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UiTheme {
+    Classic,
+    Monokai,
+}
+
+impl UiTheme {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Monokai => "Monokai",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Classic => Self::Monokai,
+            Self::Monokai => Self::Classic,
         }
     }
 }
@@ -327,9 +429,7 @@ impl ThrottleMode {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AuxBinding {
     None,
-    /// Switch on an EV_ABS axis (e.g., EdgeTX CH5..CH8). Active when normalized value > 0.35 (or < -0.35 if inverted).
     Axis { code: u16, invert: bool },
-    /// Momentary/latching button on an EV_KEY code (EdgeTX HID button or gamepad button).
     Button { code: u16 },
 }
 
@@ -376,18 +476,23 @@ impl AuxBinding {
 pub struct Config {
     pub quad: QuadClass,
     pub battery_pack: BatteryPack,
-    pub prop_wash: bool,
+    pub prop_wash: PropWashLevel,
+    // Optional "The Zone"-style Drone Tuning multipliers
+    pub thrust_pct: u16, // 60..=150 %
+    pub weight_pct: u16, // 70..=150 %
+    pub drag_pct: u16,   // 50..=160 %
+    pub grip_pct: u16,   // 0..=160 %
+    pub motor_pct: u16,  // 60..=150 %
+    pub thr_expo: u8,    // 0..=60 (0.00..=0.60 Betaflight throttle expo around hover)
+
     pub flight_mode: FlightMode,
     pub rates: RatesPreset,
-    /// Betaflight Actual Center Sensitivity (deg/s, 50..=400)
     pub rate_center: u16,
-    /// Betaflight Actual Max Rate (deg/s, 300..=1200)
     pub rate_max: u16,
-    /// Betaflight Actual Expo (0..=90, representing 0.00..=0.90)
     pub rate_expo: u8,
     pub camera_tilt_deg: u8,
     pub theme: VisualTheme,
-    /// Graphics & OSD settings
+    pub ui_theme: UiTheme,
     pub detail_high: bool,
     pub sky_detail: bool,
     pub analog_filter: bool,
@@ -406,7 +511,6 @@ pub struct Config {
     pub axis_yaw: Option<u16>,
     pub axis_pit: Option<u16>,
     pub axis_rol: Option<u16>,
-    /// Radio AUX switch / button bindings
     pub aux_arm: AuxBinding,
     pub aux_mode: AuxBinding,
     pub aux_turtle: AuxBinding,
@@ -419,7 +523,13 @@ impl Default for Config {
         Self {
             quad: QuadClass::Air75II,
             battery_pack: BatteryPack::LavaII580,
-            prop_wash: true,
+            prop_wash: PropWashLevel::Stock,
+            thrust_pct: 100,
+            weight_pct: 100,
+            drag_pct: 100,
+            grip_pct: 100,
+            motor_pct: 100,
+            thr_expo: 25,
             flight_mode: FlightMode::Acro,
             rates: RatesPreset::Soft,
             rate_center: 100,
@@ -427,6 +537,7 @@ impl Default for Config {
             rate_expo: 20,
             camera_tilt_deg: 25,
             theme: VisualTheme::Summer,
+            ui_theme: UiTheme::Classic,
             detail_high: true,
             sky_detail: true,
             analog_filter: true,
@@ -455,6 +566,30 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn reset_drone_tuning(&mut self) {
+        self.thrust_pct = 100;
+        self.weight_pct = 100;
+        self.drag_pct = 100;
+        self.grip_pct = 100;
+        self.motor_pct = 100;
+        self.thr_expo = 25;
+    }
+
+    pub fn effective_auw_grams(&self) -> f32 {
+        let p = self.quad.params();
+        let (_, batt_g, _) = self.battery_pack.specs(&p);
+        p.dry_mass_g * (self.weight_pct as f32 / 100.0) + batt_g
+    }
+
+    pub fn effective_twr(&self) -> f32 {
+        let p = self.quad.params();
+        let (_, batt_g, _) = self.battery_pack.specs(&p);
+        let mass_ratio = (p.dry_mass_g * (self.weight_pct as f32 / 100.0) + batt_g)
+            / (p.dry_mass_g + p.ref_batt_g);
+        let max_a = p.max_accel * (self.thrust_pct as f32 / 100.0) / mass_ratio;
+        max_a / 10.6
+    }
+
     pub fn apply_rate_preset(&mut self, preset: RatesPreset) {
         self.rates = preset;
         let (c, m, e) = preset.defaults();
@@ -503,8 +638,22 @@ impl Config {
                     "off" => BatteryPack::Off,
                     _ => BatteryPack::LavaII580,
                 },
-                "prop_wash" => cfg.prop_wash = v != "0",
-                "flight_mode" => cfg.flight_mode = if v == "angle" { FlightMode::Angle } else { FlightMode::Acro },
+                "prop_wash" => cfg.prop_wash = match v {
+                    "0" | "off" => PropWashLevel::Off,
+                    "2" | "max" => PropWashLevel::Max,
+                    _ => PropWashLevel::Stock,
+                },
+                "thrust_pct" => if let Ok(n) = v.parse::<u16>() { cfg.thrust_pct = n.clamp(60, 150); },
+                "weight_pct" => if let Ok(n) = v.parse::<u16>() { cfg.weight_pct = n.clamp(70, 150); },
+                "drag_pct" => if let Ok(n) = v.parse::<u16>() { cfg.drag_pct = n.clamp(50, 160); },
+                "grip_pct" => if let Ok(n) = v.parse::<u16>() { cfg.grip_pct = n.clamp(0, 160); },
+                "motor_pct" => if let Ok(n) = v.parse::<u16>() { cfg.motor_pct = n.clamp(60, 150); },
+                "thr_expo" => if let Ok(n) = v.parse::<u8>() { cfg.thr_expo = n.clamp(0, 60); },
+                "flight_mode" => cfg.flight_mode = match v {
+                    "horizon" => FlightMode::Horizon,
+                    "angle" => FlightMode::Angle,
+                    _ => FlightMode::Acro,
+                },
                 "rates" => cfg.rates = match v {
                     "soft" => RatesPreset::Soft,
                     "normal" => RatesPreset::Normal,
@@ -522,6 +671,7 @@ impl Config {
                     "wireframe" => VisualTheme::Wireframe,
                     _ => VisualTheme::Summer,
                 },
+                "ui_theme" => cfg.ui_theme = if v == "monokai" { UiTheme::Monokai } else { UiTheme::Classic },
                 "detail_high" => cfg.detail_high = v != "0",
                 "sky_detail" => cfg.sky_detail = v != "0",
                 "analog_filter" => cfg.analog_filter = v != "0",
@@ -573,8 +723,14 @@ impl Config {
             BatteryPack::Stock => "stock",
             BatteryPack::Off => "off",
         };
+        let pw = match self.prop_wash {
+            PropWashLevel::Off => "off",
+            PropWashLevel::Stock => "stock",
+            PropWashLevel::Max => "max",
+        };
         let fm = match self.flight_mode {
             FlightMode::Acro => "acro",
+            FlightMode::Horizon => "horizon",
             FlightMode::Angle => "angle",
         };
         let rates = match self.rates {
@@ -588,6 +744,10 @@ impl Config {
             VisualTheme::Evening => "evening",
             VisualTheme::Night => "night",
             VisualTheme::Wireframe => "wireframe",
+        };
+        let ui = match self.ui_theme {
+            UiTheme::Classic => "classic",
+            UiTheme::Monokai => "monokai",
         };
         let gm = match self.game_mode {
             GameMode::Race => "race",
@@ -603,8 +763,13 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
-            self.prop_wash as u8,
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nthrust_pct={}\nweight_pct={}\ndrag_pct={}\ngrip_pct={}\nmotor_pct={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nshow_sticks={}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            self.thrust_pct,
+            self.weight_pct,
+            self.drag_pct,
+            self.grip_pct,
+            self.motor_pct,
+            self.thr_expo,
             self.rate_center,
             self.rate_max,
             self.rate_expo,

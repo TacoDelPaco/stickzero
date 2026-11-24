@@ -16,24 +16,21 @@ StickTime-Pi runs `StickTime.lua` inside an embedded Lua 5.3 interpreter (design
 ## Features
 
 - **6-DOF FPV Flight Physics (240 Hz)**:
-  - **Betaflight Actual Rates** presets (`Soft`, `Normal`, `Fast`).
-  - **Flight Modes**: `ACRO` (full 3D flips/rolls/dives) and `ANGLE` (self-leveling).
-  - **4 Quad Classes**: `5" Racer`, `5" Freestyle`, `3" Toothpick`, `65mm Whoop`.
-  - Motor spool lag, quadratic aerodynamic drag, ground effect cushion, obstacle collisions, **Turtle Mode** (push roll/pitch when inverted on the ground to flip upright), and optional battery voltage sag simulation.
-- **4 Built-in 3D Tracks**:
-  - `Meadow Loop` — 8-gate sweeping oval.
-  - `Figure 8` — crossover speed track.
-  - `Dive Tower` — 28m central tower + vertical dive gate + underpass.
-  - `Bando` — concrete ruin with roof gaps and freestyle pillars.
-- **4 Visual Themes**: `Summer`, `Evening`, `Night` (glowing neon gates), and `Wireframe`.
-- **Betaflight-style OSD**: Outlined 5×7 font, lap timer & persistent best lap, gate progress, next-gate beacon + off-screen edge arrow, speed (KPH), altitude (M), cell voltage, FPS/frame-ms, and optional live dual-gimbal stick overlay.
-- **Bluetooth & USB-C Controller Support**:
-  - Hot-plugs standard Linux `evdev` controllers automatically every 1.5s.
-  - Works with **USB-C Host** (flip CardputerZero's left-side USB switch to **Host**) for EdgeTX/OpenTX USB Joysticks and USB gamepads.
-  - Works with **Bluetooth** for ExpressLRS BLE Joysticks, Xbox, PlayStation DualSense/DS4, Nintendo Switch Pro, and 8BitDo controllers.
-  - Supports **Mode 2 / Mode 1** and **RC Full-Range Throttle** vs **Gamepad Spring-Centered Throttle** (`Pad Center`, where center stick = hover!).
-  - Built-in **Controller Monitor** screen with live stick bars and dual gimbal preview.
-  - **CardputerZero Keyboard Fallback**: `W/S` throttle, `A/D` yaw, `Arrows` or `I/J/K/L` pitch/roll, `R` respawn, **Short `Esc`** pause/back, **Long `Esc` (0.7s)** clean exit to APPLaunch.
+  - **Flight Modes**: `ACRO` (full 3D flips/rolls/dives), `HORIZON` (self-leveling near center, full acro flips past 55%–85% stick), and `ANGLE` (self-leveling).
+  - **6 Quad Presets**: `Air75 II 75mm`, `Meteor75 Pro II`, `65mm Whoop`, `3" Toothpick`, `5" Freestyle`, `5" Racer`.
+  - **Drone Tuning Menu** (*The Zone*-style customization): **Battery Pack** (`Lava II 580mAh`, `Lava II 680mAh`, `Stock`, `Off`), **Prop Wash** (`Off` / `Stock` / `Max`), **Thrust** (60–150% with live TWR readout), **Weight** (70–150% with live AUW readout), **Air Drag** (50–160%), **Rotor Grip** (0–160%), **Motor Response** (60–150%), and **Throttle Expo** (0.00–0.60 around hover).
+  - **StickTime-calibrated Hover Aerodynamics**: Axial inflow climb damping & descent cushion, translational lift, in-plane rotor grip, realistic ground friction & yaw-while-grounded, solid 3D gate collisions, and grounded **Turtle Mode**.
+  - **Betaflight Actual Rates**: `Soft` (`100/480/0.20`), `Normal`, `Fast`, or fully customizable `Center Sens`, `Max Rate`, and `Rate Expo`.
+- **Per-Pixel 16-bit Z-Buffered 3D Engine & 4 Tracks**:
+  - `Meadow Loop`, `Figure 8`, `Dive Tower`, and `Bando` — solid 3D gate posts & beams that never clip or vanish.
+- **4 Flight Themes + 2 Menu UI Themes**:
+  - Flight: `Summer`, `Evening`, `Night`, and redesigned hidden-line neon `Wireframe` (dark occluded cyan/violet/magenta cross-braced walls vs glowing orange/yellow gates and emerald green ground grid).
+  - Menus: Toggleable **Classic** and **Monokai** UI themes in Settings.
+- **Authentic Betaflight OSD + Post-Flight Stats**: Clean flight timer, throttle %, mAh used, cell voltage, ELRS link quality, craft name, speed/altitude, toggleable `Debug OSD` (FPS/ms), optional NTSC/RF `Analog FX`, and Betaflight post-flight stats card on disarm or empty pack.
+- **Bluetooth & USB-C Controller Support (EdgeTX / ELRS / Gamepads)**:
+  - Hot-plugs standard Linux `evdev` controllers automatically every 1.5s, including **RadioMaster Pocket** (`RM Pocket`), EdgeTX USB Joysticks, ELRS BLE Joysticks, Xbox, PlayStation, Switch Pro, and 8BitDo.
+  - Built-in 4-step **Stick Calibration (`C`)** and 3-step **AUX Switch/Button Binder (`B`)** for **Arm/Disarm**, **3-pos Flight Mode (`ACRO`/`HORIZON`/`ANGLE`)**, and **Turtle Mode**.
+  - **Fn-free CardputerZero Keyboard Navigation**: `F/X/Z/C`, `;/./,//`, `WASD`, or Arrow keys in menus; `Tab` arm/disarm, `M` mode cycle, `T` turtle, `R` respawn, **Short `Esc`** pause/back, **Long `Esc` (0.7s)** clean exit to APPLaunch.
 
 ## Building & Packaging
 
@@ -54,8 +51,8 @@ bash ./package.sh
 ### Option A: One-line install directly on CardputerZero (over Wi-Fi)
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.2_arm64.deb \
-  && sudo dpkg -i stickzero_0.1.2_arm64.deb \
+curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stickzero_0.1.3_arm64.deb \
+  && sudo dpkg -i stickzero_0.1.3_arm64.deb \
   && systemctl --user restart APPLaunch.service
 ```
 
