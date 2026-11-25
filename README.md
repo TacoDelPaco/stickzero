@@ -67,16 +67,13 @@ curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stic
 
 ### Low-Latency Bluetooth Controller Setup (ELRS BLE & Gamepads)
 
-StickZero drains controller `evdev` events on a dedicated background thread (`poll()` + 64-event batch reads + `SYN_DROPPED` resync) so the app itself adds < 1 ms input latency. If you still see 1–2 s delay over Bluetooth on CardputerZero, it is caused by BLE packet backlog in the transmitter or BlueZ stack:
+StickZero drains controller `evdev` + sibling `/dev/hidraw*` packets on a dedicated zero-contention background thread (`poll()` + 256-event batch reads + lock-free `SYN_DROPPED` resync), automatically stops lingering `bluetoothctl` discovery scans when a BT controller connects, and recovers **ExpressLRS BLE CH8 (`SD` / AUX 4)** directly from `/dev/hidraw*` onto **`A7+`** (matching EdgeTX USB) when Linux's `hid-input` drops ExpressLRS's duplicate `Slider` (`0x36`) usage.
 
-1. **ExpressLRS BLE Joystick (RadioMaster Pocket, etc.)**: Before starting **BLE Joystick**, open `SYS → ExpressLRS` and lower **Packet Rate** to **`100Hz Full`** (or `50Hz`). Running 250–500 Hz floods BLE faster than the link can drain and builds up a multi-second queue.
-2. **Lower BlueZ's BLE connection interval** (default Linux BlueZ uses 30–50 ms ≈ 22 Hz; tighten to 7.5–11.25 ms ≈ 90–133 Hz):
-   ```bash
-   sudo sed -i 's/^#*MinConnectionInterval=.*/MinConnectionInterval=6/; s/^#*MaxConnectionInterval=.*/MaxConnectionInterval=9/; s/^#*ConnectionLatency=.*/ConnectionLatency=0/' /etc/bluetooth/main.conf \
-     && sudo systemctl restart bluetooth \
-     && bluetoothctl scan off
-   ```
-3. **2.4 GHz Wi-Fi / BT Coexistence**: CardputerZero's Pi CM0 shares one 2.4 GHz antenna for Wi-Fi and Bluetooth — turning Wi-Fi off while flying over BT (`sudo rfkill block wifi`) removes wireless stalls, or flip the USB switch to **Host** and use a USB-C cable for ~2 ms wired latency.
+Installing the `.deb` package automatically configures `/etc/udev/rules.d/70-stickzero-hidraw.rules` (for non-root `/dev/hidraw*` access) and tunes `/etc/bluetooth/main.conf` (`[LE]` `MinConnectionInterval=6`, `MaxConnectionInterval=9`, `ConnectionLatency=0`). For best wireless responsiveness:
+
+1. **ExpressLRS BLE Joystick (RadioMaster Pocket, etc.)**: Before starting **BLE Joystick**, open `SYS → ExpressLRS` and set **Packet Rate** to **`100Hz Full`** (or `50Hz`). Running 250–500 Hz floods BLE faster than the link can drain and causes intermittent lag spikes.
+2. **Reconnect once after updating `.deb`**: Power-cycle / reconnect your Bluetooth radio so BlueZ negotiates the tightened 7.5–11.25 ms connection interval.
+3. **2.4 GHz Wi-Fi / BT Coexistence**: CardputerZero's Pi CM0 shares one 2.4 GHz antenna for Wi-Fi and Bluetooth — periodic Wi-Fi background scans can cause random BT micro-stalls; turning Wi-Fi off while flying over BT (`sudo rfkill block wifi`) removes them completely, or flip the USB switch to **Host** for ~2 ms wired USB-C latency.
 
 ### Display Detection
 

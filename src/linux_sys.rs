@@ -26,7 +26,15 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_ABS: u16 = 0x03;
 
 // Linux evdev SYN codes
+pub const SYN_REPORT: u16 = 0;
 pub const SYN_DROPPED: u16 = 3;
+
+// Linux input bus types (linux/input.h)
+pub const BUS_USB: u16 = 0x03;
+pub const BUS_BLUETOOTH: u16 = 0x05;
+
+// Linux clock IDs for EVIOCSCLOCKID
+pub const CLOCK_MONOTONIC: i32 = 1;
 
 // Linux poll(2) event masks
 pub const POLLIN: i16 = 0x0001;
@@ -45,6 +53,7 @@ pub const ABS_THROTTLE: u16 = 0x06;
 pub const ABS_RUDDER: u16 = 0x07;
 pub const ABS_HAT0X: u16 = 0x10;
 pub const ABS_HAT0Y: u16 = 0x11;
+pub const ABS_MISC: u16 = 0x28;
 pub const ABS_MAX: usize = 0x3f;
 
 // Common evdev KEY codes (keyboard + gamepad buttons)
@@ -93,6 +102,14 @@ pub const BTN_MODE: u16 = 0x13c;
 pub const BTN_TRIGGER: u16 = 0x120; // Generic joystick button 0
 pub const BTN_THUMB: u16 = 0x121;   // Generic joystick button 1
 
+// Linux hidraw constants & ioctls (linux/hidraw.h)
+pub const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
+
+#[inline]
+pub const fn eviocgid() -> u64 {
+    (2u64 << 30) | (8u64 << 16) | ((b'E' as u64) << 8) | 0x02
+}
+
 #[inline]
 pub const fn eviocgname(len: usize) -> u64 {
     (2u64 << 30) | ((len as u64) << 16) | ((b'E' as u64) << 8) | 0x06
@@ -111,6 +128,21 @@ pub const fn eviocgbit(ev: u32, len: usize) -> u64 {
 #[inline]
 pub const fn eviocgabs(abs: u32) -> u64 {
     (2u64 << 30) | (24u64 << 16) | ((b'E' as u64) << 8) | (0x40 + abs as u64)
+}
+
+#[inline]
+pub const fn eviocsclockid() -> u64 {
+    (1u64 << 30) | (4u64 << 16) | ((b'E' as u64) << 8) | 0xa0
+}
+
+#[inline]
+pub const fn hidiocgrdescsize() -> u64 {
+    (2u64 << 30) | (4u64 << 16) | ((b'H' as u64) << 8) | 0x01
+}
+
+#[inline]
+pub const fn hidiocgrdesc() -> u64 {
+    (2u64 << 30) | ((4 + HID_MAX_DESCRIPTOR_SIZE as u64) << 16) | ((b'H' as u64) << 8) | 0x02
 }
 
 #[repr(C)]
@@ -200,6 +232,31 @@ pub struct InputAbsInfo {
     pub fuzz: i32,
     pub flat: i32,
     pub resolution: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct InputId {
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct HidrawReportDescriptor {
+    pub size: u32,
+    pub value: [u8; HID_MAX_DESCRIPTOR_SIZE],
+}
+
+impl Default for HidrawReportDescriptor {
+    fn default() -> Self {
+        Self {
+            size: 0,
+            value: [0u8; HID_MAX_DESCRIPTOR_SIZE],
+        }
+    }
 }
 
 #[repr(C)]

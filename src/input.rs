@@ -12,6 +12,7 @@
 //! - CardputerZero short-Esc / long-Esc exit semantics
 
 use crate::config::{AuxBinding, Config, FlightMode, StickMode, ThrottleMode};
+use crate::hidraw::{probe_hidraw_sidecar, HidrawSidecar};
 use crate::imu::ImuSensor;
 use crate::linux_sys::*;
 use crate::math::clampf;
@@ -19,6 +20,7 @@ use crate::physics::StickInput;
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -104,22 +106,28 @@ fn unpack_key_bitmap(key_bits: &[u8; MAX_KEY_CODE / 8], keys_down: &mut [u64; MA
     }
 }
 
-/// Resynchronize all axis values and button states directly from the kernel via
+/// Resynchronize all evdev axis values and button states directly from the kernel via
 /// `EVIOCGABS` and `EVIOCGKEY` (called on initial open and after any `SYN_DROPPED`).
+/// Skips axes sourced from a `/dev/hidraw*` sidecar (`hidraw_axis_mask`) so recovered
+/// channels like ELRS BLE CH8 (`ABS_RUDDER` / `A7+`) are never overwritten with zeros.
 fn resync_device_state(
     fd: i32,
     axes: &mut [AxisCal; ABS_MAX + 1],
     keys_down: &mut [u64; MAX_KEY_CODE / 64],
+    hidraw_axis_mask: u64,
 ) {
     for code in 0..=ABS_MAX {
+        if (hidraw_axis_mask & (1u64 << code)) != 0 {
+            continue;
+        }
         if axes[code].present {
             let mut info = InputAbsInfo::default();
-            if unsafe { ioctl(fd, eviocgabs(code as u32), &mut info) } >= 0 {
+            if unsafe { ioctl(fd, eviocgabs(code as u32), &mut info) } >= 0
+                && info.maximum > info.minimum
+            {
                 axes[code].value = info.value;
-                if info.maximum > info.minimum {
-                    axes[code].min = info.minimum;
-                    axes[code].max = info.maximum;
-                }
+                axes[code].min = info.minimum;
+                axes[code].max = info.maximum;
             }
         }
     }
@@ -127,6 +135,22 @@ fn resync_device_state(
     if unsafe { ioctl(fd, eviocgkey(key_bits.len()), key_bits.as_mut_ptr()) } >= 0 {
         unpack_key_bitmap(&key_bits, keys_down);
     }
+}
+
+/// Best-effort one-shot helper to stop lingering BlueZ discovery scans when a Bluetooth
+/// controller connects. On Raspberry Pi CM0 / CardputerZero's shared 2.4 GHz radio, an
+/// active BLE scan left on after pairing periodically stalls BLE HID packets for 100–500 ms.
+fn stop_bt_discovery_async() {
+    let _ = thread::Builder::new()
+        .name("bt-scan-off".to_string())
+        .spawn(|| {
+            let _ = Command::new("bluetoothctl")
+                .args(["scan", "off"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
 }
 
 struct GamepadLiveState {
@@ -140,24 +164,47 @@ struct GamepadLiveState {
     disconnected: bool,
 }
 
-/// Dedicated background evdev drain loop.
+/// Dedicated zero-contention background evdev + optional hidraw drain loop.
 ///
 /// Sits on `poll(2)` (0% CPU when idle, <0.1 ms wakeup when a Bluetooth/USB HID packet
-/// arrives) and drains up to 64 events per `read(2)` syscall so the kernel evdev ring
-/// buffer never overflows during 60 Hz rendering/fbdev blits. Automatically resyncs
-/// axes and buttons on `SYN_DROPPED` and detects clean Bluetooth disconnects.
-fn gamepad_reader_thread(fd: i32, shared: Arc<Mutex<GamepadLiveState>>, stop: Arc<AtomicBool>) {
-    let mut ev_buf = [InputEvent::default(); 64];
+/// arrives) and drains up to 256 evdev events per `read(2)` syscall plus any sibling
+/// `/dev/hidraw*` sidecar packets into thread-local state BEFORE acquiring the shared
+/// mutex once per wakeup. This guarantees:
+/// - The 60 Hz render thread never blocks waiting on `read(2)` or `ioctl(2)` syscalls.
+/// - Bursty BLE packets always collapse straight to the newest stick/switch sample.
+/// - `SYN_DROPPED` discards partial frames until `SYN_REPORT` and resyncs lock-free.
+/// - ExpressLRS BLE CH8 (duplicate `Slider` 0x36) stays live on `ABS_RUDDER` (`A7+`).
+fn gamepad_reader_thread(
+    fd: i32,
+    mut hidraw: Option<HidrawSidecar>,
+    mut local_axes: [AxisCal; ABS_MAX + 1],
+    mut local_keys_down: [u64; MAX_KEY_CODE / 64],
+    shared: Arc<Mutex<GamepadLiveState>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut ev_buf = [InputEvent::default(); 256];
     let ev_size = std::mem::size_of::<InputEvent>();
     let buf_bytes = ev_buf.len() * ev_size;
+    let mut raw_buf = [0u8; 64];
+
+    let mut local_pressed: Vec<u16> = Vec::with_capacity(16);
+    let mut dropping = false;
 
     while !stop.load(Ordering::Relaxed) {
-        let mut pfd = PollFd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        let pr = unsafe { poll(&mut pfd as *mut PollFd, 1, 15) };
+        let mut pfds = [
+            PollFd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: hidraw.as_ref().map(|h| h.fd).unwrap_or(-1),
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if hidraw.is_some() { 2 } else { 1 };
+        let pr = unsafe { poll(pfds.as_mut_ptr(), nfds, 15) };
         if pr < 0 {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if err == 4 {
@@ -172,89 +219,191 @@ fn gamepad_reader_thread(fd: i32, shared: Arc<Mutex<GamepadLiveState>>, stop: Ar
         if pr == 0 {
             continue;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 && (pfd.revents & POLLIN) == 0 {
+
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
+            && (pfds[0].revents & POLLIN) == 0
+        {
             if let Ok(mut st) = shared.lock() {
                 st.disconnected = true;
             }
             break;
         }
 
+        let hidraw_mask = hidraw.as_ref().map(|h| h.axis_mask).unwrap_or(0);
         let mut disconnected = false;
-        loop {
-            let n = unsafe { read(fd, ev_buf.as_mut_ptr() as *mut std::ffi::c_void, buf_bytes) };
-            if n > 0 {
-                let count = (n as usize) / ev_size;
-                if let Ok(mut guard) = shared.lock() {
-                    let st = &mut *guard;
+        let mut dirty = false;
+        let mut hat_up = false;
+        let mut hat_down = false;
+        let mut hat_left = false;
+        let mut hat_right = false;
+        local_pressed.clear();
+
+        // 1. Drain ALL queued evdev events into thread-local state (zero mutex contention!)
+        if (pfds[0].revents & POLLIN) != 0 {
+            loop {
+                let n =
+                    unsafe { read(fd, ev_buf.as_mut_ptr() as *mut std::ffi::c_void, buf_bytes) };
+                if n > 0 {
+                    let count = (n as usize) / ev_size;
                     for ev in &ev_buf[..count] {
-                        match ev.type_ {
-                            EV_SYN if ev.code == SYN_DROPPED => {
-                                resync_device_state(fd, &mut st.axes, &mut st.keys_down);
+                        if ev.type_ == EV_SYN && ev.code == SYN_DROPPED {
+                            dropping = true;
+                            continue;
+                        }
+                        if dropping {
+                            if ev.type_ == EV_SYN && ev.code == SYN_REPORT {
+                                dropping = false;
+                                resync_device_state(
+                                    fd,
+                                    &mut local_axes,
+                                    &mut local_keys_down,
+                                    hidraw_mask,
+                                );
+                                dirty = true;
                             }
+                            continue;
+                        }
+                        match ev.type_ {
                             EV_ABS => {
                                 let c = ev.code as usize;
-                                if c <= ABS_MAX {
-                                    st.axes[c].value = ev.value;
-                                    if !st.axes[c].present {
-                                        st.axes[c].present = true;
-                                        st.axes[c].min = -32768;
-                                        st.axes[c].max = 32767;
+                                if c <= ABS_MAX && (hidraw_mask & (1u64 << c)) == 0 {
+                                    local_axes[c].value = ev.value;
+                                    if !local_axes[c].present {
+                                        local_axes[c].present = true;
+                                        local_axes[c].min = -32768;
+                                        local_axes[c].max = 32767;
                                     }
+                                    dirty = true;
                                 }
                                 if ev.code == ABS_HAT0Y {
                                     if ev.value < 0 {
-                                        st.hat_up = true;
+                                        hat_up = true;
+                                        dirty = true;
                                     }
                                     if ev.value > 0 {
-                                        st.hat_down = true;
+                                        hat_down = true;
+                                        dirty = true;
                                     }
                                 } else if ev.code == ABS_HAT0X {
                                     if ev.value < 0 {
-                                        st.hat_left = true;
+                                        hat_left = true;
+                                        dirty = true;
                                     }
                                     if ev.value > 0 {
-                                        st.hat_right = true;
+                                        hat_right = true;
+                                        dirty = true;
                                     }
                                 }
                             }
                             EV_KEY => {
                                 let pressed = ev.value == 1;
                                 let held = ev.value != 0;
-                                set_key_bit(&mut st.keys_down, ev.code, held);
-                                if pressed && st.pressed_buttons.len() < 32 {
-                                    st.pressed_buttons.push(ev.code);
+                                set_key_bit(&mut local_keys_down, ev.code, held);
+                                if pressed && local_pressed.len() < 32 {
+                                    local_pressed.push(ev.code);
                                 }
+                                dirty = true;
                             }
                             _ => {}
                         }
                     }
-                }
-                if count < ev_buf.len() {
+                    if count < ev_buf.len() {
+                        break;
+                    }
+                } else if n == 0 {
+                    disconnected = true;
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if err == 11 || err == 4 {
+                        // EAGAIN / EINTR -> fully drained
+                        break;
+                    }
+                    // ENODEV (19), EIO (5), EBADF (9) -> device disconnected
+                    disconnected = true;
                     break;
                 }
-            } else if n == 0 {
-                disconnected = true;
-                break;
-            } else {
-                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if err == 11 || err == 4 {
-                    // EAGAIN / EINTR -> fully drained
-                    break;
+            }
+
+            if dropping && !disconnected {
+                dropping = false;
+                resync_device_state(fd, &mut local_axes, &mut local_keys_down, hidraw_mask);
+                dirty = true;
+            }
+        }
+
+        // 2. Drain ALL queued sibling /dev/hidraw* packets, keeping the very latest sample
+        if let Some(ref sidecar) = hidraw {
+            let mut drop_hidraw = false;
+            if (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
+                && (pfds[1].revents & POLLIN) == 0
+            {
+                drop_hidraw = true;
+            } else if (pfds[1].revents & POLLIN) != 0 {
+                loop {
+                    let n = unsafe {
+                        read(
+                            sidecar.fd,
+                            raw_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            raw_buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        let len = (n as usize).min(raw_buf.len());
+                        if sidecar.apply_report(&raw_buf[..len], &mut local_axes) {
+                            dirty = true;
+                        }
+                    } else if n == 0 {
+                        drop_hidraw = true;
+                        break;
+                    } else {
+                        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if err == 11 || err == 4 {
+                            // EAGAIN / EINTR -> fully drained
+                            break;
+                        }
+                        drop_hidraw = true;
+                        break;
+                    }
                 }
-                // ENODEV (19), EIO (5), EBADF (9) -> device disconnected
-                disconnected = true;
-                break;
+            }
+            if drop_hidraw {
+                if let Some(old) = hidraw.take() {
+                    unsafe { close(old.fd) };
+                }
+            }
+        }
+
+        // 3. Publish latest drained snapshot in a single sub-microsecond critical section
+        if dirty || disconnected {
+            if let Ok(mut st) = shared.lock() {
+                if dirty {
+                    st.axes = local_axes;
+                    st.keys_down = local_keys_down;
+                    for &code in &local_pressed {
+                        if st.pressed_buttons.len() < 32 {
+                            st.pressed_buttons.push(code);
+                        }
+                    }
+                    st.hat_up |= hat_up;
+                    st.hat_down |= hat_down;
+                    st.hat_left |= hat_left;
+                    st.hat_right |= hat_right;
+                }
+                if disconnected {
+                    st.disconnected = true;
+                }
             }
         }
 
         if disconnected {
-            if let Ok(mut st) = shared.lock() {
-                st.disconnected = true;
-            }
             break;
         }
     }
 
+    if let Some(sidecar) = hidraw {
+        unsafe { close(sidecar.fd) };
+    }
     unsafe { close(fd) };
 }
 
@@ -265,6 +414,8 @@ pub struct GamepadDevice {
     pub path: String,
     pub name: String,
     pub kind: ControllerKind,
+    #[allow(dead_code)]
+    pub bustype: u16,
     pub axes: [AxisCal; ABS_MAX + 1],
     /// Bitset of currently held EV_KEY button codes (0..768)
     pub keys_down: [u64; MAX_KEY_CODE / 64],
@@ -282,10 +433,35 @@ impl GamepadDevice {
         path: String,
         name: String,
         kind: ControllerKind,
+        bustype: u16,
         mut axes: [AxisCal; ABS_MAX + 1],
     ) -> Self {
+        // Request monotonic timestamps on evdev (best-effort; ignored on older kernels)
+        let clk = CLOCK_MONOTONIC;
+        let _ = unsafe { ioctl(fd, eviocsclockid(), &clk) };
+
+        // Probe sibling /dev/hidraw* to recover duplicate/dropped HID axes (e.g. ELRS BLE CH8 -> A7+)
+        let hidraw = probe_hidraw_sidecar(&path, &axes);
+        let hidraw_mask = if let Some(ref sidecar) = hidraw {
+            for ax in &sidecar.axes {
+                axes[ax.evdev_code] = AxisCal {
+                    present: true,
+                    min: ax.logical_min,
+                    max: ax.logical_max,
+                    value: ax.logical_min + (ax.logical_max - ax.logical_min) / 2,
+                };
+            }
+            sidecar.axis_mask
+        } else {
+            0
+        };
+
         let mut keys_down = [0u64; MAX_KEY_CODE / 64];
-        resync_device_state(fd, &mut axes, &mut keys_down);
+        resync_device_state(fd, &mut axes, &mut keys_down, hidraw_mask);
+
+        if bustype == BUS_BLUETOOTH {
+            stop_bt_discovery_async();
+        }
 
         let shared = Arc::new(Mutex::new(GamepadLiveState {
             axes,
@@ -300,7 +476,9 @@ impl GamepadDevice {
         let stop = Arc::new(AtomicBool::new(false));
         let bg_shared = Arc::clone(&shared);
         let bg_stop = Arc::clone(&stop);
-        let reader = thread::spawn(move || gamepad_reader_thread(fd, bg_shared, bg_stop));
+        let reader = thread::spawn(move || {
+            gamepad_reader_thread(fd, hidraw, axes, keys_down, bg_shared, bg_stop)
+        });
 
         Self {
             shared,
@@ -309,6 +487,7 @@ impl GamepadDevice {
             path,
             name,
             kind,
+            bustype,
             axes,
             keys_down,
             frame_btns_pressed: Vec::with_capacity(8),
@@ -822,16 +1001,28 @@ impl InputManager {
         let Some(ref gp) = self.gamepad else {
             return "No evdev ABS axes".to_string();
         };
-        let mut parts = Vec::new();
+        let mut active: Vec<(usize, f32)> = Vec::new();
         for code in 0..=ABS_MAX {
             if gp.axes[code].present && !is_hat_axis(code) {
-                let v = gp.axes[code].raw_norm();
-                parts.push(format!("{code}:{v:+.1}"));
-                if parts.len() >= 6 {
+                active.push((code, gp.axes[code].raw_norm()));
+                if active.len() >= 8 {
                     break;
                 }
             }
         }
+        let compact = active.len() > 6;
+        let mut parts: Vec<String> = active
+            .into_iter()
+            .map(|(code, v)| {
+                if compact {
+                    // Compact 1-digit format so all 8 RC axes (0..7) fit on the 320px display
+                    let rounded = v.round() as i32;
+                    format!("{code}:{rounded:+}")
+                } else {
+                    format!("{code}:{v:+.1}")
+                }
+            })
+            .collect();
         if let Some(b) = gp.last_btn_seen {
             parts.push(format!("B{b}"));
         }
@@ -875,6 +1066,7 @@ impl InputManager {
             path: String,
             name: String,
             kind: ControllerKind,
+            bustype: u16,
             axes: [AxisCal; ABS_MAX + 1],
         }
 
@@ -939,6 +1131,9 @@ impl InputManager {
                 }
 
                 if stick_axes >= 2 {
+                    let mut id = InputId::default();
+                    let _ = unsafe { ioctl(fd, eviocgid(), &mut id) };
+
                     let is_rc = lower.contains("edgetx")
                         || lower.contains("opentx")
                         || lower.contains("radiomaster")
@@ -968,6 +1163,7 @@ impl InputManager {
                         path,
                         name,
                         kind: if is_rc { ControllerKind::RcRadio } else { ControllerKind::Gamepad },
+                        bustype: id.bustype,
                         axes,
                     });
                     continue;
@@ -997,6 +1193,7 @@ impl InputManager {
                 chosen.path,
                 chosen.name,
                 chosen.kind,
+                chosen.bustype,
                 chosen.axes,
             ));
         } else if self.gamepad.is_none() && !self.imu.is_available() && !self.imu.is_lite {
@@ -1365,13 +1562,25 @@ impl InputManager {
         if gp.kind == ControllerKind::RcRadio {
             let rol = ABS_X as usize;
             let pit = ABS_Y as usize;
-            let thr = if has(ABS_THROTTLE) { ABS_THROTTLE as usize } else { ABS_Z as usize };
-            let yaw = if has(ABS_RUDDER) {
-                ABS_RUDDER as usize
-            } else if has(ABS_RX) {
-                ABS_RX as usize
+            // EdgeTX USB & ExpressLRS BLE expose CH1-CH4 on X/Y/Z/RX (or RZ) and use
+            // ABS_THROTTLE (6) / ABS_RUDDER (7) for CH7 (SC) and CH8 (SD / Crash Flip).
+            // Prefer Z & RX so CH7/CH8 AUX switches are never shadowed by stick_axes;
+            // fall back to ABS_THROTTLE / ABS_RUDDER only on legacy sim dongles lacking Z/RX.
+            let thr = if has(ABS_Z) {
+                ABS_Z as usize
+            } else if has(ABS_THROTTLE) {
+                ABS_THROTTLE as usize
             } else {
+                ABS_Z as usize
+            };
+            let yaw = if has(ABS_RX) {
+                ABS_RX as usize
+            } else if has(ABS_RZ) {
                 ABS_RZ as usize
+            } else if has(ABS_RUDDER) {
+                ABS_RUDDER as usize
+            } else {
+                ABS_RX as usize
             };
             return ([thr, yaw, pit, rol], [false, false, false, false]);
         }
@@ -1627,5 +1836,88 @@ mod tests {
         assert!(mgr.flight_sticks(&cfg).roll > 0.5, "M should roll right");
         assert!(!mgr.kb_mode_toggle, "M must roll right, not toggle flight mode");
         mgr.process_key_event(KEY_M, 0, false);
+    }
+
+    #[test]
+    fn test_rc_radio_aux_wizard_binds_a4_a5_and_recovered_a7_sd() {
+        let mut axes = [AxisCal::default(); ABS_MAX + 1];
+        for c in 0..=7 {
+            axes[c] = AxisCal {
+                present: true,
+                min: 0,
+                max: 32767,
+                value: if c >= 4 { 0 } else { 16384 }, // AUX switches resting LOW (-1.0)
+            };
+        }
+
+        let gp = GamepadDevice {
+            shared: Arc::new(Mutex::new(GamepadLiveState {
+                axes,
+                keys_down: [0u64; MAX_KEY_CODE / 64],
+                pressed_buttons: Vec::new(),
+                hat_up: false,
+                hat_down: false,
+                hat_left: false,
+                hat_right: false,
+                disconnected: false,
+            })),
+            stop: Arc::new(AtomicBool::new(true)),
+            reader: None,
+            path: "/dev/input/event99".to_string(),
+            name: "ExpressLRS Joystick".to_string(),
+            kind: ControllerKind::RcRadio,
+            bustype: BUS_BLUETOOTH,
+            axes,
+            keys_down: [0u64; MAX_KEY_CODE / 64],
+            frame_btns_pressed: Vec::new(),
+            frame_btn_pressed: None,
+            last_btn_seen: None,
+        };
+
+        // 1. Auto-axes on 8-ch ELRS/EdgeTX radio must pick CH1-4 (0..=3) and NEVER shadow CH7(6)/CH8(7)!
+        let (auto_codes, _) = InputManager::resolve_auto_axes(&gp);
+        assert_eq!(auto_codes, [ABS_Z as usize, ABS_RX as usize, ABS_Y as usize, ABS_X as usize]);
+        assert!(!auto_codes.contains(&(ABS_THROTTLE as usize)));
+        assert!(!auto_codes.contains(&(ABS_RUDDER as usize)));
+
+        let mut cfg = Config::default();
+        let mut mgr = InputManager::new();
+        mgr.gamepad = Some(gp);
+
+        // 2. Live diagnostics string must include axis 7 (SD) even with 8 active axes
+        let summary = mgr.raw_axes_summary();
+        assert!(summary.contains("7:-1"), "expected axis 7 in summary, got: {summary}");
+
+        // 3. AUX wizard binds SA (A4+), SB (A5+), and SD (A7+) cleanly!
+        mgr.start_aux_wizard(&cfg);
+        let past = Instant::now() - Duration::from_secs(1);
+
+        // Step 0: ARM -> flip axis 4 HIGH
+        mgr.aux_wiz.as_mut().unwrap().step_started = past;
+        mgr.gamepad.as_mut().unwrap().axes[4].value = 32767;
+        assert!(!mgr.update_aux_wizard(&mut cfg, false));
+        assert_eq!(cfg.aux_arm.short_label(), "A4+");
+
+        // Step 1: MODE -> flip axis 5 HIGH
+        mgr.aux_wiz.as_mut().unwrap().step_started = past;
+        mgr.gamepad.as_mut().unwrap().axes[5].value = 32767;
+        assert!(!mgr.update_aux_wizard(&mut cfg, false));
+        assert_eq!(cfg.aux_mode.short_label(), "A5+");
+
+        // Step 2: CRASH FLIP (SD / AUX 4) -> flip recovered axis 7 HIGH
+        mgr.aux_wiz.as_mut().unwrap().step_started = past;
+        mgr.gamepad.as_mut().unwrap().axes[7].value = 32767;
+        assert!(mgr.update_aux_wizard(&mut cfg, false));
+        assert_eq!(cfg.aux_turtle.short_label(), "A7+");
+
+        // 4. Live evaluation matches USB behavior identically
+        let aux = mgr.aux_inputs(&cfg);
+        assert!(aux.arm_aux_connected);
+        assert_eq!(aux.arm_switch, Some(true));
+        assert_eq!(aux.mode_switch, Some(FlightMode::Angle));
+        assert_eq!(aux.turtle_switch, Some(true));
+
+        mgr.gamepad.as_mut().unwrap().axes[7].value = 0;
+        assert_eq!(mgr.aux_inputs(&cfg).turtle_switch, Some(false));
     }
 }

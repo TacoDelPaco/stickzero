@@ -16,6 +16,7 @@ fi
 rm -rf "$STAGE"
 mkdir -p \
     "$STAGE/DEBIAN" \
+    "$STAGE/etc/udev/rules.d" \
     "$STAGE/usr/share/APPLaunch/applications" \
     "$STAGE/usr/share/APPLaunch/bin" \
     "$STAGE/usr/share/APPLaunch/share/images" \
@@ -27,6 +28,15 @@ chmod 755 "$STAGE/usr/share/APPLaunch/bin/stickzero"
 cp "$ICON" "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 chmod 644 "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 
+cat > "$STAGE/etc/udev/rules.d/70-stickzero-hidraw.rules" <<'EOF'
+# Allow StickZero (input group / active seat) to read Bluetooth & ELRS HID raw reports
+# so ExpressLRS BLE Joystick CH8 (duplicate Slider usage 0x36) is exposed as A7+ (SD).
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ELRS*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ExpressLRS*", GROUP="input", MODE="0660", TAG+="uaccess"
+EOF
+chmod 644 "$STAGE/etc/udev/rules.d/70-stickzero-hidraw.rules"
+
 cat > "$STAGE/usr/share/APPLaunch/applications/stickzero.desktop" <<'EOF'
 [Desktop Entry]
 Name=StickZero
@@ -36,6 +46,81 @@ Terminal=false
 Icon=share/images/stickzero_100.png
 Type=Application
 EOF
+
+cat > "$STAGE/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+
+# 1. Reload udev rules so /dev/hidraw* gets input-group read access immediately
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=hidraw >/dev/null 2>&1 || true
+fi
+
+# 2. Tune BlueZ [LE] connection parameters for low-latency BLE HID controllers (7.5-11.25ms, 0 latency)
+BT_CONF="/etc/bluetooth/main.conf"
+if [ -f "$BT_CONF" ] && command -v awk >/dev/null 2>&1; then
+    TMP_CONF="$(mktemp /tmp/stickzero-bt.XXXXXX)"
+    awk '
+    function flush_le() {
+        if (!s_min) print "MinConnectionInterval=6"
+        if (!s_max) print "MaxConnectionInterval=9"
+        if (!s_lat) print "ConnectionLatency=0"
+        if (!s_sup) print "ConnectionSupervisionTimeout=400"
+    }
+    BEGIN { in_le = 0; saw_le = 0; s_min = 0; s_max = 0; s_lat = 0; s_sup = 0 }
+    /^\[.*\]/ {
+        if (in_le) {
+            flush_le()
+            in_le = 0
+        }
+        if ($0 ~ /^\[LE\][[:space:]]*$/) {
+            in_le = 1
+            saw_le = 1
+        }
+        print
+        next
+    }
+    in_le && /^[[:space:]]*#?[[:space:]]*MinConnectionInterval[[:space:]]*=/ {
+        if (!s_min) { print "MinConnectionInterval=6"; s_min = 1 }
+        next
+    }
+    in_le && /^[[:space:]]*#?[[:space:]]*MaxConnectionInterval[[:space:]]*=/ {
+        if (!s_max) { print "MaxConnectionInterval=9"; s_max = 1 }
+        next
+    }
+    in_le && /^[[:space:]]*#?[[:space:]]*ConnectionLatency[[:space:]]*=/ {
+        if (!s_lat) { print "ConnectionLatency=0"; s_lat = 1 }
+        next
+    }
+    in_le && /^[[:space:]]*#?[[:space:]]*ConnectionSupervisionTimeout[[:space:]]*=/ {
+        if (!s_sup) { print "ConnectionSupervisionTimeout=400"; s_sup = 1 }
+        next
+    }
+    { print }
+    END {
+        if (in_le) {
+            flush_le()
+        } else if (!saw_le) {
+            print ""
+            print "[LE]"
+            flush_le()
+        }
+    }
+    ' "$BT_CONF" > "$TMP_CONF"
+
+    if ! cmp -s "$BT_CONF" "$TMP_CONF"; then
+        cat "$TMP_CONF" > "$BT_CONF"
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl try-restart bluetooth.service >/dev/null 2>&1 || true
+        fi
+    fi
+    rm -f "$TMP_CONF"
+fi
+
+exit 0
+EOF
+chmod 755 "$STAGE/DEBIAN/postinst"
 
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: ${PKG_NAME}

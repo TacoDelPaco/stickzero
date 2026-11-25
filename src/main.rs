@@ -7,6 +7,7 @@ mod audio;
 mod config;
 mod display;
 mod font;
+mod hidraw;
 mod imu;
 mod input;
 mod linux_sys;
