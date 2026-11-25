@@ -1668,7 +1668,17 @@ impl Renderer {
                 format!("{} | {}g {}", cfg.quad.craft_name(), cfg.weight_g, cfg.battery_pack.short_name()),
             ),
             ("THEME", format!("{} / {} deg", cfg.theme.name(), cfg.camera_tilt_deg)),
-            ("SETTINGS", format!("{} | Rates, Gfx, OSD", cfg.flight_mode.name())),
+            (
+                "SETTINGS",
+                format!(
+                    "{} | Rates, Gfx, OSD",
+                    if input.control_source() == FlightControlSource::ImuSimplified {
+                        "IMU EASY"
+                    } else {
+                        cfg.flight_mode.name()
+                    }
+                ),
+            ),
             ("CONTROLLER", input.controller_name().chars().take(24).collect()),
         ];
 
@@ -1805,11 +1815,16 @@ impl Renderer {
         }
     }
 
-    pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize) {
+    pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize, imu_mode: bool) {
         let ui = ui_colors(cfg.ui_theme);
+        let flight_mode_val = if imu_mode {
+            "IMU EASY (Locked)".to_string()
+        } else {
+            cfg.flight_mode.name().to_string()
+        };
         let rows: [(&str, String); 17] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
-            ("Flight Mode", cfg.flight_mode.name().to_string()),
+            ("Flight Mode", flight_mode_val),
             ("Rate Preset", cfg.rates.name().to_string()),
             ("Center Sens", format!("{} deg/s", cfg.rate_center)),
             ("Max Rate", format!("{} deg/s", cfg.rate_max)),
@@ -1841,12 +1856,25 @@ impl Renderer {
             let (k, ref v) = rows[i];
             let y = 27 + (slot as i32) * 16;
             let is_sel = i == selected;
+            let is_locked = imu_mode && i == 1;
             if is_sel {
                 self.fill_rect(6, y - 2, W - 12, 14, ui.sel_bg);
                 self.draw_rect(6, y - 2, W - 12, 14, ui.sel_border);
             }
-            let kcol = if is_sel { ui.sel_label } else { ui.label };
-            let vcol = if is_sel { ui.sel_val } else { ui.val };
+            let kcol = if is_locked {
+                ui.muted
+            } else if is_sel {
+                ui.sel_label
+            } else {
+                ui.label
+            };
+            let vcol = if is_locked {
+                ui.muted
+            } else if is_sel {
+                ui.sel_val
+            } else {
+                ui.val
+            };
             self.draw_text(12, y + 1, k, kcol, 1, false);
             self.draw_text(126, y + 1, v, vcol, 1, false);
         }

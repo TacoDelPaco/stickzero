@@ -164,17 +164,19 @@ impl QuadState {
     pub fn apply_aux(&mut self, aux: AuxInputs, input: StickInput, cfg: &mut Config) -> bool {
         let mut just_armed = false;
 
-        // 1. Flight Mode switch / toggle (Acro / Horizon / Angle)
-        if let Some(target) = aux.mode_switch {
-            if cfg.flight_mode != target {
-                cfg.flight_mode = target;
-                self.combo_text = target.name();
+        // 1. Flight Mode switch / toggle (Acro / Horizon / Angle) — disabled in IMU Simplified mode
+        if self.control_source != FlightControlSource::ImuSimplified {
+            if let Some(target) = aux.mode_switch {
+                if cfg.flight_mode != target {
+                    cfg.flight_mode = target;
+                    self.combo_text = target.name();
+                    self.combo_timer = 0.8;
+                }
+            } else if aux.mode_toggle {
+                cfg.flight_mode = cfg.flight_mode.next();
+                self.combo_text = cfg.flight_mode.name();
                 self.combo_timer = 0.8;
             }
-        } else if aux.mode_toggle {
-            cfg.flight_mode = cfg.flight_mode.next();
-            self.combo_text = cfg.flight_mode.name();
-            self.combo_timer = 0.8;
         }
 
         // 2. Turtle Mode switch / toggle
@@ -1679,12 +1681,12 @@ mod tests {
 
     #[test]
     fn test_sideways_wall_slide_and_gate_post_slide() {
-        // 1. Sideways hit into Bando right wall (x: 7.5..10.0, y: 0..12, z: 22..54)
+        // 1. Sideways hit into Bando right wall (x: 11.0..14.0, y: 0..12, z: 24..72)
         let bando = &TRACKS[3];
         let mut cfg = Config::default();
         cfg.flight_mode = FlightMode::Horizon;
         let mut q = QuadState::spawn(bando, &cfg);
-        q.pos = Vec3::new(6.9, 6.0, 35.0);
+        q.pos = Vec3::new(10.4, 6.0, 35.0);
         q.vel = Vec3::new(10.0, 0.0, 0.0);
         q.on_ground = false;
 
@@ -1705,7 +1707,7 @@ mod tests {
         for _ in 0..160 {
             q.step(roll_away, &mut cfg, bando);
         }
-        assert!(!q.wall_slide && q.pos.x < 5.8, "Rolling left should fly away from right wall, x={:.3}", q.pos.x);
+        assert!(!q.wall_slide && q.pos.x < 9.3, "Rolling left should fly away from right wall, x={:.3}", q.pos.x);
 
         // 2. Gate post hit (Meadow Gate 0 left post at x=-2.4, z=22.0, height=3.6)
         let meadow = &TRACKS[0];
@@ -1807,5 +1809,28 @@ mod tests {
             }
         }
         assert!(q.on_ground, "Holding descend should land cleanly on ground, y={:.2}", q.pos.y);
+    }
+
+    #[test]
+    fn test_imu_mode_disables_flight_mode_switching() {
+        let track = &TRACKS[0];
+        let mut cfg = Config::default();
+        cfg.flight_mode = FlightMode::Acro;
+        let mut q = QuadState::spawn(track, &cfg);
+        q.control_source = FlightControlSource::ImuSimplified;
+
+        let sticks = StickInput { throttle: 0.5, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        let aux_toggle = AuxInputs { mode_toggle: true, ..AuxInputs::default() };
+        q.apply_aux(aux_toggle, sticks, &mut cfg);
+        assert_eq!(cfg.flight_mode, FlightMode::Acro, "mode_toggle must be ignored in IMU mode");
+
+        let aux_switch = AuxInputs { mode_switch: Some(FlightMode::Angle), ..AuxInputs::default() };
+        q.apply_aux(aux_switch, sticks, &mut cfg);
+        assert_eq!(cfg.flight_mode, FlightMode::Acro, "mode_switch must be ignored in IMU mode");
+
+        // Switching back to Controller re-enables mode changes
+        q.control_source = FlightControlSource::Controller;
+        q.apply_aux(aux_switch, sticks, &mut cfg);
+        assert_eq!(cfg.flight_mode, FlightMode::Angle, "mode_switch should work in Controller mode");
     }
 }

@@ -171,103 +171,135 @@ pub struct Track {
 }
 
 // ---------------------------------------------------------------------------
-// Track 0: Meadow Loop (friendly sweeping race course)
+// Track 0: Meadow Loop (wide sweeping race course spanning the full meadow)
 // ---------------------------------------------------------------------------
 static MEADOW_GATES: [Gate; 8] = [
     Gate::box_gate(0.0, 0.0, 22.0, 0.0, 4.8, 3.6),
-    Gate::box_gate(16.0, 0.0, 46.0, 38.0, 4.8, 3.6),
-    Gate::box_gate(42.0, 2.0, 56.0, 90.0, 4.8, 3.6),
-    Gate::box_gate(62.0, 0.0, 36.0, 165.0, 4.8, 3.6),
-    Gate::box_gate(56.0, 0.0, 8.0, 200.0, 4.8, 3.6),
-    Gate::box_gate(36.0, 1.5, -14.0, 245.0, 4.8, 3.6),
-    Gate::box_gate(10.0, 0.0, -18.0, 285.0, 4.8, 3.6),
-    Gate::box_gate(-4.0, 0.0, 2.0, 345.0, 4.8, 3.6),
+    Gate::box_gate(32.0, 0.0, 82.0, 34.0, 4.8, 3.6),
+    Gate::box_gate(92.0, 2.5, 112.0, 88.0, 4.8, 3.6),
+    Gate::box_gate(128.0, 0.0, 62.0, 162.0, 4.8, 3.6),
+    Gate::box_gate(118.0, 0.0, -18.0, 198.0, 4.8, 3.6),
+    Gate::box_gate(68.0, 2.0, -82.0, 242.0, 4.8, 3.6),
+    Gate::box_gate(-18.0, 0.0, -78.0, 290.0, 4.8, 3.6),
+    Gate::box_gate(-48.0, 0.0, -18.0, 342.0, 4.8, 3.6),
 ];
 
-static MEADOW_STRUCTURES: [Structure; 4] = [
-    // Start tent / canopy posts
-    Structure::aabb(-10.0, 0.0, -2.0, -7.0, 3.2, 2.0, StructureColor::RedWhite),
+static MEADOW_STRUCTURES: [Structure; 8] = [
+    // Start tent / canopy
+    Structure::aabb(-16.0, 0.0, -4.0, -12.0, 3.5, 2.0, StructureColor::RedWhite),
     // Mid-field landmark pylon
-    Structure::aabb(28.0, 0.0, 20.0, 31.0, 14.0, 23.0, StructureColor::Concrete),
-    // Outer chicane barrier
-    Structure::aabb(50.0, 0.0, 22.0, 52.0, 6.0, 25.0, StructureColor::Wood),
-    // Backstretch tower
-    Structure::aabb(18.0, 0.0, -28.0, 21.0, 10.0, -25.0, StructureColor::Steel),
+    Structure::aabb(42.0, 0.0, 18.0, 46.0, 16.0, 22.0, StructureColor::Concrete),
+    // North meadow tower
+    Structure::aabb(56.0, 0.0, 124.0, 60.0, 18.0, 128.0, StructureColor::RedWhite),
+    // East chicane barrier
+    Structure::aabb(108.0, 0.0, 24.0, 111.0, 8.0, 29.0, StructureColor::Wood),
+    // Southeast perimeter mast
+    Structure::aabb(104.0, 0.0, -68.0, 108.0, 14.0, -64.0, StructureColor::Steel),
+    // South backstretch tower
+    Structure::aabb(22.0, 0.0, -108.0, 26.0, 13.0, -104.0, StructureColor::Steel),
+    // West meadow barn/wall
+    Structure::aabb(-82.0, 0.0, -42.0, -77.0, 9.0, -34.0, StructureColor::Wood),
+    // Northwest outer pylon
+    Structure::aabb(-74.0, 0.0, 68.0, -70.0, 15.0, 72.0, StructureColor::Concrete),
 ];
 
 // ---------------------------------------------------------------------------
-// Track 1: Figure 8 (fast crossover + elevated split-S gate)
+// Track 1: Figure 8 (wide fast crossover + elevated split-S gates)
 // ---------------------------------------------------------------------------
 static FIG8_GATES: [Gate; 8] = [
-    Gate::box_gate(0.0, 0.0, 20.0, 0.0, 4.6, 3.5),
-    Gate::box_gate(14.0, 2.0, 44.0, 35.0, 4.6, 3.5),
-    Gate::box_gate(38.0, 4.0, 46.0, 115.0, 4.6, 3.5),
-    Gate::box_gate(24.0, 1.0, 20.0, 215.0, 4.6, 3.5),
-    Gate::box_gate(-14.0, 0.0, -4.0, 225.0, 4.6, 3.5),
-    Gate::box_gate(-34.0, 3.0, 14.0, 315.0, 4.6, 3.5),
-    Gate::box_gate(-24.0, 5.5, 36.0, 35.0, 4.6, 3.5),
-    Gate::box_gate(-4.0, 0.0, 4.0, 15.0, 4.6, 3.5),
+    Gate::box_gate(0.0, 0.0, 24.0, 0.0, 4.6, 3.5),
+    Gate::box_gate(36.0, 2.5, 86.0, 35.0, 4.6, 3.5),
+    Gate::box_gate(108.0, 4.5, 92.0, 115.0, 4.6, 3.5),
+    Gate::box_gate(62.0, 1.5, 22.0, 215.0, 4.6, 3.5),
+    Gate::box_gate(-38.0, 0.0, -56.0, 225.0, 4.6, 3.5),
+    Gate::box_gate(-108.0, 3.5, 16.0, 315.0, 4.6, 3.5),
+    Gate::box_gate(-72.0, 6.0, 88.0, 35.0, 4.6, 3.5),
+    Gate::box_gate(-18.0, 0.0, -8.0, 15.0, 4.6, 3.5),
 ];
 
-static FIG8_STRUCTURES: [Structure; 4] = [
-    // Center crossover bridge pillars
-    Structure::aabb(8.0, 0.0, 16.0, 10.5, 11.0, 18.5, StructureColor::Steel),
-    Structure::aabb(-12.0, 0.0, 16.0, -9.5, 11.0, 18.5, StructureColor::Steel),
-    // High turn marker tower
-    Structure::aabb(46.0, 0.0, 48.0, 49.0, 16.0, 51.0, StructureColor::RedWhite),
-    Structure::aabb(-42.0, 0.0, 22.0, -39.0, 15.0, 25.0, StructureColor::RedWhite),
+static FIG8_STRUCTURES: [Structure; 8] = [
+    // Center crossover bridge pillars (wider spacing)
+    Structure::aabb(20.0, 0.0, 32.0, 23.0, 13.0, 35.0, StructureColor::Steel),
+    Structure::aabb(-24.0, 0.0, 32.0, -21.0, 13.0, 35.0, StructureColor::Steel),
+    // East lobe high turn marker tower
+    Structure::aabb(126.0, 0.0, 96.0, 130.0, 20.0, 100.0, StructureColor::RedWhite),
+    // West lobe high turn marker tower
+    Structure::aabb(-124.0, 0.0, 24.0, -120.0, 19.0, 28.0, StructureColor::RedWhite),
+    // South lobe outer pylon
+    Structure::aabb(-54.0, 0.0, -96.0, -50.0, 16.0, -92.0, StructureColor::Concrete),
+    // Southeast outer landmark
+    Structure::aabb(92.0, 0.0, -58.0, 96.0, 15.0, -54.0, StructureColor::Wood),
+    // North apex marker
+    Structure::aabb(6.0, 0.0, 126.0, 10.0, 17.0, 130.0, StructureColor::Concrete),
+    // Northwest outer pylon
+    Structure::aabb(-92.0, 0.0, 108.0, -88.0, 14.0, 112.0, StructureColor::Steel),
 ];
 
 // ---------------------------------------------------------------------------
-// Track 2: Dive Tower (28m central tower + vertical dive gate!)
+// Track 2: Dive Tower (28m central tower + wide perimeter dive & underpass)
 // ---------------------------------------------------------------------------
 static DIVE_GATES: [Gate; 7] = [
     Gate::box_gate(0.0, 0.0, 20.0, 0.0, 4.8, 3.8),
-    Gate::box_gate(0.0, 10.0, 40.0, 0.0, 5.2, 4.2),
-    Gate::dive_gate(0.0, 16.0, 54.0, 0.0, 6.5),
-    Gate::box_gate(16.0, 0.0, 54.0, 90.0, 4.8, 3.6),
-    Gate::box_gate(28.0, 0.0, 28.0, 175.0, 4.8, 3.6),
-    Gate::box_gate(14.0, 0.0, 0.0, 240.0, 4.8, 3.6),
-    Gate::box_gate(-6.0, 0.0, 6.0, 340.0, 4.8, 3.6),
+    Gate::box_gate(0.0, 12.0, 38.0, 0.0, 5.2, 4.2),
+    Gate::dive_gate(0.0, 16.0, 56.0, 0.0, 6.5),
+    Gate::box_gate(58.0, 0.0, 96.0, 82.0, 4.8, 3.6),
+    Gate::box_gate(104.0, 2.0, 18.0, 175.0, 4.8, 3.6),
+    Gate::box_gate(42.0, 0.0, -72.0, 240.0, 4.8, 3.6),
+    Gate::box_gate(-58.0, 1.5, -24.0, 335.0, 4.8, 3.6),
 ];
 
-static DIVE_STRUCTURES: [Structure; 5] = [
+static DIVE_STRUCTURES: [Structure; 9] = [
     // 26m Dive Tower core (sits cleanly beneath the crown)
     Structure::aabb(-3.0, 0.0, 44.0, 3.0, 26.0, 50.0, StructureColor::Concrete),
     // Tower top crown (sits cleanly on top of core at y=26.0)
     Structure::aabb(-4.5, 26.0, 42.5, 4.5, 28.5, 51.5, StructureColor::RedWhite),
-    // Side underpass pillars (sit cleanly beneath roof slab at y=7.5)
-    Structure::aabb(14.0, 0.0, 48.0, 16.0, 7.5, 50.0, StructureColor::Steel),
-    Structure::aabb(14.0, 0.0, 58.0, 16.0, 7.5, 60.0, StructureColor::Steel),
+    // Northeast underpass pillars (sit cleanly beneath roof slab at y=8.5)
+    Structure::aabb(54.0, 0.0, 88.0, 56.5, 8.5, 90.5, StructureColor::Steel),
+    Structure::aabb(54.0, 0.0, 102.0, 56.5, 8.5, 104.5, StructureColor::Steel),
     // Underpass roof slab (sits cleanly on top of pillars)
-    Structure::aabb(13.5, 7.5, 47.5, 16.5, 9.5, 60.5, StructureColor::Concrete),
+    Structure::aabb(53.5, 8.5, 87.5, 57.0, 10.5, 105.0, StructureColor::Concrete),
+    // East relay tower
+    Structure::aabb(118.0, 0.0, -24.0, 122.0, 22.0, -20.0, StructureColor::RedWhite),
+    // South perimeter monolith
+    Structure::aabb(12.0, 0.0, -104.0, 17.0, 18.0, -99.0, StructureColor::Concrete),
+    // West flank tower
+    Structure::aabb(-94.0, 0.0, 32.0, -89.0, 20.0, 37.0, StructureColor::Steel),
+    // Northwest outer pylon
+    Structure::aabb(-76.0, 0.0, 108.0, -72.0, 16.0, 112.0, StructureColor::Wood),
 ];
 
 // ---------------------------------------------------------------------------
-// Track 3: Bando Freestyle (concrete ruin, gaps, pillars, roof dive)
+// Track 3: Bando Freestyle (sprawling concrete ruin, gaps, pillars, towers)
 // ---------------------------------------------------------------------------
 static BANDO_GATES: [Gate; 6] = [
     Gate::box_gate(0.0, 0.0, 18.0, 0.0, 5.4, 4.2),
-    Gate::box_gate(0.0, 7.0, 42.0, 0.0, 5.4, 4.2),
-    Gate::dive_gate(18.0, 12.0, 44.0, 90.0, 6.5),
-    Gate::box_gate(18.0, 0.0, 24.0, 180.0, 5.4, 4.2),
-    Gate::box_gate(-16.0, 3.0, 26.0, 270.0, 5.4, 4.2),
-    Gate::box_gate(-14.0, 0.0, 6.0, 160.0, 5.4, 4.2),
+    Gate::box_gate(0.0, 7.5, 56.0, 0.0, 5.4, 4.2),
+    Gate::dive_gate(62.0, 14.0, 82.0, 90.0, 6.5),
+    Gate::box_gate(82.0, 0.0, -14.0, 180.0, 5.4, 4.2),
+    Gate::box_gate(-68.0, 3.5, 42.0, 270.0, 5.4, 4.2),
+    Gate::box_gate(-52.0, 0.0, -56.0, 155.0, 5.4, 4.2),
 ];
 
-static BANDO_STRUCTURES: [Structure; 8] = [
-    // Main bando hall left & right walls (y = 0..12.0)
-    Structure::aabb(-10.0, 0.0, 22.0, -7.5, 12.0, 54.0, StructureColor::Concrete),
-    Structure::aabb(7.5, 0.0, 22.0, 10.0, 12.0, 54.0, StructureColor::Concrete),
+static BANDO_STRUCTURES: [Structure; 12] = [
+    // Main bando hall left & right walls (y = 0..12.0, wider & longer)
+    Structure::aabb(-14.0, 0.0, 24.0, -11.0, 12.0, 72.0, StructureColor::Concrete),
+    Structure::aabb(11.0, 0.0, 24.0, 14.0, 12.0, 72.0, StructureColor::Concrete),
     // Roof beams resting cleanly on top of the hall walls (y = 12.0..14.0, huge powerloop gap in middle!)
-    Structure::aabb(-10.0, 12.0, 22.0, 10.0, 14.0, 28.0, StructureColor::Concrete),
-    Structure::aabb(-10.0, 12.0, 48.0, 10.0, 14.0, 54.0, StructureColor::Concrete),
-    // Smokestack tower
-    Structure::aabb(24.0, 0.0, 40.0, 28.5, 32.0, 44.5, StructureColor::Concrete),
-    // Exterior concrete pillars for slalom / trippy spins
-    Structure::aabb(-22.0, 0.0, 14.0, -19.5, 14.0, 16.5, StructureColor::Steel),
-    Structure::aabb(-22.0, 0.0, 34.0, -19.5, 14.0, 36.5, StructureColor::Steel),
-    Structure::aabb(18.0, 0.0, 12.0, 20.5, 12.0, 14.5, StructureColor::Wood),
+    Structure::aabb(-14.0, 12.0, 24.0, 14.0, 14.0, 31.0, StructureColor::Concrete),
+    Structure::aabb(-14.0, 12.0, 65.0, 14.0, 14.0, 72.0, StructureColor::Concrete),
+    // Northeast smokestack tower
+    Structure::aabb(72.0, 0.0, 76.0, 77.0, 34.0, 81.0, StructureColor::Concrete),
+    // West compound slalom pillars
+    Structure::aabb(-62.0, 0.0, 10.0, -59.0, 15.0, 13.0, StructureColor::Steel),
+    Structure::aabb(-82.0, 0.0, 66.0, -79.0, 16.0, 69.0, StructureColor::Steel),
+    // East yard concrete wall & tower
+    Structure::aabb(68.0, 0.0, -48.0, 72.0, 12.0, -24.0, StructureColor::Concrete),
+    Structure::aabb(108.0, 0.0, 18.0, 112.0, 22.0, 22.0, StructureColor::Wood),
+    // South ruin outpost
+    Structure::aabb(-26.0, 0.0, -92.0, -21.0, 14.0, -87.0, StructureColor::Concrete),
+    Structure::aabb(24.0, 0.0, -88.0, 28.0, 11.0, -84.0, StructureColor::Steel),
+    // Far north crane pylon
+    Structure::aabb(-24.0, 0.0, 118.0, -20.0, 20.0, 122.0, StructureColor::RedWhite),
 ];
 
 pub static TRACKS: [Track; 4] = [

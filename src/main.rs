@@ -179,7 +179,7 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     // 4. Monokai Settings showing UI Theme + Stick OSD: Trails
     cfg.flight_mode = FlightMode::Horizon;
     cfg.stick_overlay = StickOverlay::Trails;
-    renderer.render_settings_menu(&cfg, 10);
+    renderer.render_settings_menu(&cfg, 10, false);
     png::save_rgb565_png(&dir.join("monokai-settings.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 4. Clean zero-overlap Wireframe Bando + Trailing Sticks OSD
@@ -604,6 +604,7 @@ fn main() {
             }
             AppScreen::Settings => {
                 const NUM_SETTINGS: usize = 17;
+                let imu_mode = input.control_source() == FlightControlSource::ImuSimplified;
                 if act.back {
                     cfg.save();
                     screen = sub_return;
@@ -614,11 +615,13 @@ fn main() {
                         match settings_idx {
                             0 => cfg.game_mode = cfg.game_mode.toggle(),
                             1 => {
-                                cfg.flight_mode = if act.left {
-                                    cfg.flight_mode.prev()
-                                } else {
-                                    cfg.flight_mode.next()
-                                };
+                                if !imu_mode {
+                                    cfg.flight_mode = if act.left {
+                                        cfg.flight_mode.prev()
+                                    } else {
+                                        cfg.flight_mode.next()
+                                    };
+                                }
                             }
                             2 => {
                                 let next = cfg.rates.next_preset();
@@ -686,7 +689,7 @@ fn main() {
                         cfg.save();
                     }
                 }
-                renderer.render_settings_menu(&cfg, settings_idx);
+                renderer.render_settings_menu(&cfg, settings_idx, imu_mode);
             }
             AppScreen::Controller => {
                 if input.calib.is_some() {

@@ -8,7 +8,7 @@
 //! - Interactive 4-step "Detect Sticks" calibration wizard (`C`)
 //! - Interactive 3-step "Bind AUX Switches/Buttons" wizard (`B`) for Arm/Disarm, Flight Mode, and Turtle Mode
 //!   supporting BOTH EV_ABS switch channels (EdgeTX CH5-CH8) AND EV_KEY buttons!
-//! - Fn-free menu navigation (F/X/Z/C, ;/./,//, WASD, Arrows, Right-Stick)
+//! - Fn-free menu navigation (F/X/Z/C, Arrows, Right-Stick)
 //! - CardputerZero short-Esc / long-Esc exit semantics
 
 use crate::config::{AuxBinding, Config, FlightMode, StickMode, ThrottleMode};
@@ -1165,7 +1165,7 @@ impl InputManager {
     /// Process a single Linux evdev keyboard event.
     ///
     /// Flight keyboard mapping (Mode 2):
-    /// - Left Gimbal (Throttle / Yaw): CardputerZero arrow keys (`F`/`X`/`Z`/`C`, `Up`/`Down`/`Left`/`Right`, `;`/`.`/`,`/`/`, `W`/`S`/`A`/`D`)
+    /// - Left Gimbal (Throttle / Yaw): CardputerZero arrow keys (`F`/`X`/`Z`/`C`, `Up`/`Down`/`Left`/`Right`)
     /// - Right Gimbal (Pitch / Roll): `K` (pitch forward), `N` (pitch back), `B` (roll left), `M` (roll right)
     /// - Flight shortcuts: `Space` = zero IMU, `E` = cycle flight mode, `T` = turtle, `R` = respawn, `Tab` = arm/disarm
     fn process_key_event(&mut self, code: u16, val: i32, in_menu: bool) {
@@ -1193,14 +1193,6 @@ impl InputManager {
                 set_dir_bit(&mut self.kb_l_up, 1, held);
                 if pressed && in_menu { self.pending.up = true; }
             }
-            KEY_W => {
-                set_dir_bit(&mut self.kb_l_up, 2, held);
-                if pressed && in_menu { self.pending.up = true; }
-            }
-            KEY_SEMICOLON => {
-                set_dir_bit(&mut self.kb_l_up, 3, held);
-                if pressed && in_menu { self.pending.up = true; }
-            }
             // Left Gimbal Down (Throttle- / IMU Descend) + Menu Down
             KEY_X => {
                 set_dir_bit(&mut self.kb_l_down, 0, held);
@@ -1210,14 +1202,6 @@ impl InputManager {
                 set_dir_bit(&mut self.kb_l_down, 1, held);
                 if pressed && in_menu { self.pending.down = true; }
             }
-            KEY_S => {
-                set_dir_bit(&mut self.kb_l_down, 2, held);
-                if pressed && in_menu { self.pending.down = true; }
-            }
-            KEY_DOT => {
-                set_dir_bit(&mut self.kb_l_down, 3, held);
-                if pressed && in_menu { self.pending.down = true; }
-            }
             // Left Gimbal Left (Yaw Left) + Menu Left
             KEY_Z => {
                 set_dir_bit(&mut self.kb_l_left, 0, held);
@@ -1225,14 +1209,6 @@ impl InputManager {
             }
             KEY_LEFT => {
                 set_dir_bit(&mut self.kb_l_left, 1, held);
-                if pressed && in_menu { self.pending.left = true; }
-            }
-            KEY_A => {
-                set_dir_bit(&mut self.kb_l_left, 2, held);
-                if pressed && in_menu { self.pending.left = true; }
-            }
-            KEY_COMMA => {
-                set_dir_bit(&mut self.kb_l_left, 3, held);
                 if pressed && in_menu { self.pending.left = true; }
             }
             // Left Gimbal Right (Yaw Right) + Menu Right / Controller Calibrate
@@ -1245,14 +1221,6 @@ impl InputManager {
             }
             KEY_RIGHT => {
                 set_dir_bit(&mut self.kb_l_right, 1, held);
-                if pressed && in_menu { self.pending.right = true; }
-            }
-            KEY_D => {
-                set_dir_bit(&mut self.kb_l_right, 2, held);
-                if pressed && in_menu { self.pending.right = true; }
-            }
-            KEY_SLASH => {
-                set_dir_bit(&mut self.kb_l_right, 3, held);
                 if pressed && in_menu { self.pending.right = true; }
             }
             // Right Gimbal: K (Pitch Forward), N (Pitch Back), B (Roll Left), M (Roll Right)
