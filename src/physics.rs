@@ -4,7 +4,7 @@
 //! radio AUX Arm/Mode/Turtle support, solid gate & structure collisions, and post-flight stats.
 
 use crate::config::{AuxBinding, BatteryPack, Config, FlightMode, GameMode, PropWashLevel};
-use crate::input::AuxInputs;
+use crate::input::{AuxInputs, FlightControlSource};
 use crate::math::{clampf, Quat, Vec3};
 use crate::tracks::{GateKind, Track};
 
@@ -60,6 +60,11 @@ pub struct QuadState {
     pub horizon_smooth: f32,
     pub has_flown: bool,
     pub throttle_pct: u8,
+
+    // Active input mode (Controller vs CardputerZero IMU simplified flight)
+    pub control_source: FlightControlSource,
+    /// Vertical climb/descend command in IMU simplified mode (-1 descend, 0 auto-hover, +1 climb)
+    pub imu_climb_cmd: f32,
 
     // Battery & post-flight telemetry
     pub cell_voltage: f32,
@@ -119,6 +124,8 @@ impl QuadState {
             horizon_smooth: 1.0,
             has_flown: false,
             throttle_pct: 0,
+            control_source: FlightControlSource::Controller,
+            imu_climb_cmd: 0.0,
             cell_voltage: start_v,
             min_cell_voltage: start_v,
             mah_used: 0.0,
@@ -142,8 +149,10 @@ impl QuadState {
 
     pub fn respawn_at_start(&mut self, track: &Track, cfg: &Config) {
         let best_score = self.score;
+        let ctrl_src = self.control_source;
         *self = Self::spawn(track, cfg);
         self.score = best_score;
+        self.control_source = ctrl_src;
     }
 
     pub fn speed_kmh(&self) -> f32 {
@@ -505,22 +514,54 @@ impl QuadState {
 
         let stick_flip_mag = input.roll.abs().max(input.pitch.abs());
         let turtle_flipping = self.turtle_active && stick_flip_mag > 0.22 && up.y < 0.72;
+        let imu_simplified = self.control_source == FlightControlSource::ImuSimplified;
 
-        self.throttle_pct = if self.turtle_active {
-            0
-        } else {
-            (clampf(input.throttle, 0.0, 1.0) * 100.0).round() as u8
-        };
-
-        // 1. Betaflight throttle mid + expo + motor spool lag (Throttle 100% disabled during Crash Flip!)
-        let shaped_thr = Self::apply_throttle_expo(input.throttle, cfg.thr_mid, cfg.thr_expo);
+        // 1. Throttle control:
+        //    - Controller mode: Betaflight throttle mid + expo + motor spool lag
+        //    - IMU Simplified mode: Automatic hover-hold & smooth vertical velocity control
+        //      (stays grounded until Climb is pressed, auto-hovers when released, lands cleanly on Descend)
         let target_thr = if !self.armed || (self.battery_empty && batt_on) {
             0.0
         } else if self.turtle_active {
             if turtle_flipping { 0.35 * stick_flip_mag } else { 0.0 }
+        } else if imu_simplified {
+            let climb = clampf(self.imu_climb_cmd, -1.0, 1.0);
+            if self.on_ground && climb <= 0.05 {
+                0.0
+            } else if !self.on_ground && climb < -0.1 && self.pos.y <= QUAD_RADIUS + 0.30 && self.vel.y <= 0.25 {
+                0.0
+            } else {
+                let up_y_eff = up.y.clamp(0.55, 1.0);
+                let sag_est = if batt_on {
+                    (self.cell_voltage / 4.0).clamp(0.72, 1.05)
+                } else {
+                    1.0
+                };
+                let idle_a = params.idle_accel / mass_ratio;
+                let needed_curve = ((GRAVITY / (sag_est * up_y_eff) - idle_a).max(0.5) / max_accel).clamp(0.05, 0.90);
+                let hover_thr = needed_curve.powf(1.0 / 1.18);
+                let target_vy = if climb > 0.05 {
+                    3.2 * climb
+                } else if climb < -0.05 {
+                    2.8 * climb
+                } else {
+                    0.0
+                };
+                let vy_err = target_vy - self.vel.y;
+                clampf(hover_thr + vy_err * 0.085, 0.06, 0.92)
+            }
         } else {
-            shaped_thr
+            Self::apply_throttle_expo(input.throttle, cfg.thr_mid, cfg.thr_expo)
         };
+
+        self.throttle_pct = if self.turtle_active {
+            0
+        } else if imu_simplified {
+            (clampf(target_thr, 0.0, 1.0) * 100.0).round() as u8
+        } else {
+            (clampf(input.throttle, 0.0, 1.0) * 100.0).round() as u8
+        };
+
         let alpha = dt / (eff_motor_tau + dt);
         self.motor_thr += (target_thr - self.motor_thr) * alpha;
         if (!self.armed || (self.turtle_active && !turtle_flipping)) && self.motor_thr < 0.01 {
@@ -723,6 +764,39 @@ impl QuadState {
                 clampf(err_z * 6.0, -5.5, 5.5),
             );
             let rot_alpha = (14.0 * dt).min(1.0);
+            self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
+            self.rot = self.rot.integrate_body_omega(self.omega, dt);
+        } else if imu_simplified {
+            // Simplified CardputerZero IMU flight: always self-levels (capped at 38 deg total tilt
+            // via circular clamping) with smooth yaw so tilting the handheld never accidentally flips
+            // upside-down or loses hover authority on diagonal forward+bank turns.
+            let max_tilt = 38.0_f32.to_radians();
+            let mut px = clampf(input.pitch, -1.0, 1.0);
+            let mut rx = clampf(input.roll, -1.0, 1.0);
+            let mag = (px * px + rx * rx).sqrt();
+            if mag > 1.0 {
+                px /= mag;
+                rx /= mag;
+            }
+            let desired_pitch = px * max_tilt;
+            let desired_roll = rx * max_tilt;
+            let (cur_pitch, cur_roll) = if up.y >= 0.0 {
+                (
+                    clampf(-forward.y, -1.0, 1.0).asin(),
+                    clampf(-right.y, -1.0, 1.0).asin(),
+                )
+            } else {
+                let roll_sign = if right.y >= 0.0 { -1.0 } else { 1.0 };
+                (0.0, roll_sign * std::f32::consts::PI * 0.75)
+            };
+            let pitch_err = desired_pitch - cur_pitch;
+            let roll_err = desired_roll - cur_roll;
+            let target_omega = Vec3::new(
+                clampf(pitch_err * 8.0, -6.5, 6.5),
+                clampf(input.yaw, -1.0, 1.0) * 145.0_f32.to_radians(),
+                clampf(-roll_err * 8.0, -6.5, 6.5),
+            );
+            let rot_alpha = (18.0 * dt).min(1.0);
             self.omega = self.omega.add(target_omega.sub(self.omega).scale(rot_alpha));
             self.rot = self.rot.integrate_body_omega(self.omega, dt);
         } else {
@@ -1670,5 +1744,68 @@ mod tests {
         assert!(!q.wall_slide, "Landing on top of a flat roof should NOT trigger wall_slide");
         assert!(q.on_ground, "Drone should settle grounded on top of the flat roof");
         assert!((q.pos.y - (28.5 + QUAD_RADIUS)).abs() < 0.05, "Should rest on roof surface, y={:.3}", q.pos.y);
+    }
+
+    #[test]
+    fn test_imu_simplified_takeoff_hover_tilt_and_landing() {
+        let track = &TRACKS[0];
+        let mut cfg = Config::default();
+        cfg.flight_mode = FlightMode::Acro; // IMU simplified mode must still self-level even when global mode is Acro!
+        let mut q = QuadState::spawn(track, &cfg);
+        q.control_source = FlightControlSource::ImuSimplified;
+        let neutral = StickInput { throttle: 0.5, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+
+        // 1. Stays grounded until climb is pressed
+        q.imu_climb_cmd = 0.0;
+        for _ in 0..120 {
+            q.step(neutral, &mut cfg, track);
+        }
+        assert!(q.on_ground && q.throttle_pct == 0, "Should stay idle on pad until climb is pressed");
+
+        // 2. Press Climb -> lifts off cleanly
+        q.imu_climb_cmd = 1.0;
+        for _ in 0..240 {
+            q.step(neutral, &mut cfg, track);
+        }
+        assert!(!q.on_ground && q.pos.y > 2.0, "Should take off and climb, y={:.2}", q.pos.y);
+
+        // 3. Release Climb -> auto-hovers steadily with near-zero vertical drift
+        q.imu_climb_cmd = 0.0;
+        for _ in 0..240 {
+            q.step(neutral, &mut cfg, track);
+        }
+        let hover_y = q.pos.y;
+        for _ in 0..240 {
+            q.step(neutral, &mut cfg, track);
+        }
+        assert!((q.pos.y - hover_y).abs() < 0.35, "Auto-hover should hold altitude steadily ({hover_y:.2} -> {:.2})", q.pos.y);
+
+        // 4a. Straight forward tilt -> accelerates cleanly forward (+Z) while holding altitude
+        let tilt_fwd = StickInput { throttle: 0.5, yaw: 0.0, pitch: 1.0, roll: 0.0 };
+        let start_z = q.pos.z;
+        for _ in 0..240 {
+            q.step(tilt_fwd, &mut cfg, track);
+            let (_, up, _) = q.rot.basis();
+            assert!(up.y > 0.72, "Forward tilt must stay upright within 38 deg cap (up.y={:.2})", up.y);
+        }
+        assert!(q.pos.z > start_z + 2.0, "Forward tilt should fly forward, dz={:.2}", q.pos.z - start_z);
+
+        // 4b. Diagonal full forward + right tilt + coordinated yaw -> stays upright & carves right
+        let tilt_fwd_right = StickInput { throttle: 0.5, yaw: 0.6, pitch: 1.0, roll: 1.0 };
+        for _ in 0..240 {
+            q.step(tilt_fwd_right, &mut cfg, track);
+            let (_, up, _) = q.rot.basis();
+            assert!(up.y > 0.70, "Diagonal IMU tilt must stay upright within 38 deg cap (up.y={:.2})", up.y);
+        }
+
+        // 5. Hold Descend -> lands gently back on ground
+        q.imu_climb_cmd = -1.0;
+        for _ in 0..960 {
+            q.step(neutral, &mut cfg, track);
+            if q.on_ground {
+                break;
+            }
+        }
+        assert!(q.on_ground, "Holding descend should land cleanly on ground, y={:.2}", q.pos.y);
     }
 }

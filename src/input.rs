@@ -12,6 +12,7 @@
 //! - CardputerZero short-Esc / long-Esc exit semantics
 
 use crate::config::{AuxBinding, Config, FlightMode, StickMode, ThrottleMode};
+use crate::imu::ImuSensor;
 use crate::linux_sys::*;
 use crate::math::clampf;
 use crate::physics::StickInput;
@@ -55,9 +56,21 @@ impl AxisCal {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ControllerKind {
+    #[allow(dead_code)]
     None,
     RcRadio, // EdgeTX / OpenTX / ExpressLRS
     Gamepad, // Xbox / PS / Switch / 8BitDo / Generic
+}
+
+/// Active flight control source driving the quadcopter and OSD stick layout.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlightControlSource {
+    /// Physical USB-C or Bluetooth RC radio / gamepad.
+    Controller,
+    /// CardputerZero onboard BMI270 IMU simplified flight (no controller connected).
+    ImuSimplified,
+    /// Neither controller nor IMU detected (e.g. CardputerZero Lite without controller).
+    None,
 }
 
 const MAX_KEY_CODE: usize = 768; // Covers keyboard, BTN_JOYSTICK (0x120..), BTN_GAMEPAD (0x130..), BTN_TRIGGER_HAPPY (0x2c0..)
@@ -412,6 +425,7 @@ fn is_hat_axis(code: usize) -> bool {
 
 pub struct InputManager {
     pub gamepad: Option<GamepadDevice>,
+    pub imu: ImuSensor,
     keyboards: Vec<(i32, String)>,
     last_scan: Instant,
     device_skip_idx: usize,
@@ -424,6 +438,9 @@ pub struct InputManager {
     kb_s: bool,
     kb_a: bool,
     kb_d: bool,
+    kb_f: bool,
+    kb_x: bool,
+    kb_space: bool,
     kb_up: bool,
     kb_down: bool,
     kb_left: bool,
@@ -447,8 +464,10 @@ pub struct InputManager {
 
 impl InputManager {
     pub fn new() -> Self {
+        let imu = ImuSensor::probe_default();
         let mut mgr = Self {
             gamepad: None,
+            imu,
             keyboards: Vec::new(),
             last_scan: Instant::now() - Duration::from_secs(10),
             device_skip_idx: 0,
@@ -459,6 +478,9 @@ impl InputManager {
             kb_s: false,
             kb_a: false,
             kb_d: false,
+            kb_f: false,
+            kb_x: false,
+            kb_space: false,
             kb_up: false,
             kb_down: false,
             kb_left: false,
@@ -474,12 +496,61 @@ impl InputManager {
             stick_nav_latched_y: false,
         };
         mgr.scan_devices();
+        mgr.imu.set_active(mgr.gamepad.is_none());
         mgr
+    }
+
+    #[inline]
+    pub fn has_controller(&self) -> bool {
+        self.gamepad.is_some()
+    }
+
+    #[inline]
+    pub fn has_imu(&self) -> bool {
+        self.imu.is_available()
+    }
+
+    #[inline]
+    pub fn is_cardputer_lite(&self) -> bool {
+        self.imu.is_lite
+    }
+
+    #[inline]
+    pub fn control_source(&self) -> FlightControlSource {
+        if self.gamepad.is_some() {
+            FlightControlSource::Controller
+        } else if self.imu.is_available() {
+            FlightControlSource::ImuSimplified
+        } else {
+            FlightControlSource::None
+        }
+    }
+
+    /// True on launch when no controller is connected and no usable IMU is available
+    /// (or the device explicitly identifies as CardputerZero Lite).
+    #[inline]
+    pub fn needs_controller_warning(&self) -> bool {
+        self.gamepad.is_none() && (!self.imu.is_available() || self.imu.is_lite)
+    }
+
+    /// Capture current handheld pose as neutral level for IMU simplified flight.
+    pub fn recenter_imu(&mut self) {
+        self.imu.recenter();
+    }
+
+    /// Vertical climb/descend command in IMU simplified mode: `-1.0` descend, `0.0` auto-hover, `+1.0` climb.
+    #[inline]
+    pub fn imu_climb_cmd(&self) -> f32 {
+        let up = self.kb_w || self.kb_up || self.kb_f || self.kb_space;
+        let down = self.kb_s || self.kb_down || self.kb_x;
+        (up as i32 - down as i32) as f32
     }
 
     pub fn controller_name(&self) -> String {
         match &self.gamepad {
             Some(g) => Self::friendly_name(&g.name),
+            None if self.imu.is_available() => "CardputerZero IMU".to_string(),
+            None if self.imu.is_lite => "Controller Required!".to_string(),
             None => "No BT/USB Controller".to_string(),
         }
     }
@@ -511,6 +582,7 @@ impl InputManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn controller_kind(&self) -> ControllerKind {
         match &self.gamepad {
             Some(g) => g.kind,
@@ -996,6 +1068,13 @@ impl InputManager {
             self.aux_wiz = None;
         }
 
+        // 1b. Keep IMU background thread active only when no physical controller is connected.
+        let use_imu = self.gamepad.is_none();
+        self.imu.set_active(use_imu);
+        if use_imu {
+            self.imu.poll();
+        }
+
         // 2. Poll keyboards (batched reads)
         let mut kb_events: Vec<(u16, i32)> = Vec::new();
         let mut kb_buf = [InputEvent::default(); 32];
@@ -1067,7 +1146,11 @@ impl InputManager {
                     self.kb_d = held;
                     if pressed && in_menu { self.pending.right = true; }
                 }
-                KEY_ENTER | KEY_SPACE => {
+                KEY_ENTER => {
+                    if pressed { self.pending.select = true; }
+                }
+                KEY_SPACE => {
+                    self.kb_space = held;
                     if pressed { self.pending.select = true; }
                 }
                 KEY_BACKSPACE => {
@@ -1085,10 +1168,18 @@ impl InputManager {
                 KEY_T => {
                     if pressed && !in_menu { self.kb_turtle_toggle = true; }
                 }
-                KEY_F | KEY_SEMICOLON => {
+                KEY_F => {
+                    self.kb_f = held;
                     if pressed && in_menu { self.pending.up = true; }
                 }
-                KEY_X | KEY_DOT => {
+                KEY_SEMICOLON => {
+                    if pressed && in_menu { self.pending.up = true; }
+                }
+                KEY_X => {
+                    self.kb_x = held;
+                    if pressed && in_menu { self.pending.down = true; }
+                }
+                KEY_DOT => {
                     if pressed && in_menu { self.pending.down = true; }
                 }
                 KEY_Z | KEY_COMMA => {
@@ -1121,7 +1212,7 @@ impl InputManager {
             }
         }
 
-        // Keyboard throttle
+        // Keyboard throttle (used only in non-IMU keyboard fallback)
         if self.kb_w {
             self.kb_throttle = (self.kb_throttle + 1.1 * dt).min(1.0);
         } else if self.kb_s {
@@ -1329,6 +1420,22 @@ impl InputManager {
                 }
             };
             StickInput { throttle, yaw, pitch, roll }
+        } else if self.imu.is_available() {
+            // Simplified CardputerZero IMU flight:
+            // - Tilt forward/back -> Pitch, tilt left/right -> Roll
+            // - Coordinated bank-to-turn yaw from roll + optional manual A/D or Left/Right yaw
+            // - Vertical climb/hover/descend via W/S (or F/X, Up/Down, Space); QuadState applies auto-hover
+            let (roll, pitch) = self.imu.tilt_sticks();
+            let manual_yaw =
+                ((self.kb_d || self.kb_right) as i32 - (self.kb_a || self.kb_left) as i32) as f32 * 0.80;
+            let yaw = clampf(manual_yaw + roll * 0.60, -1.0, 1.0);
+            let throttle = clampf(0.5 + 0.5 * self.imu_climb_cmd(), 0.0, 1.0);
+            StickInput {
+                throttle,
+                yaw,
+                pitch,
+                roll,
+            }
         } else {
             let yaw = (self.kb_d as i32 - self.kb_a as i32) as f32 * 0.75;
             let pitch = (self.kb_up as i32 - self.kb_down as i32) as f32 * 0.75;
@@ -1382,5 +1489,59 @@ mod tests {
             (unpacked[BTN_TRIGGER as usize / 64] & (1u64 << (BTN_TRIGGER as usize % 64))),
             0
         );
+    }
+
+    #[test]
+    fn test_control_source_and_launch_warning_logic() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("stickzero_input_imu_{nanos}"));
+        let dev = root.join("iio:device0");
+        fs::create_dir_all(&dev).unwrap();
+        fs::write(dev.join("name"), "bmi270\n").unwrap();
+        fs::write(dev.join("in_accel_scale"), "0.001\n").unwrap();
+        fs::write(dev.join("in_accel_x_raw"), "0\n").unwrap();
+        fs::write(dev.join("in_accel_y_raw"), "0\n").unwrap();
+        fs::write(dev.join("in_accel_z_raw"), "9810\n").unwrap();
+
+        let cfg = Config::default();
+
+        // 1. No controller + BMI270 IMU present -> ImuSimplified, no launch warning
+        let mut mgr = InputManager::new();
+        mgr.gamepad = None;
+        mgr.imu = ImuSensor::probe_from_root(&root, false);
+        assert_eq!(mgr.control_source(), FlightControlSource::ImuSimplified);
+        assert!(!mgr.needs_controller_warning());
+        assert_eq!(mgr.controller_name(), "CardputerZero IMU");
+
+        // Simulate banking right + climb key pressed
+        mgr.imu.latest.roll_rad = 20.0_f32.to_radians();
+        mgr.kb_w = true;
+        let sticks = mgr.flight_sticks(&cfg);
+        assert!(sticks.roll > 0.45, "roll={}", sticks.roll);
+        assert!(sticks.yaw > 0.25, "coordinated bank-to-turn yaw={}", sticks.yaw);
+        assert_eq!(mgr.imu_climb_cmd(), 1.0);
+        assert_eq!(sticks.throttle, 1.0);
+
+        // 2. No controller + CardputerZero Lite -> None, launch warning required
+        mgr.imu = ImuSensor::probe_from_root(&root, true);
+        assert_eq!(mgr.control_source(), FlightControlSource::None);
+        assert!(mgr.needs_controller_warning());
+        assert!(mgr.is_cardputer_lite());
+
+        // 3. No controller + no IMU -> None, launch warning required
+        let empty = root.join("empty_iio");
+        fs::create_dir_all(&empty).unwrap();
+        mgr.imu = ImuSensor::probe_from_root(&empty, false);
+        assert_eq!(mgr.control_source(), FlightControlSource::None);
+        assert!(mgr.needs_controller_warning());
+        assert!(!mgr.is_cardputer_lite());
+
+        drop(mgr);
+        let _ = fs::remove_dir_all(&root);
     }
 }
