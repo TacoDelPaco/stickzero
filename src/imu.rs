@@ -2,7 +2,7 @@
 //!
 //! Hardware facts verified on M5Stack CardputerZero:
 //! - Full CardputerZero carries a Bosch BMI270 6-axis IMU exposed via Linux IIO sysfs
-//!   (`/sys/bus/iio/devices/iio:device*`, typically `name = "bmi270"`).
+//!   (`/sys/bus/iio/devices/iio:device*`, typically `iio:device0`, `name = "bmi270"`).
 //! - CardputerZero Lite omits the BMI270 IMU (and IMX219 camera).
 //! - BMI270 raw axes in device body frame:
 //!     +raw_x -> bottom edge (keyboard side)
@@ -13,13 +13,12 @@
 //!     screen_y = -raw_x  (up / top edge)
 //!     screen_z = +raw_z  (out of screen; +9.81 m/s^2 when lying flat face-up)
 //!
-//! Reads happen on a dedicated background thread via `pread(2)` at offset 0 so the 60 Hz
-//! render/physics loop never blocks on I2C transactions. When an external USB-C/BT controller
-//! is connected, the thread drops to idle sleep (~0% CPU).
+//! Each sample opens and reads the IIO sysfs attributes fresh on a dedicated background
+//! thread (matching CardputerZero Compass / zeroSDR / ZeroSky) so Linux `kernfs` always
+//! triggers a fresh hardware I2C sample while keeping the 60 Hz render loop non-blocking.
 
 use crate::math::clampf;
-use std::fs::{self, File};
-use std::os::unix::fs::FileExt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,20 +29,22 @@ use std::time::Duration;
 const TILT_DEADZONE_DEG: f32 = 3.0;
 /// Tilt angle beyond neutral (degrees) producing full 1.0 stick deflection.
 const TILT_FULL_DEG: f32 = 28.0;
-/// Exponential smoothing factor for accelerometer vector at ~80 Hz polling.
-const ACCEL_LPF_ALPHA: f32 = 0.28;
-/// Consecutive read failures before marking the IMU stream unavailable.
+/// Exponential smoothing factor for accelerometer vector at ~60 Hz polling.
+const ACCEL_LPF_ALPHA: f32 = 0.30;
+/// Consecutive read failures before temporarily flagging the IMU stream invalid.
 const MAX_READ_FAILURES: u32 = 40;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ImuSample {
-    /// Filtered screen-frame acceleration (m/s^2): +x right, +y top edge, +z out of screen.
+    /// Filtered screen-frame acceleration (m/s^2 or scaled units): +x right, +y top edge, +z out of screen.
     pub accel: [f32; 3],
     /// Pitch angle in radians (top edge UP is positive; flat face-up is 0).
     pub pitch_rad: f32,
     /// Roll angle in radians (right edge DOWN is positive; flat face-up is 0).
     pub roll_rad: f32,
-    /// True once at least one valid sample has been read and sensor is healthy.
+    /// True once a non-zero gravity vector has been observed.
+    pub has_gravity: bool,
+    /// True while the IIO device is healthy and readable.
     pub valid: bool,
 }
 
@@ -52,7 +53,9 @@ struct DiscoveredImu {
     dir: PathBuf,
     name: String,
     accel_scale: f32,
+    accel_offset: [f32; 3],
     initial_accel: [f32; 3],
+    has_gravity: bool,
 }
 
 /// Map raw BMI270 sensor coordinates `(raw_x, raw_y, raw_z)` to CardputerZero screen frame:
@@ -106,16 +109,39 @@ fn read_f32_file(path: &Path) -> Option<f32> {
     if v.is_finite() { Some(v) } else { None }
 }
 
-/// Refresh-read a single signed/float sysfs value at offset 0 using `pread(2)`.
-fn pread_f32(file: &File) -> Option<f32> {
-    let mut buf = [0u8; 48];
-    let n = file.read_at(&mut buf, 0).ok()?;
-    if n == 0 {
-        return None;
+fn read_accel_offsets(dir: &Path) -> [f32; 3] {
+    let global = read_f32_file(&dir.join("in_accel_offset")).unwrap_or(0.0);
+    [
+        read_f32_file(&dir.join("in_accel_x_offset")).unwrap_or(global),
+        read_f32_file(&dir.join("in_accel_y_offset")).unwrap_or(global),
+        read_f32_file(&dir.join("in_accel_z_offset")).unwrap_or(global),
+    ]
+}
+
+fn read_accel_scale(dir: &Path) -> f32 {
+    if let Some(s) = read_f32_file(&dir.join("in_accel_scale")) {
+        if s > 0.0 {
+            return s;
+        }
     }
-    let s = std::str::from_utf8(&buf[..n]).ok()?.trim();
-    let v = s.parse::<f32>().ok()?;
-    if v.is_finite() { Some(v) } else { None }
+    if let Some(s) = read_f32_file(&dir.join("in_accel_x_scale")) {
+        if s > 0.0 {
+            return s;
+        }
+    }
+    // Tilt angles via atan2 are scale-invariant as long as all 3 axes share units.
+    1.0
+}
+
+fn read_scaled_accel(dir: &Path, scale: f32, offset: [f32; 3]) -> Option<[f32; 3]> {
+    let rx = read_f32_file(&dir.join("in_accel_x_raw"))?;
+    let ry = read_f32_file(&dir.join("in_accel_y_raw"))?;
+    let rz = read_f32_file(&dir.join("in_accel_z_raw"))?;
+    Some([
+        (rx + offset[0]) * scale,
+        (ry + offset[1]) * scale,
+        (rz + offset[2]) * scale,
+    ])
 }
 
 /// Detect whether the device explicitly identifies itself as CardputerZero Lite.
@@ -145,36 +171,65 @@ pub fn detect_cardputer_lite() -> bool {
 }
 
 fn try_probe_iio_dir(dir: &Path, require_known_imu: bool) -> Option<DiscoveredImu> {
+    if !dir.join("in_accel_x_raw").exists()
+        || !dir.join("in_accel_y_raw").exists()
+        || !dir.join("in_accel_z_raw").exists()
+    {
+        return None;
+    }
+
     let name = read_text_trimmed(&dir.join("name")).unwrap_or_default();
     let lower = name.to_ascii_lowercase();
+    if lower.contains("magn") || lower.contains("bmm150") {
+        return None;
+    }
+
     let is_bmi270 = lower.contains("bmi270");
     let has_gyro = dir.join("in_anglvel_x_raw").exists();
     let is_known_imu = is_bmi270
         || lower.contains("imu")
+        || lower.contains("accel")
         || lower.contains("mpu")
-        || lower.contains("lsm6")
+        || lower.contains("lsm")
         || lower.contains("icm")
-        || lower.contains("bmi160")
+        || lower.contains("bmi")
         || has_gyro;
 
     if require_known_imu && !is_known_imu {
         return None;
     }
 
-    let accel_scale = read_f32_file(&dir.join("in_accel_scale"))?;
-    if accel_scale <= 0.0 {
-        return None;
+    let accel_scale = read_accel_scale(dir);
+    let accel_offset = read_accel_offsets(dir);
+
+    // BMI270 uses Linux runtime PM: the very first read after idle may wake the sensor and
+    // briefly return (0, 0, 0) while the first sample settles. Retry briefly before proceeding.
+    let mut initial_raw = read_scaled_accel(dir, accel_scale, accel_offset)?;
+    let mut norm_sq = initial_raw[0] * initial_raw[0]
+        + initial_raw[1] * initial_raw[1]
+        + initial_raw[2] * initial_raw[2];
+
+    if norm_sq < 1e-4 {
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(15));
+            if let Some(next_raw) = read_scaled_accel(dir, accel_scale, accel_offset) {
+                initial_raw = next_raw;
+                norm_sq = initial_raw[0] * initial_raw[0]
+                    + initial_raw[1] * initial_raw[1]
+                    + initial_raw[2] * initial_raw[2];
+                if norm_sq >= 1e-4 {
+                    break;
+                }
+            }
+        }
     }
 
-    let rx = read_f32_file(&dir.join("in_accel_x_raw"))?;
-    let ry = read_f32_file(&dir.join("in_accel_y_raw"))?;
-    let rz = read_f32_file(&dir.join("in_accel_z_raw"))?;
-    let raw = [rx * accel_scale, ry * accel_scale, rz * accel_scale];
-    let norm_sq = raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2];
-    // Real accelerometer under Earth gravity reads ~9.81 m/s^2; reject dead zeroed nodes.
-    if !norm_sq.is_finite() || norm_sq < 0.25 {
-        return None;
-    }
+    let has_gravity = norm_sq.is_finite() && norm_sq >= 1e-4;
+    let initial_accel = if has_gravity {
+        map_bmi270_to_screen(initial_raw)
+    } else {
+        [0.0, 0.0, 9.81]
+    };
 
     let display_name = if name.is_empty() {
         dir.file_name()
@@ -188,7 +243,9 @@ fn try_probe_iio_dir(dir: &Path, require_known_imu: bool) -> Option<DiscoveredIm
         dir: dir.to_path_buf(),
         name: display_name,
         accel_scale,
-        initial_accel: map_bmi270_to_screen(raw),
+        accel_offset,
+        initial_accel,
+        has_gravity,
     })
 }
 
@@ -200,6 +257,17 @@ fn discover_imu_in_root(root: &Path) -> Option<DiscoveredImu> {
         }
     }
 
+    // Fast path: CardputerZero standard BMI270 path `/sys/bus/iio/devices/iio:device0`.
+    let preferred = root.join("iio:device0");
+    if let Some(name) = read_text_trimmed(&preferred.join("name")) {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("bmi270") && !lower.contains("magn") {
+            if let Some(found) = try_probe_iio_dir(&preferred, false) {
+                return Some(found);
+            }
+        }
+    }
+
     let entries = fs::read_dir(root).ok()?;
     let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     dirs.sort();
@@ -207,7 +275,8 @@ fn discover_imu_in_root(root: &Path) -> Option<DiscoveredImu> {
     // Pass 1: Strongly prefer BMI270 (CardputerZero onboard IMU).
     for dir in &dirs {
         if let Some(name) = read_text_trimmed(&dir.join("name")) {
-            if name.to_ascii_lowercase().contains("bmi270") {
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("bmi270") && !lower.contains("magn") {
                 if let Some(found) = try_probe_iio_dir(dir, false) {
                     return Some(found);
                 }
@@ -215,9 +284,16 @@ fn discover_imu_in_root(root: &Path) -> Option<DiscoveredImu> {
         }
     }
 
-    // Pass 2: Fallback to any readable 6-axis IMU node under IIO root.
+    // Pass 2: Any readable known IMU / 6-axis accel+gyro node under IIO root.
     for dir in &dirs {
         if let Some(found) = try_probe_iio_dir(dir, true) {
+            return Some(found);
+        }
+    }
+
+    // Pass 3: Any readable 3-axis accelerometer IIO node.
+    for dir in &dirs {
+        if let Some(found) = try_probe_iio_dir(dir, false) {
             return Some(found);
         }
     }
@@ -228,30 +304,13 @@ fn discover_imu_in_root(root: &Path) -> Option<DiscoveredImu> {
 fn imu_reader_thread(
     dir: PathBuf,
     scale: f32,
+    offset: [f32; 3],
     shared: Arc<Mutex<ImuSample>>,
     active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
-    let Ok(fx) = File::open(dir.join("in_accel_x_raw")) else {
-        if let Ok(mut st) = shared.lock() {
-            st.valid = false;
-        }
-        return;
-    };
-    let Ok(fy) = File::open(dir.join("in_accel_y_raw")) else {
-        if let Ok(mut st) = shared.lock() {
-            st.valid = false;
-        }
-        return;
-    };
-    let Ok(fz) = File::open(dir.join("in_accel_z_raw")) else {
-        if let Ok(mut st) = shared.lock() {
-            st.valid = false;
-        }
-        return;
-    };
-
     let mut filtered = shared.lock().map(|s| s.accel).unwrap_or([0.0, 0.0, 9.81]);
+    let mut has_gravity = shared.lock().map(|s| s.has_gravity).unwrap_or(false);
     let mut failures = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
@@ -260,22 +319,30 @@ fn imu_reader_thread(
             continue;
         }
 
-        if let (Some(rx), Some(ry), Some(rz)) = (pread_f32(&fx), pread_f32(&fy), pread_f32(&fz)) {
-            let screen = map_bmi270_to_screen([rx * scale, ry * scale, rz * scale]);
+        // Open & read sysfs attributes fresh each tick so Linux kernfs always triggers an I2C read.
+        if let Some(raw) = read_scaled_accel(&dir, scale, offset) {
+            let screen = map_bmi270_to_screen(raw);
             let norm_sq = screen[0] * screen[0] + screen[1] * screen[1] + screen[2] * screen[2];
-            if norm_sq.is_finite() && norm_sq >= 0.25 {
+            if norm_sq.is_finite() && norm_sq >= 1e-4 {
                 failures = 0;
-                filtered[0] += (screen[0] - filtered[0]) * ACCEL_LPF_ALPHA;
-                filtered[1] += (screen[1] - filtered[1]) * ACCEL_LPF_ALPHA;
-                filtered[2] += (screen[2] - filtered[2]) * ACCEL_LPF_ALPHA;
+                if !has_gravity {
+                    filtered = screen;
+                    has_gravity = true;
+                } else {
+                    filtered[0] += (screen[0] - filtered[0]) * ACCEL_LPF_ALPHA;
+                    filtered[1] += (screen[1] - filtered[1]) * ACCEL_LPF_ALPHA;
+                    filtered[2] += (screen[2] - filtered[2]) * ACCEL_LPF_ALPHA;
+                }
                 let (pitch_rad, roll_rad) = screen_accel_to_angles(filtered);
                 if let Ok(mut st) = shared.lock() {
                     st.accel = filtered;
                     st.pitch_rad = pitch_rad;
                     st.roll_rad = roll_rad;
+                    st.has_gravity = true;
                     st.valid = true;
                 }
             } else {
+                // Sensor waking up / momentarily zero; keep trying without killing the thread.
                 failures = failures.saturating_add(1);
             }
         } else {
@@ -286,10 +353,10 @@ fn imu_reader_thread(
             if let Ok(mut st) = shared.lock() {
                 st.valid = false;
             }
-            break;
+            thread::sleep(Duration::from_millis(200));
+        } else {
+            thread::sleep(Duration::from_millis(16));
         }
-
-        thread::sleep(Duration::from_millis(12));
     }
 }
 
@@ -335,6 +402,7 @@ impl ImuSensor {
                 accel: info.initial_accel,
                 pitch_rad,
                 roll_rad,
+                has_gravity: info.has_gravity,
                 valid: true,
             };
             let shared = Arc::new(Mutex::new(initial));
@@ -345,7 +413,14 @@ impl ImuSensor {
             let bg_active = Arc::clone(&active);
             let bg_stop = Arc::clone(&stop);
             let reader = thread::spawn(move || {
-                imu_reader_thread(bg_dir, info.accel_scale, bg_shared, bg_active, bg_stop)
+                imu_reader_thread(
+                    bg_dir,
+                    info.accel_scale,
+                    info.accel_offset,
+                    bg_shared,
+                    bg_active,
+                    bg_stop,
+                )
             });
 
             let mut sensor = Self {
@@ -361,7 +436,9 @@ impl ImuSensor {
                 zero_roll_rad: 0.0,
                 zeroed: false,
             };
-            sensor.recenter();
+            if info.has_gravity {
+                sensor.recenter();
+            }
             sensor
         } else {
             Self {
@@ -399,14 +476,14 @@ impl ImuSensor {
         if let Ok(st) = self.shared.lock() {
             self.latest = *st;
         }
-        if self.latest.valid && !self.zeroed {
+        if self.latest.valid && self.latest.has_gravity && !self.zeroed {
             self.recenter();
         }
     }
 
     /// Capture the current handheld orientation as neutral (level hover) reference.
     pub fn recenter(&mut self) {
-        if !self.latest.valid {
+        if !self.latest.valid || !self.latest.has_gravity {
             return;
         }
         // Clamp neutral reference to sane handheld viewing poses (-50 deg .. +72 deg pitch, +/-30 deg roll)
@@ -418,7 +495,7 @@ impl ImuSensor {
     /// Tilt angle relative to neutral center in degrees: `(pitch_fwd_deg, roll_right_deg)`.
     /// Positive `pitch_fwd_deg` = tilted forward (fly forward); positive `roll_right_deg` = right edge down (bank right).
     pub fn relative_tilt_deg(&self) -> (f32, f32) {
-        if !self.is_available() {
+        if !self.is_available() || !self.latest.has_gravity {
             return (0.0, 0.0);
         }
         let pitch_fwd_rad = self.zero_pitch_rad - self.latest.pitch_rad;
@@ -428,7 +505,7 @@ impl ImuSensor {
 
     /// Convert current relative IMU tilt into normalized `(roll, pitch)` stick commands in `-1.0 ..= +1.0`.
     pub fn tilt_sticks(&self) -> (f32, f32) {
-        if !self.is_available() {
+        if !self.is_available() || !self.latest.has_gravity {
             return (0.0, 0.0);
         }
         let pitch_fwd_rad = self.zero_pitch_rad - self.latest.pitch_rad;
@@ -546,7 +623,7 @@ mod tests {
 
         // Give background thread enough ticks to converge through LPF
         for _ in 0..25 {
-            thread::sleep(Duration::from_millis(15));
+            thread::sleep(Duration::from_millis(18));
             imu.poll();
         }
         let (roll, pitch) = imu.tilt_sticks();
@@ -558,6 +635,38 @@ mod tests {
         let (r_after, p_after) = imu.tilt_sticks();
         assert_eq!(r_after, 0.0);
         assert_eq!(p_after, 0.0);
+
+        drop(imu);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_imu_recovers_from_cold_start_zero_reading() {
+        let root = make_temp_iio_dir("bmi270_cold");
+        // Simulate BMI270 returning (0,0,0) on cold runtime-PM wake-up
+        let dev = write_fake_bmi270(&root, 0, 0, 0);
+
+        let mut imu = ImuSensor::probe_from_root(&root, false);
+        assert!(imu.is_available(), "Cold-start BMI270 should still be detected");
+
+        // Sensor wakes up with flat face-up gravity
+        fs::write(dev.join("in_accel_z_raw"), "9810\n").unwrap();
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(18));
+            imu.poll();
+        }
+        assert!(imu.latest.has_gravity, "Should acquire gravity vector once awake");
+        assert_eq!(imu.tilt_sticks(), (0.0, 0.0));
+
+        // Now tilt right edge down 20 deg
+        fs::write(dev.join("in_accel_y_raw"), "-3355\n").unwrap();
+        fs::write(dev.join("in_accel_z_raw"), "9218\n").unwrap();
+        for _ in 0..25 {
+            thread::sleep(Duration::from_millis(18));
+            imu.poll();
+        }
+        let (roll, _) = imu.tilt_sticks();
+        assert!(roll > 0.45, "Should respond to tilt after cold-start wakeup, roll={roll}");
 
         drop(imu);
         let _ = fs::remove_dir_all(&root);

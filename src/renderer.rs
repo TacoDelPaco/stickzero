@@ -1384,7 +1384,7 @@ impl Renderer {
             match quad.control_source {
                 FlightControlSource::ImuSimplified => {
                     self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
-                    let hint = "W:FLY  TILT:STEER  C:ZERO";
+                    let hint = "F/UP:FLY TILT:STEER SPC:ZERO";
                     self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
                 }
                 FlightControlSource::None => {
@@ -1567,7 +1567,7 @@ impl Renderer {
         let border = rgb565(102, 217, 239);
         let hover_tick = rgb565(85, 110, 130);
         let (fill_col, cue, cue_col) = if on_ground && climb_cmd <= 0.05 {
-            (rgb565(90, 115, 135), "W/S", rgb565(180, 195, 210))
+            (rgb565(90, 115, 135), "F/X", rgb565(180, 195, 210))
         } else if climb_cmd > 0.1 {
             (rgb565(85, 235, 125), "+CLB", rgb565(85, 255, 120))
         } else if climb_cmd < -0.1 {
@@ -1884,8 +1884,8 @@ impl Renderer {
                 cfg.aux_mode.short_label(),
                 cfg.aux_turtle.short_label(),
             ),
-            FlightControlSource::ImuSimplified => "Tilt:Steer | W/S:Alt | A/D:Yaw".to_string(),
-            FlightControlSource::None => "USB-C or BT controller required to fly".to_string(),
+            FlightControlSource::ImuSimplified => "Tilt:Steer | F/X:Alt | Z/C:Yaw".to_string(),
+            FlightControlSource::None => "F/X/Z/C:L-Stk | K/B/N/M:R-Stk".to_string(),
         };
 
         let dev_col = if ctrl_src == FlightControlSource::None { ui.warn } else { ui.sel_label };
@@ -1958,7 +1958,7 @@ impl Renderer {
                 self.draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
             }
             FlightControlSource::ImuSimplified => {
-                self.draw_text(8, 141, "C:Zero IMU | W/S:Alt | R:Rescan BT/USB", ui.sel_val, 1, false);
+                self.draw_text(8, 141, "C:Zero IMU | F/X:Alt | R:Rescan BT/USB", ui.sel_val, 1, false);
                 self.draw_text(8, 154, "Connect USB/BT radio for full sticks", ui.muted, 1, false);
             }
             FlightControlSource::None => {

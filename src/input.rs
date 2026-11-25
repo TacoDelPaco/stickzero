@@ -352,6 +352,7 @@ pub struct MenuActions {
     pub back: bool,
     pub respawn: bool,
     pub calibrate: bool,
+    pub recenter_imu: bool,
     pub bind_aux: bool,
     pub next_device: bool,
     pub exit_app: bool,
@@ -423,6 +424,15 @@ fn is_hat_axis(code: usize) -> bool {
     code == ABS_HAT0X as usize || code == ABS_HAT0Y as usize
 }
 
+#[inline]
+fn set_dir_bit(mask: &mut u8, bit: u8, held: bool) {
+    if held {
+        *mask |= 1u8 << bit;
+    } else {
+        *mask &= !(1u8 << bit);
+    }
+}
+
 pub struct InputManager {
     pub gamepad: Option<GamepadDevice>,
     pub imu: ImuSensor,
@@ -433,18 +443,17 @@ pub struct InputManager {
     pub calib: Option<CalibWizard>,
     pub aux_wiz: Option<AuxWizard>,
 
-    // Keyboard flight state
-    kb_w: bool,
-    kb_s: bool,
-    kb_a: bool,
-    kb_d: bool,
-    kb_f: bool,
-    kb_x: bool,
-    kb_space: bool,
-    kb_up: bool,
-    kb_down: bool,
-    kb_left: bool,
-    kb_right: bool,
+    // Keyboard flight state:
+    // Left gimbal = CardputerZero arrow keys (F/X/Z/C, Arrows, ;/./,//, WASD) -> Throttle / Yaw
+    kb_l_up: u8,
+    kb_l_down: u8,
+    kb_l_left: u8,
+    kb_l_right: u8,
+    // Right gimbal = K (pitch fwd), N (pitch back), B (roll left), M (roll right)
+    kb_r_up: bool,
+    kb_r_down: bool,
+    kb_r_left: bool,
+    kb_r_right: bool,
     kb_throttle: f32,
 
     // Keyboard edge-triggered AUX toggles
@@ -474,17 +483,14 @@ impl InputManager {
             candidate_count: 0,
             calib: None,
             aux_wiz: None,
-            kb_w: false,
-            kb_s: false,
-            kb_a: false,
-            kb_d: false,
-            kb_f: false,
-            kb_x: false,
-            kb_space: false,
-            kb_up: false,
-            kb_down: false,
-            kb_left: false,
-            kb_right: false,
+            kb_l_up: 0,
+            kb_l_down: 0,
+            kb_l_left: 0,
+            kb_l_right: 0,
+            kb_r_up: false,
+            kb_r_down: false,
+            kb_r_left: false,
+            kb_r_right: false,
             kb_throttle: 0.0,
             kb_arm_toggle: false,
             kb_mode_toggle: false,
@@ -539,11 +545,17 @@ impl InputManager {
     }
 
     /// Vertical climb/descend command in IMU simplified mode: `-1.0` descend, `0.0` auto-hover, `+1.0` climb.
+    /// Driven by Left Gimbal Up/Down (CardputerZero F/X, Arrows Up/Down, W/S, ;/.).
     #[inline]
     pub fn imu_climb_cmd(&self) -> f32 {
-        let up = self.kb_w || self.kb_up || self.kb_f || self.kb_space;
-        let down = self.kb_s || self.kb_down || self.kb_x;
+        let up = self.kb_l_up != 0;
+        let down = self.kb_l_down != 0;
         (up as i32 - down as i32) as f32
+    }
+
+    /// Reset software keyboard throttle to 0 (e.g. on respawn).
+    pub fn reset_kb_throttle(&mut self) {
+        self.kb_throttle = 0.0;
     }
 
     pub fn controller_name(&self) -> String {
@@ -987,6 +999,11 @@ impl InputManager {
                 chosen.kind,
                 chosen.axes,
             ));
+        } else if self.gamepad.is_none() && !self.imu.is_available() && !self.imu.is_lite {
+            let probed = ImuSensor::probe_default();
+            if probed.is_available() {
+                self.imu = probed;
+            }
         }
     }
 
@@ -1099,109 +1116,7 @@ impl InputManager {
             }
         }
         for (code, val) in kb_events {
-            let pressed = val == 1;
-            let held = val != 0;
-            match code {
-                KEY_ESC => {
-                    if val == 1 {
-                        self.esc_down_at = Some(Instant::now());
-                        self.esc_long_fired = false;
-                    } else if val == 0 {
-                        if !self.esc_long_fired && self.esc_down_at.is_some() {
-                            self.pending.back = true;
-                        }
-                        self.esc_down_at = None;
-                        self.esc_long_fired = false;
-                    }
-                }
-                KEY_UP | KEY_I => {
-                    self.kb_up = held;
-                    if pressed { self.pending.up = true; }
-                }
-                KEY_DOWN | KEY_K => {
-                    self.kb_down = held;
-                    if pressed { self.pending.down = true; }
-                }
-                KEY_LEFT | KEY_J => {
-                    self.kb_left = held;
-                    if pressed { self.pending.left = true; }
-                }
-                KEY_RIGHT | KEY_L => {
-                    self.kb_right = held;
-                    if pressed { self.pending.right = true; }
-                }
-                KEY_W => {
-                    self.kb_w = held;
-                    if pressed && in_menu { self.pending.up = true; }
-                }
-                KEY_S => {
-                    self.kb_s = held;
-                    if pressed && in_menu { self.pending.down = true; }
-                }
-                KEY_A => {
-                    self.kb_a = held;
-                    if pressed && in_menu { self.pending.left = true; }
-                }
-                KEY_D => {
-                    self.kb_d = held;
-                    if pressed && in_menu { self.pending.right = true; }
-                }
-                KEY_ENTER => {
-                    if pressed { self.pending.select = true; }
-                }
-                KEY_SPACE => {
-                    self.kb_space = held;
-                    if pressed { self.pending.select = true; }
-                }
-                KEY_BACKSPACE => {
-                    if pressed { self.pending.back = true; }
-                }
-                KEY_R => {
-                    if pressed { self.pending.respawn = true; }
-                }
-                KEY_TAB => {
-                    if pressed && !in_menu { self.kb_arm_toggle = true; }
-                }
-                KEY_M => {
-                    if pressed && !in_menu { self.kb_mode_toggle = true; }
-                }
-                KEY_T => {
-                    if pressed && !in_menu { self.kb_turtle_toggle = true; }
-                }
-                KEY_F => {
-                    self.kb_f = held;
-                    if pressed && in_menu { self.pending.up = true; }
-                }
-                KEY_SEMICOLON => {
-                    if pressed && in_menu { self.pending.up = true; }
-                }
-                KEY_X => {
-                    self.kb_x = held;
-                    if pressed && in_menu { self.pending.down = true; }
-                }
-                KEY_DOT => {
-                    if pressed && in_menu { self.pending.down = true; }
-                }
-                KEY_Z | KEY_COMMA => {
-                    if pressed && in_menu { self.pending.left = true; }
-                }
-                KEY_SLASH => {
-                    if pressed && in_menu { self.pending.right = true; }
-                }
-                KEY_C => {
-                    if pressed {
-                        self.pending.calibrate = true;
-                        if in_menu { self.pending.right = true; }
-                    }
-                }
-                KEY_B => {
-                    if pressed { self.pending.bind_aux = true; }
-                }
-                KEY_N => {
-                    if pressed { self.pending.next_device = true; }
-                }
-                _ => {}
-            }
+            self.process_key_event(code, val, in_menu);
         }
 
         // CardputerZero long-Esc (>= 700ms) for clean exit to APPLaunch
@@ -1212,10 +1127,10 @@ impl InputManager {
             }
         }
 
-        // Keyboard throttle (used only in non-IMU keyboard fallback)
-        if self.kb_w {
+        // Keyboard left-gimbal throttle (CardputerZero F/X, Arrows Up/Down, W/S, ;/.)
+        if self.kb_l_up != 0 {
             self.kb_throttle = (self.kb_throttle + 1.1 * dt).min(1.0);
-        } else if self.kb_s {
+        } else if self.kb_l_down != 0 {
             self.kb_throttle = (self.kb_throttle - 1.3 * dt).max(0.0);
         }
 
@@ -1244,6 +1159,146 @@ impl InputManager {
                     self.stick_nav_latched_x = true;
                 }
             }
+        }
+    }
+
+    /// Process a single Linux evdev keyboard event.
+    ///
+    /// Flight keyboard mapping (Mode 2):
+    /// - Left Gimbal (Throttle / Yaw): CardputerZero arrow keys (`F`/`X`/`Z`/`C`, `Up`/`Down`/`Left`/`Right`, `;`/`.`/`,`/`/`, `W`/`S`/`A`/`D`)
+    /// - Right Gimbal (Pitch / Roll): `K` (pitch forward), `N` (pitch back), `B` (roll left), `M` (roll right)
+    /// - Flight shortcuts: `Space` = zero IMU, `E` = cycle flight mode, `T` = turtle, `R` = respawn, `Tab` = arm/disarm
+    fn process_key_event(&mut self, code: u16, val: i32, in_menu: bool) {
+        let pressed = val == 1;
+        let held = val != 0;
+        match code {
+            KEY_ESC => {
+                if val == 1 {
+                    self.esc_down_at = Some(Instant::now());
+                    self.esc_long_fired = false;
+                } else if val == 0 {
+                    if !self.esc_long_fired && self.esc_down_at.is_some() {
+                        self.pending.back = true;
+                    }
+                    self.esc_down_at = None;
+                    self.esc_long_fired = false;
+                }
+            }
+            // Left Gimbal Up (Throttle+ / IMU Climb) + Menu Up
+            KEY_F => {
+                set_dir_bit(&mut self.kb_l_up, 0, held);
+                if pressed && in_menu { self.pending.up = true; }
+            }
+            KEY_UP => {
+                set_dir_bit(&mut self.kb_l_up, 1, held);
+                if pressed && in_menu { self.pending.up = true; }
+            }
+            KEY_W => {
+                set_dir_bit(&mut self.kb_l_up, 2, held);
+                if pressed && in_menu { self.pending.up = true; }
+            }
+            KEY_SEMICOLON => {
+                set_dir_bit(&mut self.kb_l_up, 3, held);
+                if pressed && in_menu { self.pending.up = true; }
+            }
+            // Left Gimbal Down (Throttle- / IMU Descend) + Menu Down
+            KEY_X => {
+                set_dir_bit(&mut self.kb_l_down, 0, held);
+                if pressed && in_menu { self.pending.down = true; }
+            }
+            KEY_DOWN => {
+                set_dir_bit(&mut self.kb_l_down, 1, held);
+                if pressed && in_menu { self.pending.down = true; }
+            }
+            KEY_S => {
+                set_dir_bit(&mut self.kb_l_down, 2, held);
+                if pressed && in_menu { self.pending.down = true; }
+            }
+            KEY_DOT => {
+                set_dir_bit(&mut self.kb_l_down, 3, held);
+                if pressed && in_menu { self.pending.down = true; }
+            }
+            // Left Gimbal Left (Yaw Left) + Menu Left
+            KEY_Z => {
+                set_dir_bit(&mut self.kb_l_left, 0, held);
+                if pressed && in_menu { self.pending.left = true; }
+            }
+            KEY_LEFT => {
+                set_dir_bit(&mut self.kb_l_left, 1, held);
+                if pressed && in_menu { self.pending.left = true; }
+            }
+            KEY_A => {
+                set_dir_bit(&mut self.kb_l_left, 2, held);
+                if pressed && in_menu { self.pending.left = true; }
+            }
+            KEY_COMMA => {
+                set_dir_bit(&mut self.kb_l_left, 3, held);
+                if pressed && in_menu { self.pending.left = true; }
+            }
+            // Left Gimbal Right (Yaw Right) + Menu Right / Controller Calibrate
+            KEY_C => {
+                set_dir_bit(&mut self.kb_l_right, 0, held);
+                if pressed && in_menu {
+                    self.pending.calibrate = true;
+                    self.pending.right = true;
+                }
+            }
+            KEY_RIGHT => {
+                set_dir_bit(&mut self.kb_l_right, 1, held);
+                if pressed && in_menu { self.pending.right = true; }
+            }
+            KEY_D => {
+                set_dir_bit(&mut self.kb_l_right, 2, held);
+                if pressed && in_menu { self.pending.right = true; }
+            }
+            KEY_SLASH => {
+                set_dir_bit(&mut self.kb_l_right, 3, held);
+                if pressed && in_menu { self.pending.right = true; }
+            }
+            // Right Gimbal: K (Pitch Forward), N (Pitch Back), B (Roll Left), M (Roll Right)
+            KEY_K => {
+                self.kb_r_up = held;
+            }
+            KEY_N => {
+                self.kb_r_down = held;
+                if pressed && in_menu { self.pending.next_device = true; }
+            }
+            KEY_B => {
+                self.kb_r_left = held;
+                if pressed && in_menu { self.pending.bind_aux = true; }
+            }
+            KEY_M => {
+                self.kb_r_right = held;
+            }
+            // Menu / Flight utility keys
+            KEY_ENTER => {
+                if pressed { self.pending.select = true; }
+            }
+            KEY_SPACE => {
+                if pressed {
+                    if in_menu {
+                        self.pending.select = true;
+                    } else {
+                        self.pending.recenter_imu = true;
+                    }
+                }
+            }
+            KEY_BACKSPACE => {
+                if pressed { self.pending.back = true; }
+            }
+            KEY_R => {
+                if pressed { self.pending.respawn = true; }
+            }
+            KEY_TAB => {
+                if pressed && !in_menu { self.kb_arm_toggle = true; }
+            }
+            KEY_E => {
+                if pressed && !in_menu { self.kb_mode_toggle = true; }
+            }
+            KEY_T => {
+                if pressed && !in_menu { self.kb_turtle_toggle = true; }
+            }
+            _ => {}
         }
     }
 
@@ -1422,13 +1477,15 @@ impl InputManager {
             StickInput { throttle, yaw, pitch, roll }
         } else if self.imu.is_available() {
             // Simplified CardputerZero IMU flight:
-            // - Tilt forward/back -> Pitch, tilt left/right -> Roll
-            // - Coordinated bank-to-turn yaw from roll + optional manual A/D or Left/Right yaw
-            // - Vertical climb/hover/descend via W/S (or F/X, Up/Down, Space); QuadState applies auto-hover
-            let (roll, pitch) = self.imu.tilt_sticks();
-            let manual_yaw =
-                ((self.kb_d || self.kb_right) as i32 - (self.kb_a || self.kb_left) as i32) as f32 * 0.80;
-            let yaw = clampf(manual_yaw + roll * 0.60, -1.0, 1.0);
+            // - Left Gimbal (CardputerZero F/X/Z/C, Arrows, W/S/A/D): Climb/Descend + Yaw
+            // - Right Gimbal: CardputerZero IMU Tilt (+ optional K/N/B/M keyboard override)
+            let (imu_roll, imu_pitch) = self.imu.tilt_sticks();
+            let kb_yaw = ((self.kb_l_right != 0) as i32 - (self.kb_l_left != 0) as i32) as f32 * 0.80;
+            let kb_pitch = (self.kb_r_up as i32 - self.kb_r_down as i32) as f32 * 0.80;
+            let kb_roll = (self.kb_r_right as i32 - self.kb_r_left as i32) as f32 * 0.80;
+            let pitch = clampf(imu_pitch + kb_pitch, -1.0, 1.0);
+            let roll = clampf(imu_roll + kb_roll, -1.0, 1.0);
+            let yaw = clampf(kb_yaw + imu_roll * 0.60, -1.0, 1.0);
             let throttle = clampf(0.5 + 0.5 * self.imu_climb_cmd(), 0.0, 1.0);
             StickInput {
                 throttle,
@@ -1437,9 +1494,12 @@ impl InputManager {
                 roll,
             }
         } else {
-            let yaw = (self.kb_d as i32 - self.kb_a as i32) as f32 * 0.75;
-            let pitch = (self.kb_up as i32 - self.kb_down as i32) as f32 * 0.75;
-            let roll = (self.kb_right as i32 - self.kb_left as i32) as f32 * 0.75;
+            // Keyboard flight:
+            // - Left Gimbal: CardputerZero arrow keys (F/X/Z/C, Arrows, ;/./,//, WASD) -> Throttle / Yaw
+            // - Right Gimbal: K (pitch fwd), N (pitch back), B (roll left), M (roll right)
+            let yaw = ((self.kb_l_right != 0) as i32 - (self.kb_l_left != 0) as i32) as f32 * 0.75;
+            let pitch = (self.kb_r_up as i32 - self.kb_r_down as i32) as f32 * 0.75;
+            let roll = (self.kb_r_right as i32 - self.kb_r_left as i32) as f32 * 0.75;
             StickInput {
                 throttle: self.kb_throttle,
                 yaw,
@@ -1518,14 +1578,19 @@ mod tests {
         assert!(!mgr.needs_controller_warning());
         assert_eq!(mgr.controller_name(), "CardputerZero IMU");
 
-        // Simulate banking right + climb key pressed
+        // Simulate banking right + CardputerZero Up arrow (F) pressed
         mgr.imu.latest.roll_rad = 20.0_f32.to_radians();
-        mgr.kb_w = true;
+        mgr.process_key_event(KEY_F, 1, false);
         let sticks = mgr.flight_sticks(&cfg);
         assert!(sticks.roll > 0.45, "roll={}", sticks.roll);
         assert!(sticks.yaw > 0.25, "coordinated bank-to-turn yaw={}", sticks.yaw);
         assert_eq!(mgr.imu_climb_cmd(), 1.0);
         assert_eq!(sticks.throttle, 1.0);
+
+        // Space in flight triggers IMU recenter, not select
+        mgr.process_key_event(KEY_SPACE, 1, false);
+        let act = mgr.take_menu_actions();
+        assert!(act.recenter_imu && !act.select);
 
         // 2. No controller + CardputerZero Lite -> None, launch warning required
         mgr.imu = ImuSensor::probe_from_root(&root, true);
@@ -1543,5 +1608,56 @@ mod tests {
 
         drop(mgr);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_cardputer_keyboard_gimbals_arrows_left_kbnm_right() {
+        let cfg = Config::default();
+        let mut mgr = InputManager::new();
+        mgr.gamepad = None;
+        mgr.imu = ImuSensor::probe_from_root(Path::new("/nonexistent_iio_dir"), false);
+
+        // Left Gimbal: CardputerZero arrow keys F/X/Z/C and hardware Up/Down/Left/Right
+        mgr.process_key_event(KEY_F, 1, false);
+        mgr.kb_throttle = (mgr.kb_throttle + 0.5).min(1.0);
+        mgr.process_key_event(KEY_C, 1, false); // Yaw right (must NOT trigger calibrate in flight!)
+        assert!(!mgr.take_menu_actions().calibrate);
+        let s1 = mgr.flight_sticks(&cfg);
+        assert!(s1.throttle > 0.45);
+        assert!(s1.yaw > 0.5, "C should yaw right, got {}", s1.yaw);
+
+        mgr.process_key_event(KEY_C, 0, false);
+        mgr.process_key_event(KEY_Z, 1, false); // Yaw left
+        assert!(mgr.flight_sticks(&cfg).yaw < -0.5);
+        mgr.process_key_event(KEY_Z, 0, false);
+        mgr.process_key_event(KEY_F, 0, false);
+
+        // Hardware arrow keys also drive Left Gimbal
+        mgr.process_key_event(KEY_LEFT, 1, false);
+        assert!(mgr.flight_sticks(&cfg).yaw < -0.5);
+        mgr.process_key_event(KEY_LEFT, 0, false);
+        mgr.process_key_event(KEY_RIGHT, 1, false);
+        assert!(mgr.flight_sticks(&cfg).yaw > 0.5);
+        mgr.process_key_event(KEY_RIGHT, 0, false);
+
+        // Right Gimbal: K (pitch fwd), N (pitch back), B (roll left), M (roll right)
+        mgr.process_key_event(KEY_K, 1, false);
+        assert!(mgr.flight_sticks(&cfg).pitch > 0.5, "K should pitch forward");
+        mgr.process_key_event(KEY_K, 0, false);
+
+        mgr.process_key_event(KEY_N, 1, false);
+        assert!(mgr.flight_sticks(&cfg).pitch < -0.5, "N should pitch back");
+        assert!(!mgr.take_menu_actions().next_device);
+        mgr.process_key_event(KEY_N, 0, false);
+
+        mgr.process_key_event(KEY_B, 1, false);
+        assert!(mgr.flight_sticks(&cfg).roll < -0.5, "B should roll left");
+        assert!(!mgr.take_menu_actions().bind_aux);
+        mgr.process_key_event(KEY_B, 0, false);
+
+        mgr.process_key_event(KEY_M, 1, false);
+        assert!(mgr.flight_sticks(&cfg).roll > 0.5, "M should roll right");
+        assert!(!mgr.kb_mode_toggle, "M must roll right, not toggle flight mode");
+        mgr.process_key_event(KEY_M, 0, false);
     }
 }

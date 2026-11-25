@@ -335,7 +335,7 @@ fn main() {
 
         match screen {
             AppScreen::ControllerWarning => {
-                if input.has_controller() || act.select || act.back {
+                if input.has_controller() || !input.needs_controller_warning() || act.select || act.back {
                     screen = AppScreen::MainMenu;
                 }
                 renderer.render_controller_warning(&cfg, &input);
@@ -348,6 +348,7 @@ fn main() {
                         0 if act.select => {
                             quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
                             quad.control_source = input.control_source();
+                            input.reset_kb_throttle();
                             if quad.control_source == FlightControlSource::ImuSimplified {
                                 input.recenter_imu();
                             }
@@ -508,6 +509,7 @@ fn main() {
                     }
                     if act.respawn {
                         quad.respawn_at_start(track, &cfg);
+                        input.reset_kb_throttle();
                         if quad.control_source == FlightControlSource::ImuSimplified {
                             input.recenter_imu();
                         }
@@ -516,7 +518,7 @@ fn main() {
                             audio.trigger_arm();
                         }
                     }
-                    if act.calibrate && quad.control_source == FlightControlSource::ImuSimplified {
+                    if act.recenter_imu && quad.control_source == FlightControlSource::ImuSimplified {
                         input.recenter_imu();
                         quad.combo_text = "IMU ZEROED";
                         quad.combo_timer = 0.9;
@@ -570,6 +572,7 @@ fn main() {
                             1 => {
                                 quad.respawn_at_start(track, &cfg);
                                 quad.control_source = input.control_source();
+                                input.reset_kb_throttle();
                                 if quad.control_source == FlightControlSource::ImuSimplified {
                                     input.recenter_imu();
                                 }
