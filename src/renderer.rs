@@ -5,7 +5,7 @@
 use crate::config::{AuxBinding, BatteryPack, Config, GameMode, StickOverlay, UiTheme, VisualTheme};
 use crate::display::{SCREEN_H, SCREEN_W};
 use crate::font::{glyph, GLYPH_H, GLYPH_W};
-use crate::input::{ControllerKind, InputManager};
+use crate::input::{FlightControlSource, InputManager};
 use crate::math::{clampf, Quat, Vec3};
 use crate::physics::{QuadState, StickInput};
 use crate::tracks::{GateKind, StructureColor, Track, TRACKS};
@@ -1289,13 +1289,16 @@ impl Renderer {
         self.draw_hline(cx + 2, cx + 5, cy, white);
         self.draw_vline(cx, cy - 3, cy - 2, white);
 
-        // Top-left: Mode (ACRO / ANGLE / TURTLE) + Gate / Points
-        let mode_str = if quad.turtle_mode {
-            "TURTLE"
+        // Top-left: Mode (IMU EASY / ACRO / HORIZON / ANGLE / TURTLE) + Gate / Points
+        let imu_mode = quad.control_source == FlightControlSource::ImuSimplified;
+        let (mode_str, mode_col) = if quad.turtle_mode {
+            ("TURTLE", yellow)
+        } else if imu_mode {
+            ("IMU EASY", cyan)
         } else {
-            cfg.flight_mode.name()
+            (cfg.flight_mode.name(), white)
         };
-        self.draw_text(4, 3, mode_str, if quad.turtle_mode { yellow } else { white }, 1, true);
+        self.draw_text(4, 3, mode_str, mode_col, 1, true);
         if cfg.game_mode == GameMode::Race {
             let g_str = format!("G {}/{}", quad.next_gate + 1, track.gates.len());
             self.draw_text(4, 13, &g_str, yellow, 1, true);
@@ -1378,7 +1381,22 @@ impl Renderer {
             && !quad.inverted
             && !quad.battery_empty
         {
-            self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
+            match quad.control_source {
+                FlightControlSource::ImuSimplified => {
+                    self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
+                    let hint = "F/UP:FLY TILT:STEER SPC:ZERO";
+                    self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
+                }
+                FlightControlSource::None => {
+                    let title = "CONTROLLER REQUIRED";
+                    self.draw_text(cx - (title.len() as i32) * 3, cy - 22, title, red, 1, true);
+                    let hint = "CONNECT USB/BT CONTROLLER";
+                    self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
+                }
+                FlightControlSource::Controller => {
+                    self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
+                }
+            }
         } else if quad.turtle_active && quad.turtle_mode {
             self.draw_text(cx - 30, cy - 22, "CRASH FLIP", yellow, 1, true);
             let sub = if quad.inverted {
@@ -1405,18 +1423,30 @@ impl Renderer {
             self.draw_text(cx - 33, 32, "LOW BATTERY", yellow, 1, true);
         }
 
-        // Optional compact live gimbal stick overlay in bottom corners (Off / Dot / Trails)
-        let lx = sticks.yaw;
-        let ly = sticks.throttle * 2.0 - 1.0;
-        let rx = sticks.roll;
-        let ry = sticks.pitch;
-        if cfg.stick_overlay == StickOverlay::Trails {
-            self.push_stick_trail(lx, ly, rx, ry);
-            self.draw_stick_box_trails(4, H - 30, 26, lx, ly, true);
-            self.draw_stick_box_trails(W - 30, H - 30, 26, rx, ry, false);
-        } else if cfg.stick_overlay == StickOverlay::Dot {
-            self.draw_stick_box(4, H - 30, 26, lx, ly);
-            self.draw_stick_box(W - 30, H - 30, 26, rx, ry);
+        // Compact live stick / IMU control overlay in bottom corners (Off / Dot / Trails)
+        if cfg.stick_overlay.is_visible() {
+            if imu_mode {
+                let show_trails = cfg.stick_overlay == StickOverlay::Trails;
+                if show_trails {
+                    self.push_stick_trail(0.0, quad.throttle_pct as f32 / 50.0 - 1.0, sticks.roll, sticks.pitch);
+                }
+                self.draw_imu_throttle_bar(4, H - 30, 14, 26, quad.throttle_pct, quad.imu_climb_cmd, quad.on_ground);
+                self.draw_text(W - 26, H - 39, "IMU", cyan, 1, true);
+                self.draw_imu_tilt_box(W - 30, H - 30, 26, sticks.roll, sticks.pitch, show_trails);
+            } else {
+                let lx = sticks.yaw;
+                let ly = sticks.throttle * 2.0 - 1.0;
+                let rx = sticks.roll;
+                let ry = sticks.pitch;
+                if cfg.stick_overlay == StickOverlay::Trails {
+                    self.push_stick_trail(lx, ly, rx, ry);
+                    self.draw_stick_box_trails(4, H - 30, 26, lx, ly, true);
+                    self.draw_stick_box_trails(W - 30, H - 30, 26, rx, ry, false);
+                } else {
+                    self.draw_stick_box(4, H - 30, 26, lx, ly);
+                    self.draw_stick_box(W - 30, H - 30, 26, rx, ry);
+                }
+            }
         }
     }
 
@@ -1522,6 +1552,96 @@ impl Renderer {
         self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
     }
 
+    /// Simplified vertical throttle/altitude gauge for CardputerZero IMU flight (replaces left 2D gimbal).
+    fn draw_imu_throttle_bar(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        throttle_pct: u8,
+        climb_cmd: f32,
+        on_ground: bool,
+    ) {
+        let bg = rgb565(18, 22, 30);
+        let border = rgb565(102, 217, 239);
+        let hover_tick = rgb565(85, 110, 130);
+        let (fill_col, cue, cue_col) = if on_ground && climb_cmd <= 0.05 {
+            (rgb565(90, 115, 135), "F/X", rgb565(180, 195, 210))
+        } else if climb_cmd > 0.1 {
+            (rgb565(85, 235, 125), "+CLB", rgb565(85, 255, 120))
+        } else if climb_cmd < -0.1 {
+            (rgb565(253, 151, 31), "-DSC", rgb565(255, 175, 65))
+        } else {
+            (rgb565(75, 210, 245), "=HOV", rgb565(120, 240, 255))
+        };
+
+        self.fill_rect(x, y, w, h, bg);
+        self.draw_rect(x, y, w, h, border);
+
+        // Center auto-hover tick reference
+        let mid_y = y + h / 2;
+        self.draw_hline(x + 2, x + w - 3, mid_y, hover_tick);
+
+        // Live vertical throttle fill
+        let inner_h = (h - 4).max(1);
+        let frac = (throttle_pct as f32 / 100.0).clamp(0.0, 1.0);
+        let fill_h = (frac * inner_h as f32).round() as i32;
+        if fill_h > 0 {
+            let fy = y + h - 2 - fill_h;
+            self.fill_rect(x + 2, fy, (w - 4).max(1), fill_h, fill_col);
+            self.draw_hline(x + 2, x + w - 3, fy, rgb565(255, 245, 150));
+        }
+
+        // Compact climb / hover / descend indicator right next to gauge
+        self.draw_text(x + w + 3, y + h / 2 - 3, cue, cue_col, 1, true);
+    }
+
+    /// Simplified 2D IMU tilt reticle box (replaces right gimbal with an attitude/tilt horizon pad).
+    fn draw_imu_tilt_box(&mut self, x: i32, y: i32, size: i32, roll: f32, pitch: f32, trails: bool) {
+        let border = rgb565(102, 217, 239);
+        let bg = rgb565(18, 22, 30);
+        let guide = rgb565(46, 62, 78);
+        let dz_col = rgb565(72, 108, 128);
+        let dot = rgb565(255, 232, 90);
+        let trail_old = rgb565(35, 92, 118);
+        let trail_new = rgb565(255, 165, 50);
+
+        self.fill_rect(x, y, size, size, bg);
+        self.draw_rect(x, y, size, size, border);
+
+        let cx = x + size / 2;
+        let cy = y + size / 2;
+        // Crosshair axes + small center deadzone box so it visually reads as an IMU tilt pad
+        self.draw_hline(x + 2, x + size - 3, cy, guide);
+        self.draw_vline(cx, y + 2, y + size - 3, guide);
+        self.draw_rect(cx - 2, cy - 2, 5, 5, dz_col);
+
+        let half = (size / 2 - 2) as f32;
+        if trails && self.trail_len >= 2 {
+            let n = self.trail_len;
+            let start = (self.trail_head + STICK_TRAIL_LEN - n) % STICK_TRAIL_LEN;
+            let mut prev: Option<(i32, i32)> = None;
+            for i in 0..n {
+                let sample = self.stick_trail[(start + i) % STICK_TRAIL_LEN];
+                let px = cx + (clampf(sample.2, -1.0, 1.0) * half) as i32;
+                let py = cy - (clampf(sample.3, -1.0, 1.0) * half) as i32;
+                let age_t = (i as f32) / ((n - 1) as f32);
+                let col = lerp_rgb565(trail_old, trail_new, age_t);
+                if let Some((ox, oy)) = prev {
+                    self.draw_line(ox, oy, px, py, col);
+                } else {
+                    self.put_pixel(px, py, col);
+                }
+                prev = Some((px, py));
+            }
+        }
+
+        let dx = cx + (clampf(roll, -1.0, 1.0) * half) as i32;
+        let dy = cy - (clampf(pitch, -1.0, 1.0) * half) as i32;
+        self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
+    }
+
     // -----------------------------------------------------------------------
     // Menu UIs (320 x 170 tailored for CardputerZero 1.9" display)
     // -----------------------------------------------------------------------
@@ -1565,15 +1685,59 @@ impl Renderer {
             self.draw_text(86, y + 3, val, vcol, 1, false);
         }
 
-        let ctrl_ok = input.controller_kind() != ControllerKind::None;
-        let dot_col = if ctrl_ok { ui.ok } else { ui.warn };
-        self.fill_rect(8, H - 14, 6, 6, dot_col);
-        let hint = if ctrl_ok {
-            "BT/USB Ready | Ent:Select | Hold Esc:Exit"
-        } else {
-            "FXZC/WASD | Ent:Select | Hold Esc:Exit"
+        let (dot_col, hint) = match input.control_source() {
+            FlightControlSource::Controller => (ui.ok, "BT/USB Ready | Ent:Select | Hold Esc:Exit"),
+            FlightControlSource::ImuSimplified => (ui.tag, "IMU Tilt Ready | Ent:Select | Hold Esc:Exit"),
+            FlightControlSource::None => (ui.warn, "Controller Req! | Ent:Select | Hold Esc:Exit"),
         };
+        self.fill_rect(8, H - 14, 6, 6, dot_col);
         self.draw_text(18, H - 14, hint, ui.muted, 1, false);
+    }
+
+    /// Launch warning modal shown when no IMU sensor is detected and/or running on CardputerZero Lite
+    /// without a connected USB-C or Bluetooth controller.
+    pub fn render_controller_warning(&mut self, cfg: &Config, input: &InputManager) {
+        self.render_main_menu(cfg, 0, input);
+        let ui = ui_colors(cfg.ui_theme);
+
+        let mx = 18;
+        let my = 24;
+        let mw = W - 36;
+        let mh = H - 42;
+        let cx = W / 2;
+        let warn_border = rgb565(255, 110, 45);
+        let banner_bg = rgb565(75, 24, 20);
+        let banner_txt = rgb565(255, 215, 70);
+
+        self.fill_rect(mx, my, mw, mh, ui.header_bg);
+        self.draw_rect(mx, my, mw, mh, warn_border);
+        self.draw_rect(mx + 1, my + 1, mw - 2, mh - 2, warn_border);
+
+        self.fill_rect(mx + 2, my + 2, mw - 4, 19, banner_bg);
+        self.draw_hline(mx + 2, mx + mw - 3, my + 21, warn_border);
+        let title = "! CONTROLLER REQUIRED !";
+        self.draw_text(cx - (title.len() as i32) * 3, my + 8, title, banner_txt, 1, false);
+
+        let reason = if input.is_cardputer_lite() {
+            "CardputerZero Lite detected (no IMU)"
+        } else {
+            "No IMU sensor detected"
+        };
+        self.draw_text(cx - (reason.len() as i32) * 3, my + 29, reason, ui.title, 1, false);
+
+        let l1 = "A USB-C or Bluetooth controller";
+        let l2 = "is required to fly StickZero.";
+        self.draw_text(cx - (l1.len() as i32) * 3, my + 45, l1, ui.label, 1, false);
+        self.draw_text(cx - (l2.len() as i32) * 3, my + 57, l2, ui.label, 1, false);
+
+        let l3 = "Pair a BT gamepad / ELRS radio";
+        let l4 = "or connect via USB-C Host mode.";
+        self.draw_text(cx - (l3.len() as i32) * 3, my + 74, l3, ui.tag, 1, false);
+        self.draw_text(cx - (l4.len() as i32) * 3, my + 86, l4, ui.tag, 1, false);
+
+        self.draw_hline(mx + 10, mx + mw - 11, my + 103, ui.muted);
+        let footer = "Enter/Esc: Continue | Hold Esc: Exit";
+        self.draw_text(cx - (footer.len() as i32) * 3, my + 111, footer, ui.sel_label, 1, false);
     }
 
     pub fn render_drone_tuning_menu(&mut self, cfg: &Config, selected: usize) {
@@ -1692,24 +1856,41 @@ impl Renderer {
 
     pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {
         let ui = ui_colors(cfg.ui_theme);
-        self.draw_header("CONTROLLER", "BT / USB-C", ui);
+        let ctrl_src = input.control_source();
+        let header_tag = match ctrl_src {
+            FlightControlSource::Controller => "BT / USB-C",
+            FlightControlSource::ImuSimplified => "IMU EASY",
+            FlightControlSource::None => "NO INPUT",
+        };
+        self.draw_header("CONTROLLER", header_tag, ui);
 
         let name: String = input.controller_name().chars().take(36).collect();
-        let dev_tag = if input.candidate_count > 1 {
-            format!("{name} [{} devs]", input.candidate_count)
-        } else {
-            name
+        let dev_tag = match ctrl_src {
+            FlightControlSource::Controller if input.candidate_count > 1 => {
+                format!("{name} [{} devs]", input.candidate_count)
+            }
+            FlightControlSource::ImuSimplified => "CardputerZero IMU (Simplified)".to_string(),
+            FlightControlSource::None if input.is_cardputer_lite() => {
+                "CardputerZero Lite (No IMU)".to_string()
+            }
+            FlightControlSource::None => "No Controller / No IMU".to_string(),
+            _ => name,
         };
-        let aux_summary = format!(
-            "Thr:{} | ARM:{} MOD:{} TRT:{}",
-            cfg.throttle_mode.name(),
-            cfg.aux_arm.short_label(),
-            cfg.aux_mode.short_label(),
-            cfg.aux_turtle.short_label(),
-        );
+        let sub_summary = match ctrl_src {
+            FlightControlSource::Controller => format!(
+                "Thr:{} | ARM:{} MOD:{} TRT:{}",
+                cfg.throttle_mode.name(),
+                cfg.aux_arm.short_label(),
+                cfg.aux_mode.short_label(),
+                cfg.aux_turtle.short_label(),
+            ),
+            FlightControlSource::ImuSimplified => "Tilt:Steer | F/X:Alt | Z/C:Yaw".to_string(),
+            FlightControlSource::None => "F/X/Z/C:L-Stk | K/B/N/M:R-Stk".to_string(),
+        };
 
-        self.draw_text(8, 25, &dev_tag, ui.sel_label, 1, false);
-        self.draw_text(8, 35, &aux_summary, ui.tag, 1, false);
+        let dev_col = if ctrl_src == FlightControlSource::None { ui.warn } else { ui.sel_label };
+        self.draw_text(8, 25, &dev_tag, dev_col, 1, false);
+        self.draw_text(8, 35, &sub_summary, ui.tag, 1, false);
 
         if let Some(ref wiz) = input.calib {
             self.fill_rect(10, 48, W - 20, 74, ui.header_bg);
@@ -1749,17 +1930,41 @@ impl Renderer {
                 self.fill_rect(pos, y + 2, 4, 6, ui.ok);
             }
 
-            self.draw_stick_box(204, 51, 46, sticks.yaw, sticks.throttle * 2.0 - 1.0);
-            self.draw_stick_box(260, 51, 46, sticks.roll, sticks.pitch);
-            self.draw_text(214, 101, "L-STK", ui.muted, 1, false);
-            self.draw_text(270, 101, "R-STK", ui.muted, 1, false);
+            if ctrl_src == FlightControlSource::ImuSimplified {
+                let thr_pct = (sticks.throttle * 100.0).round() as u8;
+                self.draw_imu_throttle_bar(204, 51, 18, 46, thr_pct, input.imu_climb_cmd(), false);
+                self.draw_imu_tilt_box(260, 51, 46, sticks.roll, sticks.pitch, false);
+                self.draw_text(204, 101, "ALT", ui.muted, 1, false);
+                self.draw_text(274, 101, "IMU", ui.tag, 1, false);
+            } else {
+                self.draw_stick_box(204, 51, 46, sticks.yaw, sticks.throttle * 2.0 - 1.0);
+                self.draw_stick_box(260, 51, 46, sticks.roll, sticks.pitch);
+                self.draw_text(214, 101, "L-STK", ui.muted, 1, false);
+                self.draw_text(270, 101, "R-STK", ui.muted, 1, false);
+            }
         }
 
-        let raw = format!("ABS {}", input.raw_axes_summary());
+        let raw = match ctrl_src {
+            FlightControlSource::Controller => format!("ABS {}", input.raw_axes_summary()),
+            FlightControlSource::ImuSimplified => format!("IMU {}", input.imu.summary()),
+            FlightControlSource::None => input.imu.summary(),
+        };
         let raw_trim: String = raw.chars().take(50).collect();
-        self.draw_text(8, 127, &raw_trim, ui.ok, 1, false);
+        self.draw_text(8, 127, &raw_trim, if ctrl_src == FlightControlSource::None { ui.warn } else { ui.ok }, 1, false);
 
-        self.draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", ui.sel_val, 1, false);
-        self.draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
+        match ctrl_src {
+            FlightControlSource::Controller => {
+                self.draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", ui.sel_val, 1, false);
+                self.draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
+            }
+            FlightControlSource::ImuSimplified => {
+                self.draw_text(8, 141, "C:Zero IMU | F/X:Alt | R:Rescan BT/USB", ui.sel_val, 1, false);
+                self.draw_text(8, 154, "Connect USB/BT radio for full sticks", ui.muted, 1, false);
+            }
+            FlightControlSource::None => {
+                self.draw_text(8, 141, "Connect USB-C Host or BT Controller", ui.sel_val, 1, false);
+                self.draw_text(8, 154, "R:Rescan | N:NextDev | Esc:Back", ui.muted, 1, false);
+            }
+        }
     }
 }

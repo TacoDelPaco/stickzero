@@ -24,7 +24,7 @@
     "permissions": {
       "camera": false,
       "microphone": false,
-      "imu": false,
+      "imu": true,
       "network": false,
       "additional_hardware": false,
       "background_service": false,

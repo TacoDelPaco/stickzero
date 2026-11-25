@@ -7,6 +7,7 @@ mod audio;
 mod config;
 mod display;
 mod font;
+mod imu;
 mod input;
 mod linux_sys;
 mod math;
@@ -18,7 +19,7 @@ mod tracks;
 use audio::AudioEngine;
 use config::{AuxBinding, BatteryPack, Config, FlightMode, RatesPreset, StickOverlay, ThrottleMode, UiTheme, VisualTheme};
 use display::{FbDisplay, SCREEN_H, SCREEN_W};
-use input::InputManager;
+use input::{FlightControlSource, InputManager};
 use linux_sys::{signal, SIGINT, SIGTERM};
 use math::{Quat, Vec3};
 use physics::{QuadState, StickInput, PHYSICS_DT};
@@ -36,6 +37,7 @@ extern "C" fn handle_signal(_sig: i32) {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum AppScreen {
+    ControllerWarning,
     MainMenu,
     DroneTuning,
     Flying,
@@ -222,7 +224,35 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     renderer.render_flight(&qd, &cfg, dive, sticks_d, 60, 0.4);
     png::save_rgb565_png(&dir.join("wireframe-dive-tower.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    println!("Saved 5 CardputerZero 320x170 preview PNGs to {}", dir.display());
+    // 6. CardputerZero IMU Simplified Flight OSD (Summer Meadow, hover-assist vertical gauge + IMU tilt pad)
+    cfg.theme = VisualTheme::Summer;
+    cfg.track_index = 0;
+    cfg.game_mode = config::GameMode::Race;
+    cfg.analog_filter = true;
+    let meadow = &TRACKS[0];
+    let mut qi = QuadState::spawn(meadow, &cfg);
+    qi.control_source = FlightControlSource::ImuSimplified;
+    qi.imu_climb_cmd = 0.0;
+    qi.pos = Vec3::new(-0.8, 2.2, 8.0);
+    qi.vel = Vec3::new(0.8, 0.0, 12.5);
+    qi.on_ground = false;
+    qi.rot = Quat::from_axis_angle(Vec3::FORWARD, -0.14).mul(Quat::from_axis_angle(Vec3::RIGHT, 0.10));
+    qi.lap_time = 9.35;
+    qi.flight_time = 24.0;
+    qi.mah_used = 64.0;
+    qi.throttle_pct = 38;
+    qi.cell_voltage = 4.02;
+    let sticks_i = StickInput { throttle: 0.50, yaw: 0.16, pitch: 0.30, roll: 0.26 };
+    seed_demo_stick_trail(&mut renderer, sticks_i);
+    renderer.render_flight(&qi, &cfg, meadow, sticks_i, 60, 0.9);
+    png::save_rgb565_png(&dir.join("imu-simplified-osd.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 7. Launch Controller Required Warning (No IMU / CardputerZero Lite)
+    cfg.ui_theme = UiTheme::Monokai;
+    renderer.render_controller_warning(&cfg, &input);
+    png::save_rgb565_png(&dir.join("controller-required-warning.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    println!("Saved 7 CardputerZero 320x170 preview PNGs to {}", dir.display());
     Ok(())
 }
 
@@ -267,13 +297,18 @@ fn main() {
     let audio = AudioEngine::start(cfg.sound_on);
     let mut input = InputManager::new();
     let mut renderer = Renderer::new();
-    let mut screen = AppScreen::MainMenu;
+    let mut screen = if input.needs_controller_warning() {
+        AppScreen::ControllerWarning
+    } else {
+        AppScreen::MainMenu
+    };
     let mut sub_return = AppScreen::MainMenu;
     let mut menu_idx: usize = 0;
     let mut drone_idx: usize = 0;
     let mut pause_idx: usize = 0;
     let mut settings_idx: usize = 0;
     let mut quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
+    quad.control_source = input.control_source();
 
     let target_frame = Duration::from_micros(16_667); // 60 Hz target
     let mut last_frame = Instant::now();
@@ -299,6 +334,12 @@ fn main() {
         }
 
         match screen {
+            AppScreen::ControllerWarning => {
+                if input.has_controller() || !input.needs_controller_warning() || act.select || act.back {
+                    screen = AppScreen::MainMenu;
+                }
+                renderer.render_controller_warning(&cfg, &input);
+            }
             AppScreen::MainMenu => {
                 if act.up { menu_idx = (menu_idx + 5) % 6; }
                 if act.down { menu_idx = (menu_idx + 1) % 6; }
@@ -306,6 +347,11 @@ fn main() {
                     match menu_idx {
                         0 if act.select => {
                             quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
+                            quad.control_source = input.control_source();
+                            input.reset_kb_throttle();
+                            if quad.control_source == FlightControlSource::ImuSimplified {
+                                input.recenter_imu();
+                            }
                             renderer.reset_stick_trail();
                             phys_accum = 0.0;
                             if quad.armed {
@@ -453,13 +499,31 @@ fn main() {
                     screen = AppScreen::Paused;
                 } else {
                     let track = &TRACKS[cfg.track_index];
+                    let ctrl_src = input.control_source();
+                    if ctrl_src != quad.control_source {
+                        quad.control_source = ctrl_src;
+                        renderer.reset_stick_trail();
+                        if ctrl_src == FlightControlSource::ImuSimplified {
+                            input.recenter_imu();
+                        }
+                    }
                     if act.respawn {
                         quad.respawn_at_start(track, &cfg);
+                        input.reset_kb_throttle();
+                        if quad.control_source == FlightControlSource::ImuSimplified {
+                            input.recenter_imu();
+                        }
                         renderer.reset_stick_trail();
                         if quad.armed {
                             audio.trigger_arm();
                         }
                     }
+                    if act.recenter_imu && quad.control_source == FlightControlSource::ImuSimplified {
+                        input.recenter_imu();
+                        quad.combo_text = "IMU ZEROED";
+                        quad.combo_timer = 0.9;
+                    }
+                    quad.imu_climb_cmd = input.imu_climb_cmd();
                     let sticks = input.flight_sticks(&cfg);
                     let aux = input.aux_inputs(&cfg);
                     if quad.apply_aux(aux, sticks, &mut cfg) {
@@ -507,6 +571,11 @@ fn main() {
                             0 => screen = AppScreen::Flying,
                             1 => {
                                 quad.respawn_at_start(track, &cfg);
+                                quad.control_source = input.control_source();
+                                input.reset_kb_throttle();
+                                if quad.control_source == FlightControlSource::ImuSimplified {
+                                    input.recenter_imu();
+                                }
                                 renderer.reset_stick_trail();
                                 if quad.armed {
                                     audio.trigger_arm();
@@ -636,7 +705,11 @@ fn main() {
                     cfg.save();
                     screen = AppScreen::MainMenu;
                 } else if act.calibrate {
-                    input.start_calibration();
+                    if input.has_controller() {
+                        input.start_calibration();
+                    } else if input.has_imu() {
+                        input.recenter_imu();
+                    }
                 } else if act.bind_aux {
                     input.start_aux_wizard(&cfg);
                 } else if act.next_device {

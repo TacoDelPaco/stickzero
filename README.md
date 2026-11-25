@@ -30,7 +30,8 @@ StickTime-Pi runs `StickTime.lua` inside an embedded Lua 5.3 interpreter (design
 - **Bluetooth & USB-C Controller Support (EdgeTX / ELRS / Gamepads)**:
   - Hot-plugs standard Linux `evdev` controllers automatically every 1.5s, including **RadioMaster Pocket** (`RM Pocket`), EdgeTX USB Joysticks, ELRS BLE Joysticks, Xbox, PlayStation, Switch Pro, and 8BitDo.
   - Built-in 4-step **Stick Calibration (`C`)** and 3-step **AUX Switch/Button Binder (`B`)** for **Arm/Disarm**, **3-pos Flight Mode (`ACRO`/`HORIZON`/`ANGLE`)**, and **Turtle Mode**.
-  - **Fn-free CardputerZero Keyboard Navigation**: `F/X/Z/C`, `;/./,//`, `WASD`, or Arrow keys in menus; `Tab` arm/disarm, `M` mode cycle, `T` turtle, `R` respawn, **Short `Esc`** pause/back, **Long `Esc` (0.7s)** clean exit to APPLaunch.
+  - **CardputerZero IMU Simplified Flight (No Controller Fallback)**: Automatically reads the onboard **Bosch BMI270** over Linux IIO when no controller is connected — tilt forward/back and left/right to fly with 38° self-leveling, coordinated bank-to-turn yaw, auto-hover altitude hold (`F`/`Up` climb, `X`/`Down` descend/land, `Z`/`C` manual yaw, `Space` re-zero tilt), and a dedicated simplified OSD stick layout (vertical altitude/hover gauge + single `IMU` tilt reticle). On **CardputerZero Lite** or hardware without an IMU sensor, StickZero warns on launch that a controller is required to fly.
+  - **Fn-free CardputerZero Keyboard Controls**: `F/X/Z/C`, `;/./,//`, `WASD`, or Arrow keys in menus and for the **Left Gimbal** (Throttle/Yaw) in flight; **`K/B/N/M`** for the **Right Gimbal** (`K` pitch fwd, `N` pitch back, `B` roll left, `M` roll right); `Space` zero IMU, `Tab` arm/disarm, `E` mode cycle, `T` turtle, `R` respawn, **Short `Esc`** pause/back, **Long `Esc` (0.7s)** clean exit to APPLaunch.
 
 ## Building & Packaging
 
