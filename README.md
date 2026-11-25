@@ -75,6 +75,19 @@ Installing the `.deb` package automatically configures `/etc/udev/rules.d/70-sti
 2. **Reconnect once after updating `.deb`**: Power-cycle / reconnect your Bluetooth radio so BlueZ negotiates the tightened 7.5–11.25 ms connection interval.
 3. **2.4 GHz Wi-Fi / BT Coexistence**: CardputerZero's Pi CM0 shares one 2.4 GHz antenna for Wi-Fi and Bluetooth — periodic Wi-Fi background scans can cause random BT micro-stalls; turning Wi-Fi off while flying over BT (`sudo rfkill block wifi`) removes them completely, or flip the USB switch to **Host** for ~2 ms wired USB-C latency.
 
-### Display Detection
+### Display Detection & Mini-HDMI Output
 
-StickZero never hardcodes `/dev/fb0`. It scans `/proc/fb` for `fb_st7789v` (typically `/dev/fb1` on CardputerZero), and also honors `STICKZERO_FBDEV` or `LV_LINUX_FBDEV_DEVICE` if you want to force HDMI (`/dev/fb0`) or another framebuffer.
+StickZero automatically detects CardputerZero's built-in 320×170 ST7789v3 LCD (honoring `APPLAUNCH_LINUX_FBDEV_DEVICE`, `LV_LINUX_FBDEV_DEVICE`, `/proc/fb`, and `/dev/fb_lcd`) **and** supports live-hotplug **Mini-HDMI output** to TVs, monitors, and HDMI-in FPV goggles with zero external dependencies:
+
+- **Display Modes (`Settings → Display`)**:
+  - **`Auto (Mirror)`** *(default)*: Mirrors to HDMI automatically whenever a monitor/goggles are plugged in (hotplug checked every 1.5s) while keeping the built-in 1.9" LCD active.
+  - **`HDMI Only`**: Outputs exclusively to HDMI and displays a static status card on the 1.9" LCD to save SPI bandwidth and battery; automatically returns to the built-in LCD if HDMI is unplugged.
+  - **`LCD Only`**: Renders strictly to the 1.9" LCD and ignores HDMI.
+- **Zero-Dependency HDMI Backends (auto-selected in order)**:
+  1. **Wayland (`WL`)**: Connects directly to stock CardputerZero's `labwc-pi` compositor (`wayland-0`) fullscreen on the HDMI output, using `wp_viewporter` for GPU-accelerated scaling (<0.15 ms CPU, <450 KB RAM) and non-blocking double-buffered `wl_shm`.
+  2. **DRM/KMS (`DRM`)**: Drives `/dev/dri/card*` `HDMI-A`/`HDMI-B` directly when no compositor owns DRM master (headless / `lightdm` disabled / Raspberry Pi OS Lite), preferring **1280×720 @ 60 Hz** (exact 4× integer scale = `1280×680`) and 16-bit `DRM_FORMAT_RGB565` with automatic `XRGB8888` fallback and clean CRTC restore on exit.
+  3. **Linux fbdev (`FB`)**: Fast LUT + row-repeat scaled blitting for 16-bit RGB565, 24-bit RGB888, and 32-bit XRGB8888/XBGR8888 framebuffers (`vc4drmfb`, `BCM2708 FB`, `simpledrm`).
+- **Optional Environment Overrides**:
+  - `STICKZERO_FBDEV=/dev/fbX` — force a single specific framebuffer device.
+  - `STICKZERO_HDMI_BACKEND=wayland|drm|fbdev` — force a specific HDMI backend.
+  - `STICKZERO_AUDIO_DEV=plughw:CARD=vc4hdmi,DEV=0` — override ALSA `aplay -D` device (e.g. for HDMI audio on ALSA-only setups).

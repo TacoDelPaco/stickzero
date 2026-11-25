@@ -477,6 +477,60 @@ impl ThrottleMode {
     }
 }
 
+/// Output routing between CardputerZero's 1.9" ST7789v3 LCD and Mini-HDMI external display.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DisplayOutput {
+    /// Mirror to HDMI automatically whenever an HDMI display is connected (hotplug supported).
+    Auto,
+    /// Render exclusively to HDMI (shows static status card on LCD; falls back to LCD if unplugged).
+    HdmiOnly,
+    /// Render strictly to the built-in 1.9" LCD and ignore HDMI.
+    LcdOnly,
+}
+
+impl DisplayOutput {
+    #[allow(dead_code)]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Mirror)",
+            Self::HdmiOnly => "HDMI Only",
+            Self::LcdOnly => "LCD Only",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::HdmiOnly,
+            Self::HdmiOnly => Self::LcdOnly,
+            Self::LcdOnly => Self::Auto,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Auto => Self::LcdOnly,
+            Self::HdmiOnly => Self::Auto,
+            Self::LcdOnly => Self::HdmiOnly,
+        }
+    }
+
+    pub fn serialize(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::HdmiOnly => "hdmi",
+            Self::LcdOnly => "lcd",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "hdmi" | "hdmi_only" => Self::HdmiOnly,
+            "lcd" | "lcd_only" => Self::LcdOnly,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Binding for a radio controller AUX switch (EV_ABS axis) or button (EV_KEY code).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AuxBinding {
@@ -568,6 +622,7 @@ pub struct Config {
     pub aux_mode: AuxBinding,
     pub aux_turtle: AuxBinding,
     pub stick_overlay: StickOverlay,
+    pub display_output: DisplayOutput,
     pub best_laps_ms: [u32; 4],
 }
 
@@ -614,6 +669,7 @@ impl Default for Config {
             aux_mode: AuxBinding::None,
             aux_turtle: AuxBinding::None,
             stick_overlay: StickOverlay::Trails,
+            display_output: DisplayOutput::Auto,
             best_laps_ms: [0; 4],
         }
     }
@@ -779,6 +835,7 @@ impl Config {
                     _ => StickOverlay::Trails,
                 },
                 "show_sticks" => cfg.stick_overlay = if v == "0" { StickOverlay::Off } else { StickOverlay::Trails },
+                "display_output" => cfg.display_output = DisplayOutput::parse(v),
                 "best0" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[0] = ms; },
                 "best1" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[1] = ms; },
                 "best2" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[2] = ms; },
@@ -850,6 +907,7 @@ impl Config {
             StickOverlay::Dot => "dot",
             StickOverlay::Trails => "trails",
         };
+        let disp = self.display_output.serialize();
         let gm = match self.game_mode {
             GameMode::Race => "race",
             GameMode::Freestyle => "freestyle",
@@ -864,7 +922,7 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nweight_g={}\nthrust_g={}\nair_drag={}\nrotor_grip={}\nmotor_lag_ms={}\nthr_mid={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nweight_g={}\nthrust_g={}\nair_drag={}\nrotor_grip={}\nmotor_lag_ms={}\nthr_mid={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\ndisplay_output={disp}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
             self.weight_g,
             self.thrust_g,
             self.air_drag,
@@ -900,5 +958,27 @@ impl Config {
             self.best_laps_ms[3],
         );
         let _ = fs::write(path, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_output_cycle_and_roundtrip() {
+        let mut d = DisplayOutput::Auto;
+        assert_eq!(d.name(), "Auto (Mirror)");
+        assert_eq!(DisplayOutput::parse(d.serialize()), DisplayOutput::Auto);
+        d = d.next();
+        assert_eq!(d, DisplayOutput::HdmiOnly);
+        assert_eq!(d.name(), "HDMI Only");
+        assert_eq!(DisplayOutput::parse(d.serialize()), DisplayOutput::HdmiOnly);
+        d = d.next();
+        assert_eq!(d, DisplayOutput::LcdOnly);
+        assert_eq!(d.name(), "LCD Only");
+        assert_eq!(DisplayOutput::parse(d.serialize()), DisplayOutput::LcdOnly);
+        assert_eq!(d.next(), DisplayOutput::Auto);
+        assert_eq!(d.prev(), DisplayOutput::HdmiOnly);
     }
 }

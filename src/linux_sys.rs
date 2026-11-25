@@ -7,7 +7,10 @@ use std::ffi::c_void;
 
 pub const O_RDONLY: i32 = 0;
 pub const O_RDWR: i32 = 2;
+pub const O_CREAT: i32 = 0o100;
+pub const O_EXCL: i32 = 0o200;
 pub const O_NONBLOCK: i32 = 0x800;
+pub const O_CLOEXEC: i32 = 0o2000000;
 
 pub const PROT_READ: i32 = 1;
 pub const PROT_WRITE: i32 = 2;
@@ -19,6 +22,40 @@ pub const SIGTERM: i32 = 15;
 // Linux fbdev ioctls
 pub const FBIOGET_VSCREENINFO: u64 = 0x4600;
 pub const FBIOGET_FSCREENINFO: u64 = 0x4602;
+pub const FBIOPAN_DISPLAY: u64 = 0x4606;
+
+// Linux DRM/KMS ioctls (verified against linux/drm/drm.h & drm_mode.h)
+pub const DRM_IOCTL_MODE_GETRESOURCES: u64 = 0xc040_64a0;
+pub const DRM_IOCTL_MODE_GETCRTC: u64 = 0xc068_64a1;
+pub const DRM_IOCTL_MODE_SETCRTC: u64 = 0xc068_64a2;
+pub const DRM_IOCTL_MODE_GETENCODER: u64 = 0xc014_64a6;
+pub const DRM_IOCTL_MODE_GETCONNECTOR: u64 = 0xc050_64a7;
+pub const DRM_IOCTL_MODE_ADDFB: u64 = 0xc01c_64ae;
+pub const DRM_IOCTL_MODE_RMFB: u64 = 0xc004_64af;
+pub const DRM_IOCTL_MODE_DIRTYFB: u64 = 0xc018_64b1;
+pub const DRM_IOCTL_MODE_CREATE_DUMB: u64 = 0xc020_64b2;
+pub const DRM_IOCTL_MODE_MAP_DUMB: u64 = 0xc010_64b3;
+pub const DRM_IOCTL_MODE_DESTROY_DUMB: u64 = 0xc004_64b4;
+pub const DRM_IOCTL_MODE_ADDFB2: u64 = 0xc068_64b8;
+
+pub const DRM_MODE_CONNECTED: u32 = 1;
+pub const DRM_MODE_CONNECTOR_HDMIA: u32 = 11;
+pub const DRM_MODE_CONNECTOR_HDMIB: u32 = 12;
+pub const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
+pub const DRM_FORMAT_RGB565: u32 = 0x3631_4752; // 'R','G','1','6'
+pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'X','R','2','4'
+
+// Linux socket / ancillary fd passing & memfd constants (x86_64 & aarch64)
+pub const SOL_SOCKET: i32 = 1;
+pub const SCM_RIGHTS: i32 = 1;
+pub const MSG_DONTWAIT: i32 = 0x40;
+pub const MSG_NOSIGNAL: i32 = 0x4000;
+pub const MFD_CLOEXEC: u32 = 1;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_MEMFD_CREATE: i64 = 319;
+#[cfg(target_arch = "aarch64")]
+pub const SYS_MEMFD_CREATE: i64 = 279;
 
 // Linux evdev event types
 pub const EV_SYN: u16 = 0x00;
@@ -267,6 +304,187 @@ pub struct PollFd {
     pub revents: i16,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct DrmModeModeInfo {
+    pub clock: u32,
+    pub hdisplay: u16,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub hskew: u16,
+    pub vdisplay: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    pub vscan: u16,
+    pub vrefresh: u32,
+    pub flags: u32,
+    pub type_: u32,
+    pub name: [u8; 32],
+}
+
+impl Default for DrmModeModeInfo {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeCardRes {
+    pub fb_id_ptr: u64,
+    pub crtc_id_ptr: u64,
+    pub connector_id_ptr: u64,
+    pub encoder_id_ptr: u64,
+    pub count_fbs: u32,
+    pub count_crtcs: u32,
+    pub count_connectors: u32,
+    pub count_encoders: u32,
+    pub min_width: u32,
+    pub max_width: u32,
+    pub min_height: u32,
+    pub max_height: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeCrtc {
+    pub set_connectors_ptr: u64,
+    pub count_connectors: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub gamma_size: u32,
+    pub mode_valid: u32,
+    pub mode: DrmModeModeInfo,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeGetEncoder {
+    pub encoder_id: u32,
+    pub encoder_type: u32,
+    pub crtc_id: u32,
+    pub possible_crtcs: u32,
+    pub possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeGetConnector {
+    pub encoders_ptr: u64,
+    pub modes_ptr: u64,
+    pub props_ptr: u64,
+    pub prop_values_ptr: u64,
+    pub count_modes: u32,
+    pub count_props: u32,
+    pub count_encoders: u32,
+    pub encoder_id: u32,
+    pub connector_id: u32,
+    pub connector_type: u32,
+    pub connector_type_id: u32,
+    pub connection: u32,
+    pub mm_width: u32,
+    pub mm_height: u32,
+    pub subpixel: u32,
+    pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeFbCmd {
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub depth: u32,
+    pub handle: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeFbCmd2 {
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: u32,
+    pub flags: u32,
+    pub handles: [u32; 4],
+    pub pitches: [u32; 4],
+    pub offsets: [u32; 4],
+    pub modifier: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeCreateDumb {
+    pub height: u32,
+    pub width: u32,
+    pub bpp: u32,
+    pub flags: u32,
+    pub handle: u32,
+    pub pitch: u32,
+    pub size: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeMapDumb {
+    pub handle: u32,
+    pub pad: u32,
+    pub offset: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeDestroyDumb {
+    pub handle: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct DrmModeFbDirtyCmd {
+    pub fb_id: u32,
+    pub flags: u32,
+    pub color: u32,
+    pub num_clips: u32,
+    pub clips_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Iovec {
+    pub iov_base: *mut c_void,
+    pub iov_len: usize,
+}
+
+/// 64-bit little-endian Linux `struct msghdr` layout (ABI-compatible across x86_64-gnu and aarch64-musl).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Msghdr {
+    pub msg_name: *mut c_void,
+    pub msg_namelen: u32,
+    pub _pad0: u32,
+    pub msg_iov: *mut Iovec,
+    pub msg_iovlen: usize,
+    pub msg_control: *mut c_void,
+    pub msg_controllen: usize,
+    pub msg_flags: i32,
+    pub _pad1: u32,
+}
+
+/// 64-bit little-endian Linux `struct cmsghdr` layout (ABI-compatible across x86_64-gnu and aarch64-musl).
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct Cmsghdr {
+    pub cmsg_len: usize,
+    pub cmsg_level: i32,
+    pub cmsg_type: i32,
+}
+
 extern "C" {
     pub fn open(pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
     pub fn close(fd: i32) -> i32;
@@ -283,4 +501,34 @@ extern "C" {
     ) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, length: usize) -> i32;
     pub fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+    pub fn getuid() -> u32;
+    pub fn ftruncate(fd: i32, length: i64) -> i32;
+    pub fn unlink(pathname: *const std::ffi::c_char) -> i32;
+    pub fn sendmsg(sockfd: i32, msg: *const Msghdr, flags: i32) -> isize;
+    pub fn recvmsg(sockfd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+    pub fn syscall(number: i64, ...) -> i64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn test_drm_and_socket_abi_sizes() {
+        assert_eq!(size_of::<DrmModeModeInfo>(), 68);
+        assert_eq!(size_of::<DrmModeCardRes>(), 64);
+        assert_eq!(size_of::<DrmModeCrtc>(), 104);
+        assert_eq!(size_of::<DrmModeGetEncoder>(), 20);
+        assert_eq!(size_of::<DrmModeGetConnector>(), 80);
+        assert_eq!(size_of::<DrmModeFbCmd>(), 28);
+        assert_eq!(size_of::<DrmModeFbCmd2>(), 104);
+        assert_eq!(size_of::<DrmModeCreateDumb>(), 32);
+        assert_eq!(size_of::<DrmModeMapDumb>(), 16);
+        assert_eq!(size_of::<DrmModeDestroyDumb>(), 4);
+        assert_eq!(size_of::<DrmModeFbDirtyCmd>(), 24);
+        assert_eq!(size_of::<Iovec>(), 16);
+        assert_eq!(size_of::<Msghdr>(), 56);
+        assert_eq!(size_of::<Cmsghdr>(), 16);
+    }
 }

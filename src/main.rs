@@ -6,6 +6,7 @@
 mod audio;
 mod config;
 mod display;
+mod drm;
 mod font;
 mod hidraw;
 mod imu;
@@ -16,10 +17,11 @@ mod physics;
 mod png;
 mod renderer;
 mod tracks;
+mod wayland;
 
 use audio::AudioEngine;
 use config::{AuxBinding, BatteryPack, Config, FlightMode, RatesPreset, StickOverlay, ThrottleMode, UiTheme, VisualTheme};
-use display::{FbDisplay, SCREEN_H, SCREEN_W};
+use display::{DisplayManager, SCREEN_H, SCREEN_W};
 use input::{FlightControlSource, InputManager};
 use linux_sys::{signal, SIGINT, SIGTERM};
 use math::{Quat, Vec3};
@@ -102,7 +104,7 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     let input = InputManager::new();
 
     // 1. Main Menu (Monokai default)
-    renderer.render_main_menu(&cfg, 0, &input);
+    renderer.render_main_menu(&cfg, 0, &input, None);
     png::save_rgb565_png(&dir.join("01-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 2. Summer Meadow Race Flight (with Analog FX + Betaflight OSD + Trailing Sticks)
@@ -163,12 +165,12 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
 
     // 1. Monokai Main Menu (Default)
     cfg.ui_theme = UiTheme::Monokai;
-    renderer.render_main_menu(&cfg, 0, &input);
+    renderer.render_main_menu(&cfg, 0, &input, None);
     png::save_rgb565_png(&dir.join("monokai-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 2. StickTime Main Menu (Alternate)
     cfg.ui_theme = UiTheme::StickTime;
-    renderer.render_main_menu(&cfg, 0, &input);
+    renderer.render_main_menu(&cfg, 0, &input, None);
     png::save_rgb565_png(&dir.join("sticktime-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 3. Monokai Drone Tuning Menu (real physical units: Weight (g): 37 with Lava II 680mAh)
@@ -180,7 +182,7 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     // 4. Monokai Settings showing UI Theme + Stick OSD: Trails
     cfg.flight_mode = FlightMode::Horizon;
     cfg.stick_overlay = StickOverlay::Trails;
-    renderer.render_settings_menu(&cfg, 10, false);
+    renderer.render_settings_menu(&cfg, 10, false, None);
     png::save_rgb565_png(&dir.join("monokai-settings.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 4. Clean zero-overlap Wireframe Bando + Trailing Sticks OSD
@@ -250,7 +252,7 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
 
     // 7. Launch Controller Required Warning (No IMU / CardputerZero Lite)
     cfg.ui_theme = UiTheme::Monokai;
-    renderer.render_controller_warning(&cfg, &input);
+    renderer.render_controller_warning(&cfg, &input, None);
     png::save_rgb565_png(&dir.join("controller-required-warning.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     println!("Saved 7 CardputerZero 320x170 preview PNGs to {}", dir.display());
@@ -285,7 +287,8 @@ fn main() {
         signal(SIGTERM, handle_signal);
     }
 
-    let mut display = match FbDisplay::open_auto() {
+    let mut cfg = Config::load();
+    let mut display = match DisplayManager::open(cfg.display_output) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("StickZero display init failed: {e}");
@@ -294,10 +297,10 @@ fn main() {
         }
     };
 
-    let mut cfg = Config::load();
     let audio = AudioEngine::start(cfg.sound_on);
     let mut input = InputManager::new();
     let mut renderer = Renderer::new();
+    let mut notice_renderer: Option<Renderer> = None;
     let mut screen = if input.needs_controller_warning() {
         AppScreen::ControllerWarning
     } else {
@@ -324,6 +327,9 @@ fn main() {
         let dt = (frame_start - last_frame).as_secs_f32().min(0.05);
         last_frame = frame_start;
 
+        display.sync_hotplug(cfg.display_output, false);
+        let hdmi_tag = display.hdmi_compact_tag();
+
         let in_menu = screen != AppScreen::Flying;
         let motors_sounding = !in_menu && quad.armed && (!quad.turtle_active || quad.motor_thr > 0.03);
         audio.set_flying(motors_sounding, cfg.analog_filter);
@@ -339,7 +345,7 @@ fn main() {
                 if input.has_controller() || !input.needs_controller_warning() || act.select || act.back {
                     screen = AppScreen::MainMenu;
                 }
-                renderer.render_controller_warning(&cfg, &input);
+                renderer.render_controller_warning(&cfg, &input, hdmi_tag.as_deref());
             }
             AppScreen::MainMenu => {
                 if act.up { menu_idx = (menu_idx + 5) % 6; }
@@ -395,7 +401,7 @@ fn main() {
                         _ => {}
                     }
                 }
-                renderer.render_main_menu(&cfg, menu_idx, &input);
+                renderer.render_main_menu(&cfg, menu_idx, &input, hdmi_tag.as_deref());
             }
             AppScreen::DroneTuning => {
                 const NUM_DRONE: usize = 11;
@@ -604,7 +610,7 @@ fn main() {
                 renderer.render_pause_menu(&cfg, pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 17;
+                const NUM_SETTINGS: usize = 18;
                 let imu_mode = input.control_source() == FlightControlSource::ImuSimplified;
                 if act.back {
                     cfg.save();
@@ -685,12 +691,21 @@ fn main() {
                             14 => cfg.sky_detail = !cfg.sky_detail,
                             15 => cfg.stick_mode = cfg.stick_mode.toggle(),
                             16 => cfg.throttle_mode = cfg.throttle_mode.toggle(),
+                            17 => {
+                                cfg.display_output = if act.left {
+                                    cfg.display_output.prev()
+                                } else {
+                                    cfg.display_output.next()
+                                };
+                                display.sync_hotplug(cfg.display_output, true);
+                            }
                             _ => {}
                         }
                         cfg.save();
                     }
                 }
-                renderer.render_settings_menu(&cfg, settings_idx, imu_mode);
+                let settings_hdmi_tag = display.hdmi_compact_tag();
+                renderer.render_settings_menu(&cfg, settings_idx, imu_mode, settings_hdmi_tag.as_deref());
             }
             AppScreen::Controller => {
                 if input.calib.is_some() {
@@ -740,7 +755,15 @@ fn main() {
             }
         }
 
-        display.present(&renderer.fb);
+        let hdmi_notice_fb = if display.needs_hdmi_notice(cfg.display_output) {
+            let nr = notice_renderer.get_or_insert_with(Renderer::new);
+            let info = display.hdmi_status_text();
+            nr.render_hdmi_lcd_notice(&cfg, &info);
+            Some(&*nr.fb)
+        } else {
+            None
+        };
+        display.present(&renderer.fb, cfg.display_output, hdmi_notice_fb);
 
         fps_counter += 1;
         if fps_timer.elapsed() >= Duration::from_secs(1) {

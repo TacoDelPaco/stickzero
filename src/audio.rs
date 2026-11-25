@@ -116,8 +116,14 @@ impl Drop for AudioEngine {
 }
 
 fn spawn_aplay() -> Option<Child> {
-    Command::new("aplay")
-        .args([
+    let mut cmd = Command::new("aplay");
+    if let Ok(dev) = std::env::var("STICKZERO_AUDIO_DEV") {
+        let dev = dev.trim();
+        if !dev.is_empty() {
+            cmd.args(["-D", dev]);
+        }
+    }
+    cmd.args([
             "-q",
             "-t", "raw",
             "-f", "S16_LE",

@@ -6,7 +6,7 @@
 
   "store": {
     "summary": "Minimal native Rust 3D FPV tinywhoop simulator with USB-C & BT controller support.",
-    "description": "StickZero is a lightweight, zero-dependency 3D FPV quadcopter simulator written in pure Rust for the M5Stack CardputerZero. Inspired by StickTime-Pi, it renders directly to the 320x170 ST7789v3 RGB565 display at 60 FPS with a two-pass 16-bit Z-buffer and 240 Hz 6-DOF quaternion physics. Features BetaFPV Air75 II (75mm) and Meteor75 Pro II (1S 75mm) presets, a dedicated real-unit Drone Tuning menu (Weight (g), Thrust (g), Air Drag, Rotor Grip, Motor Lag (ms), Thr Mid/Expo, Lava II 580/680mAh packs, Prop Wash), ACRO/HORIZON/ANGLE flight modes, custom Betaflight Actual rates, Betaflight OSD with trailing stick overlay & post-flight stats, Monokai & StickTime UI themes, real-time tinywhoop audio, 4 tracks, and USB-C/Bluetooth Stick Calibration & AUX Switch Binding wizards.",
+    "description": "StickZero is a lightweight, zero-dependency 3D FPV quadcopter simulator written in pure Rust for the M5Stack CardputerZero. Inspired by StickTime-Pi, it renders directly to the 320x170 ST7789v3 RGB565 display and Mini-HDMI external displays/FPV goggles (Wayland, DRM/KMS, or fbdev with live hotplug) at 60 FPS with a two-pass 16-bit Z-buffer and 240 Hz 6-DOF quaternion physics. Features BetaFPV Air75 II (75mm) and Meteor75 Pro II (1S 75mm) presets, a dedicated real-unit Drone Tuning menu (Weight (g), Thrust (g), Air Drag, Rotor Grip, Motor Lag (ms), Thr Mid/Expo, Lava II 580/680mAh packs, Prop Wash), ACRO/HORIZON/ANGLE flight modes, custom Betaflight Actual rates, Betaflight OSD with trailing stick overlay & post-flight stats, Monokai & StickTime UI themes, real-time tinywhoop audio, 4 tracks, and USB-C/Bluetooth Stick Calibration & AUX Switch Binding wizards.",
     "categories": ["Games"],
     "screenshots": [
       "screenshots/01-main-menu.png",
@@ -28,7 +28,7 @@
       "network": false,
       "additional_hardware": false,
       "background_service": false,
-      "external_display": false
+      "external_display": true
     }
   }
 }

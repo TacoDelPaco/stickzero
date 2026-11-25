@@ -2,7 +2,9 @@
 //! per-pixel 16-bit perspective-correct Z-buffer, solid 3D racing gates,
 //! authentic Betaflight OSD + post-flight statistics, and CardputerZero 1.9" menus.
 
-use crate::config::{AuxBinding, BatteryPack, Config, GameMode, StickOverlay, UiTheme, VisualTheme};
+use crate::config::{
+    AuxBinding, BatteryPack, Config, DisplayOutput, GameMode, StickOverlay, UiTheme, VisualTheme,
+};
 use crate::display::{SCREEN_H, SCREEN_W};
 use crate::font::{glyph, GLYPH_H, GLYPH_W};
 use crate::input::{FlightControlSource, InputManager};
@@ -1655,9 +1657,19 @@ impl Renderer {
         self.draw_text(W - rw - 6, 8, right_tag, ui.tag, 1, false);
     }
 
-    pub fn render_main_menu(&mut self, cfg: &Config, selected: usize, input: &InputManager) {
+    pub fn render_main_menu(
+        &mut self,
+        cfg: &Config,
+        selected: usize,
+        input: &InputManager,
+        hdmi_tag: Option<&str>,
+    ) {
         let ui = ui_colors(cfg.ui_theme);
-        self.draw_header("STICKZERO", "RUST FPV", ui);
+        let right_tag = match hdmi_tag {
+            Some(tag) => format!("HDMI {tag}"),
+            None => "RUST FPV".to_string(),
+        };
+        self.draw_header("STICKZERO", &right_tag, ui);
 
         let track = &TRACKS[cfg.track_index.min(TRACKS.len() - 1)];
         let items: [(&str, String); 6] = [
@@ -1706,8 +1718,13 @@ impl Renderer {
 
     /// Launch warning modal shown when no IMU sensor is detected and/or running on CardputerZero Lite
     /// without a connected USB-C or Bluetooth controller.
-    pub fn render_controller_warning(&mut self, cfg: &Config, input: &InputManager) {
-        self.render_main_menu(cfg, 0, input);
+    pub fn render_controller_warning(
+        &mut self,
+        cfg: &Config,
+        input: &InputManager,
+        hdmi_tag: Option<&str>,
+    ) {
+        self.render_main_menu(cfg, 0, input, hdmi_tag);
         let ui = ui_colors(cfg.ui_theme);
 
         let mx = 18;
@@ -1815,14 +1832,27 @@ impl Renderer {
         }
     }
 
-    pub fn render_settings_menu(&mut self, cfg: &Config, selected: usize, imu_mode: bool) {
+    pub fn render_settings_menu(
+        &mut self,
+        cfg: &Config,
+        selected: usize,
+        imu_mode: bool,
+        hdmi_tag: Option<&str>,
+    ) {
         let ui = ui_colors(cfg.ui_theme);
         let flight_mode_val = if imu_mode {
             "IMU EASY (Locked)".to_string()
         } else {
             cfg.flight_mode.name().to_string()
         };
-        let rows: [(&str, String); 17] = [
+        let display_val = match (cfg.display_output, hdmi_tag) {
+            (DisplayOutput::Auto, Some(tag)) => format!("Auto [{tag}]"),
+            (DisplayOutput::Auto, None) => "Auto [LCD]".to_string(),
+            (DisplayOutput::HdmiOnly, Some(tag)) => format!("HDMI [{tag}]"),
+            (DisplayOutput::HdmiOnly, None) => "HDMI Only [No HDMI]".to_string(),
+            (DisplayOutput::LcdOnly, _) => "LCD Only".to_string(),
+        };
+        let rows: [(&str, String); 18] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", flight_mode_val),
             ("Rate Preset", cfg.rates.name().to_string()),
@@ -1840,6 +1870,7 @@ impl Renderer {
             ("Sky Detail", if cfg.sky_detail { "On (Sun/Stars)" } else { "Off" }.to_string()),
             ("Stick Mode", cfg.stick_mode.name().to_string()),
             ("Throttle Mode", cfg.throttle_mode.name().to_string()),
+            ("Display", display_val),
         ];
 
         let tag = format!("{}/{}", selected + 1, rows.len());
@@ -1880,6 +1911,36 @@ impl Renderer {
         }
 
         self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Adjust | Esc:Save", ui.muted, 1, false);
+    }
+
+    /// Static status card drawn once on the built-in 1.9" LCD when `HDMI Only` mode is active.
+    pub fn render_hdmi_lcd_notice(&mut self, cfg: &Config, hdmi_info: &str) {
+        let ui = ui_colors(cfg.ui_theme);
+        self.draw_header("STICKZERO", "HDMI ONLY", ui);
+        let cx = W / 2;
+
+        self.fill_rect(18, 34, W - 36, 98, ui.header_bg);
+        self.draw_rect(18, 34, W - 36, 98, ui.sel_border);
+
+        let title = "HDMI OUTPUT ACTIVE";
+        self.draw_text(cx - (title.len() as i32) * 6, 46, title, ui.sel_label, 2, false);
+
+        self.draw_text(
+            cx - (hdmi_info.len() as i32) * 3,
+            74,
+            hdmi_info,
+            ui.tag,
+            1,
+            false,
+        );
+
+        let l1 = "LCD paused to save battery & SPI";
+        let l2 = "Unplug HDMI to return to LCD";
+        self.draw_text(cx - (l1.len() as i32) * 3, 96, l1, ui.label, 1, false);
+        self.draw_text(cx - (l2.len() as i32) * 3, 110, l2, ui.muted, 1, false);
+
+        let footer = "Settings -> Display: Auto / LCD";
+        self.draw_text(cx - (footer.len() as i32) * 3, H - 14, footer, ui.muted, 1, false);
     }
 
     pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {
