@@ -531,6 +531,120 @@ impl DisplayOutput {
     }
 }
 
+/// Internal software render resolution when Mini-HDMI output is active.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HdmiResolution {
+    /// Native built-in LCD resolution (320x170, lowest CPU & power).
+    Native320,
+    /// True 16:9 HD render (640x360: exact 2x to 720p, exact 3x to 1080p, no letterbox bars).
+    Hd640,
+    /// Extra-sharp 16:9 qHD render (960x540: exact 2x to 1080p).
+    Qhd960,
+}
+
+impl HdmiResolution {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Native320 => "320x170 (1x)",
+            Self::Hd640 => "640x360 (16:9)",
+            Self::Qhd960 => "960x540 (qHD)",
+        }
+    }
+
+    pub const fn dimensions(self) -> (usize, usize) {
+        match self {
+            Self::Native320 => (320, 170),
+            Self::Hd640 => (640, 360),
+            Self::Qhd960 => (960, 540),
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Native320 => Self::Hd640,
+            Self::Hd640 => Self::Qhd960,
+            Self::Qhd960 => Self::Native320,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Native320 => Self::Qhd960,
+            Self::Hd640 => Self::Native320,
+            Self::Qhd960 => Self::Hd640,
+        }
+    }
+
+    pub fn serialize(self) -> &'static str {
+        match self {
+            Self::Native320 => "320",
+            Self::Hd640 => "640",
+            Self::Qhd960 => "960",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "320" | "320x170" | "1x" => Self::Native320,
+            "960" | "960x540" | "qhd" => Self::Qhd960,
+            _ => Self::Hd640,
+        }
+    }
+}
+
+/// Built-in 1.9" LCD backlight policy while Mini-HDMI output is active.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HdmiLcdBacklight {
+    /// Dim the built-in LCD backlight (~12%) while HDMI is active to save battery.
+    Dim,
+    /// Turn the built-in LCD backlight completely off (0%) and pause SPI blits while HDMI is active.
+    Off,
+    /// Leave the built-in LCD backlight untouched at full user brightness.
+    KeepOn,
+}
+
+impl HdmiLcdBacklight {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dim => "Dim (12%)",
+            Self::Off => "Off (0%)",
+            Self::KeepOn => "Keep On",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dim => Self::Off,
+            Self::Off => Self::KeepOn,
+            Self::KeepOn => Self::Dim,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Dim => Self::KeepOn,
+            Self::Off => Self::Dim,
+            Self::KeepOn => Self::Off,
+        }
+    }
+
+    pub fn serialize(self) -> &'static str {
+        match self {
+            Self::Dim => "dim",
+            Self::Off => "off",
+            Self::KeepOn => "on",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "off" | "0" => Self::Off,
+            "on" | "keep" | "keep_on" => Self::KeepOn,
+            _ => Self::Dim,
+        }
+    }
+}
+
 /// Binding for a radio controller AUX switch (EV_ABS axis) or button (EV_KEY code).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AuxBinding {
@@ -623,6 +737,8 @@ pub struct Config {
     pub aux_turtle: AuxBinding,
     pub stick_overlay: StickOverlay,
     pub display_output: DisplayOutput,
+    pub hdmi_resolution: HdmiResolution,
+    pub hdmi_lcd_backlight: HdmiLcdBacklight,
     pub best_laps_ms: [u32; 4],
 }
 
@@ -670,6 +786,8 @@ impl Default for Config {
             aux_turtle: AuxBinding::None,
             stick_overlay: StickOverlay::Trails,
             display_output: DisplayOutput::Auto,
+            hdmi_resolution: HdmiResolution::Hd640,
+            hdmi_lcd_backlight: HdmiLcdBacklight::Dim,
             best_laps_ms: [0; 4],
         }
     }
@@ -836,6 +954,8 @@ impl Config {
                 },
                 "show_sticks" => cfg.stick_overlay = if v == "0" { StickOverlay::Off } else { StickOverlay::Trails },
                 "display_output" => cfg.display_output = DisplayOutput::parse(v),
+                "hdmi_resolution" => cfg.hdmi_resolution = HdmiResolution::parse(v),
+                "hdmi_lcd_backlight" => cfg.hdmi_lcd_backlight = HdmiLcdBacklight::parse(v),
                 "best0" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[0] = ms; },
                 "best1" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[1] = ms; },
                 "best2" => if let Ok(ms) = v.parse() { cfg.best_laps_ms[2] = ms; },
@@ -908,6 +1028,8 @@ impl Config {
             StickOverlay::Trails => "trails",
         };
         let disp = self.display_output.serialize();
+        let hdmi_res = self.hdmi_resolution.serialize();
+        let hdmi_bl = self.hdmi_lcd_backlight.serialize();
         let gm = match self.game_mode {
             GameMode::Race => "race",
             GameMode::Freestyle => "freestyle",
@@ -922,7 +1044,7 @@ impl Config {
         };
         let fmt_opt = |o: Option<u16>| o.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string());
         let out = format!(
-            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nweight_g={}\nthrust_g={}\nair_drag={}\nrotor_grip={}\nmotor_lag_ms={}\nthr_mid={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\ndisplay_output={disp}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
+            "quad={quad}\nbattery_pack={batt}\nprop_wash={pw}\nweight_g={}\nthrust_g={}\nair_drag={}\nrotor_grip={}\nmotor_lag_ms={}\nthr_mid={}\nthr_expo={}\nflight_mode={fm}\nrates={rates}\nrate_center={}\nrate_max={}\nrate_expo={}\ncamera_tilt={}\ntheme={theme}\nui_theme={ui}\ndetail_high={}\nsky_detail={}\nanalog_filter={}\nsound_on={}\ndebug_osd={}\nfov_deg={}\ngame_mode={gm}\ntrack={}\nstick_mode={sm}\nthrottle_mode={tm}\ninvert_pitch={}\ninvert_throttle={}\ninvert_yaw={}\ninvert_roll={}\naxis_thr={}\naxis_yaw={}\naxis_pit={}\naxis_rol={}\naux_arm={}\naux_mode={}\naux_turtle={}\nstick_overlay={so}\ndisplay_output={disp}\nhdmi_resolution={hdmi_res}\nhdmi_lcd_backlight={hdmi_bl}\nbest0={}\nbest1={}\nbest2={}\nbest3={}\n",
             self.weight_g,
             self.thrust_g,
             self.air_drag,
@@ -980,5 +1102,33 @@ mod tests {
         assert_eq!(DisplayOutput::parse(d.serialize()), DisplayOutput::LcdOnly);
         assert_eq!(d.next(), DisplayOutput::Auto);
         assert_eq!(d.prev(), DisplayOutput::HdmiOnly);
+    }
+
+    #[test]
+    fn test_hdmi_resolution_and_backlight_roundtrip() {
+        let mut r = HdmiResolution::Hd640;
+        assert_eq!(r.dimensions(), (640, 360));
+        assert_eq!(HdmiResolution::parse(r.serialize()), HdmiResolution::Hd640);
+        r = r.next();
+        assert_eq!(r, HdmiResolution::Qhd960);
+        assert_eq!(r.dimensions(), (960, 540));
+        assert_eq!(HdmiResolution::parse(r.serialize()), HdmiResolution::Qhd960);
+        r = r.next();
+        assert_eq!(r, HdmiResolution::Native320);
+        assert_eq!(r.dimensions(), (320, 170));
+        assert_eq!(HdmiResolution::parse(r.serialize()), HdmiResolution::Native320);
+        assert_eq!(r.next(), HdmiResolution::Hd640);
+        assert_eq!(r.prev(), HdmiResolution::Qhd960);
+
+        let mut b = HdmiLcdBacklight::Dim;
+        assert_eq!(HdmiLcdBacklight::parse(b.serialize()), HdmiLcdBacklight::Dim);
+        b = b.next();
+        assert_eq!(b, HdmiLcdBacklight::Off);
+        assert_eq!(HdmiLcdBacklight::parse(b.serialize()), HdmiLcdBacklight::Off);
+        b = b.next();
+        assert_eq!(b, HdmiLcdBacklight::KeepOn);
+        assert_eq!(HdmiLcdBacklight::parse(b.serialize()), HdmiLcdBacklight::KeepOn);
+        assert_eq!(b.next(), HdmiLcdBacklight::Dim);
+        assert_eq!(b.prev(), HdmiLcdBacklight::Off);
     }
 }

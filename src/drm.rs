@@ -6,7 +6,7 @@
 //! 16-bit `DRM_FORMAT_RGB565` (with automatic 32-bit `XRGB8888` fallback), and cleanly
 //! restores the previous CRTC state on exit or unplug.
 
-use crate::display::{Blitter, PixelLayout, SCREEN_H, SCREEN_W};
+use crate::display::{Blitter, PixelLayout};
 use crate::linux_sys::{
     close, ioctl, mmap, munmap, open, DrmModeCardRes, DrmModeCreateDumb, DrmModeCrtc,
     DrmModeDestroyDumb, DrmModeFbCmd, DrmModeFbCmd2, DrmModeFbDirtyCmd, DrmModeGetConnector,
@@ -329,13 +329,23 @@ impl DrmDisplay {
         Err("no connected HDMI connector on DRM card".to_string())
     }
 
-    pub fn present(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H]) -> bool {
+    pub fn present(&mut self, rgb565: &[u16], src_w: usize, src_h: usize) -> bool {
         if !self.alive {
             return false;
         }
+        if self.blitter.ensure_source(src_w, src_h) {
+            for b in &self.bufs {
+                if !b.ptr.is_null() && b.size > 0 {
+                    unsafe {
+                        ptr::write_bytes(b.ptr, 0, b.size);
+                    }
+                }
+            }
+        }
         let back = self.front ^ 1;
         let buf = &self.bufs[back];
-        self.blitter.blit_rgb565(rgb565, buf.ptr, buf.size);
+        self.blitter
+            .blit_rgb565(rgb565, src_w, src_h, buf.ptr, buf.size);
 
         let mut conn = self.connector_id;
         let mut crtc = DrmModeCrtc {

@@ -20,7 +20,10 @@ mod tracks;
 mod wayland;
 
 use audio::AudioEngine;
-use config::{AuxBinding, BatteryPack, Config, FlightMode, RatesPreset, StickOverlay, ThrottleMode, UiTheme, VisualTheme};
+use config::{
+    AuxBinding, BatteryPack, Config, FlightMode, HdmiResolution, RatesPreset, StickOverlay,
+    ThrottleMode, UiTheme, VisualTheme,
+};
 use display::{DisplayManager, SCREEN_H, SCREEN_W};
 use input::{FlightControlSource, InputManager};
 use linux_sys::{signal, SIGINT, SIGTERM};
@@ -59,7 +62,15 @@ fn run_benchmark() {
     quad.on_ground = false;
 
     const FRAMES: usize = 600;
-    for overlay in [StickOverlay::Dot, StickOverlay::Trails] {
+    let cases = [
+        (HdmiResolution::Native320, StickOverlay::Dot),
+        (HdmiResolution::Native320, StickOverlay::Trails),
+        (HdmiResolution::Hd640, StickOverlay::Trails),
+        (HdmiResolution::Qhd960, StickOverlay::Trails),
+    ];
+    for (res, overlay) in cases {
+        let (w, h) = res.dimensions();
+        renderer.set_size(w, h);
         cfg.stick_overlay = overlay;
         renderer.reset_stick_trail();
         let t0 = Instant::now();
@@ -80,8 +91,8 @@ fn run_benchmark() {
         let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / (FRAMES as f64);
         let fps = 1000.0 / ms_per_frame;
         println!(
-            "StickZero benchmark [Stick OSD: {:8}] ({} frames @ 320x170 Z-buf + 240Hz): {:.3} ms/frame ({:.0} FPS)",
-            overlay.name(), FRAMES, ms_per_frame, fps
+            "StickZero benchmark [{:3}x{:<3} | Stick OSD: {:8}] ({} frames Z-buf + 240Hz): {:.3} ms/frame ({:.0} FPS)",
+            w, h, overlay.name(), FRAMES, ms_per_frame, fps
         );
     }
 }
@@ -288,7 +299,7 @@ fn main() {
     }
 
     let mut cfg = Config::load();
-    let mut display = match DisplayManager::open(cfg.display_output) {
+    let mut display = match DisplayManager::open(cfg.display_output, cfg.hdmi_lcd_backlight) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("StickZero display init failed: {e}");
@@ -299,7 +310,8 @@ fn main() {
 
     let audio = AudioEngine::start(cfg.sound_on);
     let mut input = InputManager::new();
-    let mut renderer = Renderer::new();
+    let (init_w, init_h) = display.desired_render_size(cfg.hdmi_resolution);
+    let mut renderer = Renderer::with_size(init_w, init_h);
     let mut notice_renderer: Option<Renderer> = None;
     let mut screen = if input.needs_controller_warning() {
         AppScreen::ControllerWarning
@@ -327,7 +339,9 @@ fn main() {
         let dt = (frame_start - last_frame).as_secs_f32().min(0.05);
         last_frame = frame_start;
 
-        display.sync_hotplug(cfg.display_output, false);
+        display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, false);
+        let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
+        renderer.set_size(rw, rh);
         let hdmi_tag = display.hdmi_compact_tag();
 
         let in_menu = screen != AppScreen::Flying;
@@ -610,7 +624,7 @@ fn main() {
                 renderer.render_pause_menu(&cfg, pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 18;
+                const NUM_SETTINGS: usize = 20;
                 let imu_mode = input.control_source() == FlightControlSource::ImuSimplified;
                 if act.back {
                     cfg.save();
@@ -697,7 +711,26 @@ fn main() {
                                 } else {
                                     cfg.display_output.next()
                                 };
-                                display.sync_hotplug(cfg.display_output, true);
+                                display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, true);
+                                let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
+                                renderer.set_size(rw, rh);
+                            }
+                            18 => {
+                                cfg.hdmi_resolution = if act.left {
+                                    cfg.hdmi_resolution.prev()
+                                } else {
+                                    cfg.hdmi_resolution.next()
+                                };
+                                let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
+                                renderer.set_size(rw, rh);
+                            }
+                            19 => {
+                                cfg.hdmi_lcd_backlight = if act.left {
+                                    cfg.hdmi_lcd_backlight.prev()
+                                } else {
+                                    cfg.hdmi_lcd_backlight.next()
+                                };
+                                display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, true);
                             }
                             _ => {}
                         }
@@ -755,15 +788,22 @@ fn main() {
             }
         }
 
-        let hdmi_notice_fb = if display.needs_hdmi_notice(cfg.display_output) {
+        let hdmi_notice_fb = if display.needs_hdmi_notice(cfg.display_output, cfg.hdmi_lcd_backlight) {
             let nr = notice_renderer.get_or_insert_with(Renderer::new);
             let info = display.hdmi_status_text();
             nr.render_hdmi_lcd_notice(&cfg, &info);
-            Some(&*nr.fb)
+            Some(nr.fb.as_slice())
         } else {
             None
         };
-        display.present(&renderer.fb, cfg.display_output, hdmi_notice_fb);
+        display.present(
+            &renderer.fb,
+            renderer.width,
+            renderer.height,
+            cfg.display_output,
+            cfg.hdmi_lcd_backlight,
+            hdmi_notice_fb,
+        );
 
         fps_counter += 1;
         if fps_timer.elapsed() >= Duration::from_secs(1) {

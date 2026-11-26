@@ -3,7 +3,8 @@
 //! authentic Betaflight OSD + post-flight statistics, and CardputerZero 1.9" menus.
 
 use crate::config::{
-    AuxBinding, BatteryPack, Config, DisplayOutput, GameMode, StickOverlay, UiTheme, VisualTheme,
+    AuxBinding, BatteryPack, Config, DisplayOutput, GameMode, HdmiLcdBacklight, StickOverlay,
+    UiTheme, VisualTheme,
 };
 use crate::display::{SCREEN_H, SCREEN_W};
 use crate::font::{glyph, GLYPH_H, GLYPH_W};
@@ -12,10 +13,8 @@ use crate::math::{clampf, Quat, Vec3};
 use crate::physics::{QuadState, StickInput};
 use crate::tracks::{GateKind, StructureColor, Track, TRACKS};
 
-const W: i32 = SCREEN_W as i32;
-const H: i32 = SCREEN_H as i32;
-const HALF_W: f32 = (SCREEN_W as f32) * 0.5;
-const HALF_H: f32 = (SCREEN_H as f32) * 0.5;
+const UI_W: i32 = SCREEN_W as i32;
+const UI_H: i32 = SCREEN_H as i32;
 const NEAR_Z: f32 = 0.16;
 /// Scale factor mapping 1/z (0 ..= 6.25) into u16 Z-buffer (0 ..= 65000). Larger = closer.
 const IZ_SCALE: f32 = 10400.0;
@@ -178,8 +177,10 @@ struct ScreenVert {
 }
 
 pub struct Renderer {
-    pub fb: Box<[u16; SCREEN_W * SCREEN_H]>,
-    zbuf: Box<[u16; SCREEN_W * SCREEN_H]>,
+    pub width: usize,
+    pub height: usize,
+    pub fb: Vec<u16>,
+    zbuf: Vec<u16>,
     focal: f32,
     rng_state: u32,
     /// Zero-allocation ring buffer storing recent (lx, ly, rx, ry) stick positions for OSD trails.
@@ -190,15 +191,104 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
+        Self::with_size(SCREEN_W, SCREEN_H)
+    }
+
+    pub fn with_size(width: usize, height: usize) -> Self {
+        let w = width.max(SCREEN_W);
+        let h = height.max(SCREEN_H);
         Self {
-            fb: Box::new([0u16; SCREEN_W * SCREEN_H]),
-            zbuf: Box::new([0u16; SCREEN_W * SCREEN_H]),
-            focal: 160.0,
+            width: w,
+            height: h,
+            fb: vec![0u16; w * h],
+            zbuf: vec![0u16; w * h],
+            focal: (w as f32) * 0.5,
             rng_state: 0x51A7_1C09,
             stick_trail: [(0.0, 0.0, 0.0, 0.0); STICK_TRAIL_LEN],
             trail_head: 0,
             trail_len: 0,
         }
+    }
+
+    /// Dynamically switch internal render resolution (e.g. 320x170 <-> 640x360 <-> 960x540).
+    /// Zero allocations when `(width, height)` is unchanged.
+    pub fn set_size(&mut self, width: usize, height: usize) {
+        let w = width.max(SCREEN_W);
+        let h = height.max(SCREEN_H);
+        if self.width == w && self.height == h {
+            return;
+        }
+        self.width = w;
+        self.height = h;
+        let len = w * h;
+        self.fb.resize(len, 0);
+        self.zbuf.resize(len, 0);
+        self.focal = (w as f32) * 0.5;
+    }
+
+    #[inline(always)]
+    fn w(&self) -> i32 {
+        self.width as i32
+    }
+
+    #[inline(always)]
+    fn h(&self) -> i32 {
+        self.height as i32
+    }
+
+    #[inline(always)]
+    fn half_w(&self) -> f32 {
+        (self.width as f32) * 0.5
+    }
+
+    #[inline(always)]
+    fn half_h(&self) -> f32 {
+        (self.height as f32) * 0.5
+    }
+
+    #[inline(always)]
+    fn ui_scale(&self) -> i32 {
+        (self.width / SCREEN_W).min(self.height / SCREEN_H).max(1) as i32
+    }
+
+    #[inline(always)]
+    fn ui_origin(&self) -> (i32, i32) {
+        let s = self.ui_scale();
+        ((self.w() - UI_W * s) / 2, (self.h() - UI_H * s) / 2)
+    }
+
+    fn ui_fill_rect(&mut self, vx: i32, vy: i32, vw: i32, vh: i32, color: u16) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        self.fill_rect(ox + vx * s, oy + vy * s, vw * s, vh * s, color);
+    }
+
+    fn ui_draw_rect(&mut self, vx: i32, vy: i32, vw: i32, vh: i32, color: u16) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        self.draw_rect_thick(ox + vx * s, oy + vy * s, vw * s, vh * s, s, color);
+    }
+
+    fn ui_draw_hline(&mut self, vx0: i32, vx1: i32, vy: i32, color: u16) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        let x0 = vx0.min(vx1);
+        let len = (vx1 - vx0).abs() + 1;
+        self.fill_rect(ox + x0 * s, oy + vy * s, len * s, s, color);
+    }
+
+    fn ui_draw_vline(&mut self, vx: i32, vy0: i32, vy1: i32, color: u16) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        let y0 = vy0.min(vy1);
+        let len = (vy1 - vy0).abs() + 1;
+        self.fill_rect(ox + vx * s, oy + y0 * s, s, len * s, color);
+    }
+
+    fn ui_draw_text(&mut self, vx: i32, vy: i32, text: &str, color: u16, scale: i32, outline: bool) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        self.draw_text(ox + vx * s, oy + vy * s, text, color, scale * s, outline);
     }
 
     pub fn reset_stick_trail(&mut self) {
@@ -216,8 +306,8 @@ impl Renderer {
 
     #[inline(always)]
     pub fn put_pixel(&mut self, x: i32, y: i32, color: u16) {
-        if x >= 0 && x < W && y >= 0 && y < H {
-            self.fb[(y as usize) * SCREEN_W + (x as usize)] = color;
+        if x >= 0 && x < self.w() && y >= 0 && y < self.h() {
+            self.fb[(y as usize) * self.width + (x as usize)] = color;
         }
     }
 
@@ -228,13 +318,14 @@ impl Renderer {
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16) {
         let x0 = x.max(0);
         let y0 = y.max(0);
-        let x1 = (x + w).min(W);
-        let y1 = (y + h).min(H);
+        let x1 = (x + w).min(self.w());
+        let y1 = (y + h).min(self.h());
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        let stride = self.width;
         for py in y0..y1 {
-            let row = (py as usize) * SCREEN_W;
+            let row = (py as usize) * stride;
             self.fb[row + (x0 as usize)..row + (x1 as usize)].fill(color);
         }
     }
@@ -249,28 +340,43 @@ impl Renderer {
         self.draw_vline(x + w - 1, y, y + h - 1, color);
     }
 
+    fn draw_rect_thick(&mut self, x: i32, y: i32, w: i32, h: i32, thick: i32, color: u16) {
+        if w <= 0 || h <= 0 || thick <= 0 {
+            return;
+        }
+        if thick == 1 {
+            self.draw_rect(x, y, w, h, color);
+            return;
+        }
+        self.fill_rect(x, y, w, thick, color);
+        self.fill_rect(x, y + h - thick, w, thick, color);
+        self.fill_rect(x, y, thick, h, color);
+        self.fill_rect(x + w - thick, y, thick, h, color);
+    }
+
     #[inline]
     fn draw_hline(&mut self, x0: i32, x1: i32, y: i32, color: u16) {
-        if y < 0 || y >= H {
+        if y < 0 || y >= self.h() {
             return;
         }
         let lx = x0.min(x1).max(0);
-        let rx = x0.max(x1).min(W - 1);
+        let rx = x0.max(x1).min(self.w() - 1);
         if lx <= rx {
-            let row = (y as usize) * SCREEN_W;
+            let row = (y as usize) * self.width;
             self.fb[row + (lx as usize)..=row + (rx as usize)].fill(color);
         }
     }
 
     #[inline]
     fn draw_vline(&mut self, x: i32, y0: i32, y1: i32, color: u16) {
-        if x < 0 || x >= W {
+        if x < 0 || x >= self.w() {
             return;
         }
         let ty = y0.min(y1).max(0);
-        let by = y0.max(y1).min(H - 1);
+        let by = y0.max(y1).min(self.h() - 1);
+        let stride = self.width;
         for y in ty..=by {
-            self.fb[(y as usize) * SCREEN_W + (x as usize)] = color;
+            self.fb[(y as usize) * stride + (x as usize)] = color;
         }
     }
 
@@ -310,6 +416,9 @@ impl Renderer {
         color: u16,
         write_z: bool,
     ) {
+        let w = self.w();
+        let h = self.h();
+        let stride = self.width;
         let dx = (x1 - x0).abs();
         let dy_abs = (y1 - y0).abs();
         let steps = dx.max(dy_abs);
@@ -321,8 +430,8 @@ impl Renderer {
         let mut iz = iz0;
 
         for _ in 0..=steps {
-            if x0 >= 0 && x0 < W && y0 >= 0 && y0 < H {
-                let idx = (y0 as usize) * SCREEN_W + (x0 as usize);
+            if x0 >= 0 && x0 < w && y0 >= 0 && y0 < h {
+                let idx = (y0 as usize) * stride + (x0 as usize);
                 // Proportional ~0.5% depth tolerance (at least 2 u16 units, max 6) beats own-face quantization
                 // while rejecting any back wall behind the foreground surface!
                 let bias = (iz * 0.005).clamp(2.0, 6.0);
@@ -365,8 +474,11 @@ impl Renderer {
             return;
         }
 
+        let w = self.w();
+        let h = self.h();
+        let stride = self.width;
         let y_start = (v[0].y.ceil() as i32).max(0);
-        let y_end = (v[2].y.floor() as i32).min(H - 1);
+        let y_end = (v[2].y.floor() as i32).min(h - 1);
         if y_start > y_end {
             return;
         }
@@ -405,7 +517,7 @@ impl Renderer {
             }
 
             let x_start = (xa.ceil() as i32).max(0);
-            let x_end = (xb.floor() as i32).min(W - 1);
+            let x_end = (xb.floor() as i32).min(w - 1);
             if x_start > x_end {
                 continue;
             }
@@ -413,7 +525,7 @@ impl Renderer {
             let dx = xb - xa;
             let diz_dx = if dx > 1e-4 { (izb - iza) / dx } else { 0.0 };
             let mut iz = iza + diz_dx * (x_start as f32 - xa);
-            let row = (y as usize) * SCREEN_W;
+            let row = (y as usize) * stride;
 
             for x in x_start..=x_end {
                 let idx = row + (x as usize);
@@ -431,6 +543,7 @@ impl Renderer {
         let mut cx = x;
         let adv = (GLYPH_W + 1) * scale;
         let black = rgb565(0, 0, 0);
+        let ol = (scale / 2).max(1);
         for &b in text.as_bytes() {
             let g = glyph(b);
             if outline {
@@ -439,8 +552,8 @@ impl Renderer {
                         if (col & (1 << row)) != 0 {
                             let px = cx + (col_idx as i32) * scale;
                             let py = y + row * scale;
-                            self.fill_rect(px - 1, py, scale + 2, scale, black);
-                            self.fill_rect(px, py - 1, scale, scale + 2, black);
+                            self.fill_rect(px - ol, py, scale + ol * 2, scale, black);
+                            self.fill_rect(px, py - ol, scale, scale + ol * 2, black);
                         }
                     }
                 }
@@ -471,14 +584,15 @@ impl Renderer {
     fn project_sv(&self, c: Vec3) -> ScreenVert {
         let inv_z = 1.0 / c.z;
         ScreenVert {
-            x: HALF_W + c.x * self.focal * inv_z,
-            y: HALF_H - c.y * self.focal * inv_z,
+            x: self.half_w() + c.x * self.focal * inv_z,
+            y: self.half_h() - c.y * self.focal * inv_z,
             iz: (inv_z * IZ_SCALE).clamp(1.0, 65000.0),
         }
     }
 
     /// Exact zero-safe Cohen-Sutherland 2D line clipper that also linearly clips `iz`.
     fn clip_line_2d_z(
+        &self,
         mut x0: f32,
         mut y0: f32,
         mut iz0: f32,
@@ -488,13 +602,13 @@ impl Renderer {
     ) -> Option<(i32, i32, f32, i32, i32, f32)> {
         const XMIN: f32 = 0.0;
         const YMIN: f32 = 0.0;
-        const XMAX: f32 = (W - 1) as f32;
-        const YMAX: f32 = (H - 1) as f32;
+        let xmax: f32 = (self.w() - 1) as f32;
+        let ymax: f32 = (self.h() - 1) as f32;
 
         let outcode = |x: f32, y: f32| -> u8 {
             let mut c = 0u8;
-            if x < XMIN { c |= 1; } else if x > XMAX { c |= 2; }
-            if y < YMIN { c |= 4; } else if y > YMAX { c |= 8; }
+            if x < XMIN { c |= 1; } else if x > xmax { c |= 2; }
+            if y < YMIN { c |= 4; } else if y > ymax { c |= 8; }
             c
         };
 
@@ -511,8 +625,8 @@ impl Renderer {
             let (nx, ny, t) = if (out & 8) != 0 {
                 let dy = y1 - y0;
                 if dy.abs() < 1e-6 { return None; }
-                let t = (YMAX - y0) / dy;
-                (x0 + (x1 - x0) * t, YMAX, t)
+                let t = (ymax - y0) / dy;
+                (x0 + (x1 - x0) * t, ymax, t)
             } else if (out & 4) != 0 {
                 let dy = y1 - y0;
                 if dy.abs() < 1e-6 { return None; }
@@ -521,8 +635,8 @@ impl Renderer {
             } else if (out & 2) != 0 {
                 let dx = x1 - x0;
                 if dx.abs() < 1e-6 { return None; }
-                let t = (XMAX - x0) / dx;
-                (XMAX, y0 + (y1 - y0) * t, t)
+                let t = (xmax - x0) / dx;
+                (xmax, y0 + (y1 - y0) * t, t)
             } else {
                 let dx = x1 - x0;
                 if dx.abs() < 1e-6 { return None; }
@@ -561,7 +675,7 @@ impl Renderer {
         }
         let sa = self.project_sv(ca);
         let sb = self.project_sv(cb);
-        if let Some((x0, y0, _, x1, y1, _)) = Self::clip_line_2d_z(sa.x, sa.y, sa.iz, sb.x, sb.y, sb.iz) {
+        if let Some((x0, y0, _, x1, y1, _)) = self.clip_line_2d_z(sa.x, sa.y, sa.iz, sb.x, sb.y, sb.iz) {
             self.draw_line(x0, y0, x1, y1, color);
         }
     }
@@ -582,7 +696,7 @@ impl Renderer {
         }
         let sa = self.project_sv(ca);
         let sb = self.project_sv(cb);
-        if let Some((x0, y0, iz0, x1, y1, iz1)) = Self::clip_line_2d_z(sa.x, sa.y, sa.iz, sb.x, sb.y, sb.iz) {
+        if let Some((x0, y0, iz0, x1, y1, iz1)) = self.clip_line_2d_z(sa.x, sa.y, sa.iz, sb.x, sb.y, sb.iz) {
             self.draw_line_z(x0, y0, iz0, x1, y1, iz1, color, true);
             if thick {
                 self.draw_line_z(x0 + 1, y0, iz0, x1 + 1, y1, iz1, color, false);
@@ -643,7 +757,7 @@ impl Renderer {
             min_y = min_y.min(p.y);
             max_y = max_y.max(p.y);
         }
-        if max_x < 0.0 || min_x >= W as f32 || max_y < 0.0 || min_y >= H as f32 {
+        if max_x < 0.0 || min_x >= self.w() as f32 || max_y < 0.0 || min_y >= self.h() as f32 {
             return None;
         }
         Some((clipped, sv, count))
@@ -668,7 +782,7 @@ impl Renderer {
                     continue;
                 }
                 if let Some((x0, y0, iz0, x1, y1, iz1)) =
-                    Self::clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
+                    self.clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
                 {
                     self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, false);
                 }
@@ -688,7 +802,7 @@ impl Renderer {
                     continue;
                 }
                 if let Some((x0, y0, iz0, x1, y1, iz1)) =
-                    Self::clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
+                    self.clip_line_2d_z(sv[k].x, sv[k].y, sv[k].iz, sv[n].x, sv[n].y, sv[n].iz)
                 {
                     self.draw_line_z(x0, y0, iz0, x1, y1, iz1, edge, false);
                 }
@@ -721,6 +835,11 @@ impl Renderer {
     /// Ultra-fast zero-per-pixel-float smooth sky & ground gradient renderer at EVERY roll angle (0-360 deg),
     /// using a 128-entry precomputed RGB565 LUT + 16.16 fixed-point scanlines, plus an unbroken horizon line!
     fn draw_sky_and_ground(&mut self, cam_rot: Quat, pal: ThemePalette, detail_high: bool) {
+        let sw = self.width;
+        let sh = self.height;
+        let w = self.w();
+        let half_w = self.half_w();
+        let half_h = self.half_h();
         let (cam_right, cam_up, cam_fwd) = cam_rot.basis();
         let ux = cam_right.y;
         let uy = cam_up.y;
@@ -731,14 +850,14 @@ impl Renderer {
             // Fast 2-tone flat mode when Gfx Detail = Low
             if ux.abs() < 0.002 {
                 let mut prev_sky: Option<bool> = None;
-                for y in 0..SCREEN_H {
-                    let ry = HALF_H - (y as f32);
+                for y in 0..sh {
+                    let ry = half_h - (y as f32);
                     let is_sky = (uy * ry + uz) >= 0.0;
-                    let row = y * SCREEN_W;
-                    self.fb[row..row + SCREEN_W].fill(if is_sky { pal.sky_top } else { pal.ground_near });
+                    let row = y * sw;
+                    self.fb[row..row + sw].fill(if is_sky { pal.sky_top } else { pal.ground_near });
                     if let (Some(was_sky), Some(hcol)) = (prev_sky, pal.horizon_line) {
                         if was_sky != is_sky {
-                            self.fb[row..row + SCREEN_W].fill(hcol);
+                            self.fb[row..row + sw].fill(hcol);
                         }
                     }
                     prev_sky = Some(is_sky);
@@ -746,11 +865,11 @@ impl Renderer {
             } else {
                 let inv_ux = 1.0 / ux;
                 let sky_on_right = ux > 0.0;
-                for y in 0..SCREEN_H {
-                    let ry = HALF_H - (y as f32);
-                    let x_hor = HALF_W - (uy * ry + uz) * inv_ux;
-                    let x_split = (x_hor.round() as i32).clamp(0, W) as usize;
-                    let row = y * SCREEN_W;
+                for y in 0..sh {
+                    let ry = half_h - (y as f32);
+                    let x_hor = half_w - (uy * ry + uz) * inv_ux;
+                    let x_split = (x_hor.round() as i32).clamp(0, w) as usize;
+                    let row = y * sw;
                     let (left_col, right_col) = if sky_on_right {
                         (pal.ground_near, pal.sky_top)
                     } else {
@@ -759,15 +878,15 @@ impl Renderer {
                     if x_split > 0 {
                         self.fb[row..row + x_split].fill(left_col);
                     }
-                    if x_split < SCREEN_W {
-                        self.fb[row + x_split..row + SCREEN_W].fill(right_col);
+                    if x_split < sw {
+                        self.fb[row + x_split..row + sw].fill(right_col);
                     }
                     if let Some(hcol) = pal.horizon_line {
-                        let x_hor_next = HALF_W - (uy * (ry - 1.0) + uz) * inv_ux;
+                        let x_hor_next = half_w - (uy * (ry - 1.0) + uz) * inv_ux;
                         let lx = x_hor.min(x_hor_next).round() as i32;
                         let rx = x_hor.max(x_hor_next).round() as i32;
-                        if rx >= 0 && lx < W {
-                            self.draw_hline(lx.max(0), rx.min(W - 1), y as i32, hcol);
+                        if rx >= 0 && lx < w {
+                            self.draw_hline(lx.max(0), rx.min(w - 1), y as i32, hcol);
                         }
                     }
                 }
@@ -792,30 +911,30 @@ impl Renderer {
 
         // 16.16 fixed-point horizontal elevation step across each scanline
         let step_fp: i32 = (ux * inv_f * LUT_SCALE * 65536.0).round() as i32;
-        let step_total = step_fp * ((SCREEN_W - 1) as i32);
+        let step_total = step_fp * ((sw - 1) as i32);
         let rolled = ux.abs() >= 0.002;
         let inv_ux = if rolled { 1.0 / ux } else { 0.0 };
         let mut prev_sky: Option<bool> = None;
 
-        for y in 0..SCREEN_H {
-            let ry = HALF_H - (y as f32);
+        for y in 0..sh {
+            let ry = half_h - (y as f32);
             let base = uy * ry + uz;
-            let row = y * SCREEN_W;
-            let e_left = (ux * (-HALF_W) + base) * inv_f;
+            let row = y * sw;
+            let e_left = (ux * (-half_w) + base) * inv_f;
             let mut acc: i32 = ((64.0 + e_left * LUT_SCALE) * 65536.0) as i32;
             let acc_right = acc + step_total;
 
             // Fast-path uniform scanlines (flat/upside-down or fully clamped sky/ground)
             if step_fp == 0 {
                 let idx = (acc >> 16).clamp(0, 127) as usize;
-                self.fb[row..row + SCREEN_W].fill(lut[idx]);
+                self.fb[row..row + sw].fill(lut[idx]);
             } else if acc <= 0 && acc_right <= 0 {
-                self.fb[row..row + SCREEN_W].fill(lut[0]);
+                self.fb[row..row + sw].fill(lut[0]);
             } else if acc >= (127 << 16) && acc_right >= (127 << 16) {
-                self.fb[row..row + SCREEN_W].fill(lut[127]);
+                self.fb[row..row + sw].fill(lut[127]);
             } else {
                 // Smooth per-pixel rolled gradient using pure integer fixed-point LUT lookup (zero floats!)
-                for px in &mut self.fb[row..row + SCREEN_W] {
+                for px in &mut self.fb[row..row + sw] {
                     let idx = (acc >> 16).clamp(0, 127) as usize;
                     *px = lut[idx];
                     acc += step_fp;
@@ -828,17 +947,17 @@ impl Renderer {
                     let is_sky = base >= 0.0;
                     if let Some(was_sky) = prev_sky {
                         if was_sky != is_sky {
-                            self.fb[row..row + SCREEN_W].fill(hcol);
+                            self.fb[row..row + sw].fill(hcol);
                         }
                     }
                     prev_sky = Some(is_sky);
                 } else {
-                    let x0 = HALF_W - base * inv_ux;
-                    let x1 = HALF_W - (uy * (ry - 1.0) + uz) * inv_ux;
+                    let x0 = half_w - base * inv_ux;
+                    let x1 = half_w - (uy * (ry - 1.0) + uz) * inv_ux;
                     let lx = x0.min(x1).round() as i32;
                     let rx = x0.max(x1).round() as i32;
-                    if rx >= 0 && lx < W {
-                        self.draw_hline(lx.max(0), rx.min(W - 1), y as i32, hcol);
+                    if rx >= 0 && lx < w {
+                        self.draw_hline(lx.max(0), rx.min(w - 1), y as i32, hcol);
                     }
                 }
             }
@@ -846,6 +965,7 @@ impl Renderer {
     }
 
     fn draw_sky_detail(&mut self, cam_inv: Quat, theme: VisualTheme) {
+        let s = self.ui_scale();
         // Sun / Moon disc
         let sun_spec = match theme {
             VisualTheme::Summer => Some((
@@ -871,8 +991,8 @@ impl Renderer {
                 let p = self.project_sv(sc);
                 let sx = p.x as i32;
                 let sy = p.y as i32;
-                self.fill_rect(sx - 5, sy - 5, 11, 11, halo_col);
-                self.fill_rect(sx - 3, sy - 3, 7, 7, sun_col);
+                self.fill_rect(sx - 5 * s, sy - 5 * s, 11 * s, 11 * s, halo_col);
+                self.fill_rect(sx - 3 * s, sy - 3 * s, 7 * s, 7 * s, sun_col);
             }
         }
         // Rich sky starfield in Night & Wireframe modes so sky is unmistakably distinct from ground
@@ -904,15 +1024,20 @@ impl Renderer {
             } else {
                 rgb565(75, 195, 230)
             };
-            for (idx, &s) in STARS.iter().enumerate() {
-                let c = cam_inv.rotate(s);
+            for (idx, &st) in STARS.iter().enumerate() {
+                let c = cam_inv.rotate(st);
                 if c.z > 0.2 {
                     let p = self.project_sv(c);
                     let px = p.x as i32;
                     let py = p.y as i32;
-                    self.put_pixel(px, py, star_col);
-                    if idx % 3 == 0 {
-                        self.put_pixel(px + 1, py, star_col);
+                    if s == 1 {
+                        self.put_pixel(px, py, star_col);
+                        if idx % 3 == 0 {
+                            self.put_pixel(px + 1, py, star_col);
+                        }
+                    } else {
+                        let w_star = if idx % 3 == 0 { s + 1 } else { s };
+                        self.fill_rect(px, py, w_star, s, star_col);
                     }
                 }
             }
@@ -931,7 +1056,7 @@ impl Renderer {
     ) {
         let pal = palette(cfg.theme);
         let half_fov_rad = ((cfg.fov_deg as f32).clamp(70.0, 115.0) * 0.5).to_radians();
-        self.focal = HALF_W / half_fov_rad.tan();
+        self.focal = self.half_w() / half_fov_rad.tan();
 
         // Clear 16-bit per-pixel Z-buffer (0 = farthest)
         self.zbuf.fill(0);
@@ -1184,8 +1309,8 @@ impl Renderer {
         // 5. Hit flash border
         if quad.hit_flash > 0.0 {
             let red = rgb565(255, 45, 45);
-            self.draw_rect(0, 0, W, H, red);
-            self.draw_rect(1, 1, W - 2, H - 2, red);
+            let s = self.ui_scale();
+            self.draw_rect_thick(0, 0, self.w(), self.h(), 2 * s, red);
         }
 
         // 6. Next-gate screen-space beacon / off-screen edge pointer (Race mode)
@@ -1193,13 +1318,18 @@ impl Renderer {
             let target = track.gates[quad.next_gate].center();
             let tc = Self::world_to_cam(target, cam_pos, cam_inv);
             let marker_col = rgb565(255, 230, 40);
+            let s = self.ui_scale();
+            let w = self.w();
+            let h = self.h();
             if tc.z > 0.5 {
                 let p = self.project_sv(tc);
                 let sx = p.x as i32;
                 let sy = p.y as i32;
-                if sx >= 8 && sx < W - 8 && sy >= 14 && sy < H - 14 {
-                    self.draw_line(sx - 4, sy - 9, sx, sy - 5, marker_col);
-                    self.draw_line(sx + 4, sy - 9, sx, sy - 5, marker_col);
+                if sx >= 8 * s && sx < w - 8 * s && sy >= 14 * s && sy < h - 14 * s {
+                    for t in 0..s {
+                        self.draw_line(sx - 4 * s, sy - 9 * s + t, sx, sy - 5 * s + t, marker_col);
+                        self.draw_line(sx + 4 * s, sy - 9 * s + t, sx, sy - 5 * s + t, marker_col);
+                    }
                 } else {
                     self.draw_edge_arrow(tc, marker_col);
                 }
@@ -1220,16 +1350,20 @@ impl Renderer {
     fn apply_analog_filter(&mut self, static_burst: bool) {
         let mut s = self.rng_state;
         let grain_mask: u32 = if static_burst { 0x07 } else { 0x3F };
-        for y in 0..SCREEN_H {
-            let row = y * SCREEN_W;
+        let sw = self.width;
+        let sh = self.height;
+        let y_edge_px = (sh / 14).max(12);
+        let x_edge_px = (sw / 18).max(18);
+        for y in 0..sh {
+            let row = y * sw;
             let scanline = (y & 1) == 1;
-            let y_edge = y < 12 || y >= SCREEN_H - 12;
-            for x in 0..SCREEN_W {
+            let y_edge = y < y_edge_px || y >= sh - y_edge_px;
+            for x in 0..sw {
                 let mut c = self.fb[row + x];
                 if scanline {
                     c = ((c >> 1) & 0x7BEF) + ((c >> 2) & 0x39E7) + ((c >> 3) & 0x18E3);
                 }
-                if y_edge && (x < 18 || x >= SCREEN_W - 18) {
+                if y_edge && (x < x_edge_px || x >= sw - x_edge_px) {
                     c = ((c >> 1) & 0x7BEF) + ((c >> 2) & 0x39E7);
                 }
                 s ^= s << 13;
@@ -1250,15 +1384,19 @@ impl Renderer {
     }
 
     fn draw_edge_arrow(&mut self, tc: Vec3, color: u16) {
+        let s = self.ui_scale();
+        let sf = s as f32;
+        let half_w = self.half_w();
+        let half_h = self.half_h();
         let dir_x = tc.x;
         let dir_y = -tc.y;
         let len = (dir_x * dir_x + dir_y * dir_y).sqrt().max(0.001);
         let nx = dir_x / len;
         let ny = dir_y / len;
-        let ax = clampf(HALF_W + nx * (HALF_W - 14.0), 10.0, (W - 10) as f32) as i32;
-        let ay = clampf(HALF_H + ny * (HALF_H - 16.0), 16.0, (H - 16) as f32) as i32;
-        self.fill_rect(ax - 2, ay - 2, 5, 5, rgb565(0, 0, 0));
-        self.fill_rect(ax - 1, ay - 1, 3, 3, color);
+        let ax = clampf(half_w + nx * (half_w - 14.0 * sf), 10.0 * sf, (self.w() - 10 * s) as f32) as i32;
+        let ay = clampf(half_h + ny * (half_h - 16.0 * sf), 16.0 * sf, (self.h() - 16 * s) as f32) as i32;
+        self.fill_rect(ax - 2 * s, ay - 2 * s, 5 * s, 5 * s, rgb565(0, 0, 0));
+        self.fill_rect(ax - s, ay - s, 3 * s, 3 * s, color);
     }
 
     fn draw_osd(
@@ -1277,8 +1415,11 @@ impl Renderer {
         let red = rgb565(255, 70, 70);
         let batt_on = cfg.battery_pack != BatteryPack::Off;
 
-        let cx = W / 2;
-        let cy = H / 2;
+        let w = self.w();
+        let h = self.h();
+        let s = self.ui_scale();
+        let cx = w / 2;
+        let cy = h / 2;
 
         // Post-Flight Betaflight Stats Card when Disarmed after flying or when Battery is Empty!
         if (!quad.armed && (quad.has_flown || quad.battery_empty)) || quad.battery_empty {
@@ -1287,9 +1428,9 @@ impl Renderer {
         }
 
         // Betaflight crosshair
-        self.draw_hline(cx - 5, cx - 2, cy, white);
-        self.draw_hline(cx + 2, cx + 5, cy, white);
-        self.draw_vline(cx, cy - 3, cy - 2, white);
+        self.fill_rect(cx - 5 * s, cy, 4 * s, s, white);
+        self.fill_rect(cx + 2 * s, cy, 4 * s, s, white);
+        self.fill_rect(cx, cy - 3 * s, s, 2 * s, white);
 
         // Top-left: Mode (IMU EASY / ACRO / HORIZON / ANGLE / TURTLE) + Gate / Points
         let imu_mode = quad.control_source == FlightControlSource::ImuSimplified;
@@ -1300,15 +1441,15 @@ impl Renderer {
         } else {
             (cfg.flight_mode.name(), white)
         };
-        self.draw_text(4, 3, mode_str, mode_col, 1, true);
+        self.draw_text(4 * s, 3 * s, mode_str, mode_col, s, true);
         if cfg.game_mode == GameMode::Race {
             let g_str = format!("G {}/{}", quad.next_gate + 1, track.gates.len());
-            self.draw_text(4, 13, &g_str, yellow, 1, true);
+            self.draw_text(4 * s, 13 * s, &g_str, yellow, s, true);
             let s_str = format!("PTS {}", quad.score);
-            self.draw_text(4, 23, &s_str, green, 1, true);
+            self.draw_text(4 * s, 23 * s, &s_str, green, s, true);
         } else {
             let s_str = format!("PTS {}", quad.score);
-            self.draw_text(4, 13, &s_str, yellow, 1, true);
+            self.draw_text(4 * s, 13 * s, &s_str, yellow, s, true);
         }
 
         // Top-center: Betaflight Flight Timer (Freestyle) or Lap Timer (Time Trial)
@@ -1317,38 +1458,38 @@ impl Renderer {
             let mins = (secs / 60.0) as u32;
             let rem = secs - (mins as f32) * 60.0;
             let t_str = format!("{mins}:{rem:05.2}");
-            self.draw_text(cx - (t_str.len() as i32) * 3, 3, &t_str, white, 1, true);
+            self.draw_text(cx - (t_str.len() as i32) * 3 * s, 3 * s, &t_str, white, s, true);
             let best = cfg.best_laps_ms[cfg.track_index.min(3)];
             if best > 0 {
                 let bs = best as f32 / 1000.0;
                 let bm = (bs / 60.0) as u32;
                 let br = bs - (bm as f32) * 60.0;
                 let b_str = format!("B {bm}:{br:05.2}");
-                self.draw_text(cx - (b_str.len() as i32) * 3, 13, &b_str, green, 1, true);
+                self.draw_text(cx - (b_str.len() as i32) * 3 * s, 13 * s, &b_str, green, s, true);
             }
         } else {
             let ft = quad.flight_time as u32;
             let mins = ft / 60;
             let secs = ft % 60;
             let t_str = format!("{mins:02}:{secs:02}");
-            self.draw_text(cx - 15, 3, &t_str, white, 1, true);
+            self.draw_text(cx - 15 * s, 3 * s, &t_str, white, s, true);
         }
 
         // Top-right: Betaflight Throttle % + mAh used (+ optional Debug FPS/ms)
         let thr_str = format!("THR {:3}%", quad.throttle_pct);
-        self.draw_text(W - 52, 3, &thr_str, white, 1, true);
+        self.draw_text(w - 52 * s, 3 * s, &thr_str, white, s, true);
         if batt_on {
             let mah_str = format!("{:3.0}mAh", quad.mah_used);
-            self.draw_text(W - 40, 13, &mah_str, cyan, 1, true);
+            self.draw_text(w - 40 * s, 13 * s, &mah_str, cyan, s, true);
         }
         if cfg.debug_osd {
             let perf_str = format!("{}F {:.1}ms", fps, frame_ms);
-            let pw = (perf_str.len() as i32) * 6;
-            self.draw_text(W - pw - 4, 23, &perf_str, rgb565(180, 195, 210), 1, true);
+            let pw = (perf_str.len() as i32) * 6 * s;
+            self.draw_text(w - pw - 4 * s, 23 * s, &perf_str, rgb565(180, 195, 210), s, true);
         }
 
         // Bottom-left: Betaflight Cell Voltage
-        let batt_y = if cfg.stick_overlay.is_visible() { H - 41 } else { H - 11 };
+        let batt_y = if cfg.stick_overlay.is_visible() { h - 41 * s } else { h - 11 * s };
         if batt_on {
             let v_col = if quad.cell_voltage < 3.38 {
                 red
@@ -1358,25 +1499,25 @@ impl Renderer {
                 green
             };
             let v_str = format!("{:.2}V", quad.cell_voltage);
-            self.draw_text(4, batt_y, &v_str, v_col, 1, true);
+            self.draw_text(4 * s, batt_y, &v_str, v_col, s, true);
         }
 
         // Bottom-center: Betaflight Craft Name + Speed / Altitude
         let craft = cfg.quad.craft_name();
-        self.draw_text(cx - (craft.len() as i32) * 3, H - 20, craft, rgb565(215, 225, 235), 1, true);
+        self.draw_text(cx - (craft.len() as i32) * 3 * s, h - 20 * s, craft, rgb565(215, 225, 235), s, true);
         let spd = format!("{:3.0}KPH {:2.0}M", quad.speed_kmh(), (quad.pos.y - 0.22).max(0.0));
-        self.draw_text(cx - (spd.len() as i32) * 3, H - 10, &spd, white, 1, true);
+        self.draw_text(cx - (spd.len() as i32) * 3 * s, h - 10 * s, &spd, white, s, true);
 
         // Center Betaflight Warnings & Score Popups
         if quad.arm_blocked_throttle {
-            self.draw_text(cx - 42, cy - 22, "THROTTLE HIGH", red, 1, true);
+            self.draw_text(cx - 42 * s, cy - 22 * s, "THROTTLE HIGH", red, s, true);
         } else if quad.arm_aux_connected && !quad.armed {
-            self.draw_text(cx - 24, cy - 22, "DISARMED", yellow, 1, true);
+            self.draw_text(cx - 24 * s, cy - 22 * s, "DISARMED", yellow, s, true);
             let hint = match cfg.aux_arm {
                 AuxBinding::Button { .. } => "PRESS ARM BUTTON",
                 _ => "FLIP ARM SWITCH",
             };
-            self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
+            self.draw_text(cx - (hint.len() as i32) * 3 * s, cy - 11 * s, hint, white, s, true);
         } else if !quad.arm_aux_connected
             && quad.on_ground
             && !quad.has_flown
@@ -1385,22 +1526,22 @@ impl Renderer {
         {
             match quad.control_source {
                 FlightControlSource::ImuSimplified => {
-                    self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
+                    self.draw_text(cx - 15 * s, cy - 22 * s, "READY", green, s, true);
                     let hint = "F/UP:FLY TILT:STEER SPC:ZERO";
-                    self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
+                    self.draw_text(cx - (hint.len() as i32) * 3 * s, cy - 11 * s, hint, white, s, true);
                 }
                 FlightControlSource::None => {
                     let title = "CONTROLLER REQUIRED";
-                    self.draw_text(cx - (title.len() as i32) * 3, cy - 22, title, red, 1, true);
+                    self.draw_text(cx - (title.len() as i32) * 3 * s, cy - 22 * s, title, red, s, true);
                     let hint = "CONNECT USB/BT CONTROLLER";
-                    self.draw_text(cx - (hint.len() as i32) * 3, cy - 11, hint, white, 1, true);
+                    self.draw_text(cx - (hint.len() as i32) * 3 * s, cy - 11 * s, hint, white, s, true);
                 }
                 FlightControlSource::Controller => {
-                    self.draw_text(cx - 15, cy - 22, "READY", green, 1, true);
+                    self.draw_text(cx - 15 * s, cy - 22 * s, "READY", green, s, true);
                 }
             }
         } else if quad.turtle_active && quad.turtle_mode {
-            self.draw_text(cx - 30, cy - 22, "CRASH FLIP", yellow, 1, true);
+            self.draw_text(cx - 30 * s, cy - 22 * s, "CRASH FLIP", yellow, s, true);
             let sub = if quad.inverted {
                 "PUSH ROLL / PITCH"
             } else if quad.turtle_aux_connected {
@@ -1408,21 +1549,21 @@ impl Renderer {
             } else {
                 "PRESS T TO EXIT"
             };
-            self.draw_text(cx - (sub.len() as i32) * 3, cy - 11, sub, if quad.inverted { white } else { green }, 1, true);
+            self.draw_text(cx - (sub.len() as i32) * 3 * s, cy - 11 * s, sub, if quad.inverted { white } else { green }, s, true);
         } else if quad.combo_timer > 0.0 && !quad.combo_text.is_empty() {
-            let tw = (quad.combo_text.len() as i32) * 6;
-            self.draw_text(cx - tw / 2, 32, quad.combo_text, yellow, 1, true);
+            let tw = (quad.combo_text.len() as i32) * 6 * s;
+            self.draw_text(cx - tw / 2, 32 * s, quad.combo_text, yellow, s, true);
         } else if quad.on_ground && quad.inverted {
             let prompt = if quad.turtle_aux_connected {
                 "TURTLE: PRESS CRASH FLIP"
             } else {
                 "TURTLE: ROLL TO FLIP"
             };
-            self.draw_text(cx - (prompt.len() as i32) * 3, 32, prompt, red, 1, true);
+            self.draw_text(cx - (prompt.len() as i32) * 3 * s, 32 * s, prompt, red, s, true);
         } else if batt_on && quad.cell_voltage < 3.35 {
-            self.draw_text(cx - 24, 32, "LAND NOW", red, 1, true);
+            self.draw_text(cx - 24 * s, 32 * s, "LAND NOW", red, s, true);
         } else if batt_on && quad.cell_voltage < 3.48 {
-            self.draw_text(cx - 33, 32, "LOW BATTERY", yellow, 1, true);
+            self.draw_text(cx - 33 * s, 32 * s, "LOW BATTERY", yellow, s, true);
         }
 
         // Compact live stick / IMU control overlay in bottom corners (Off / Dot / Trails)
@@ -1432,9 +1573,9 @@ impl Renderer {
                 if show_trails {
                     self.push_stick_trail(0.0, quad.throttle_pct as f32 / 50.0 - 1.0, sticks.roll, sticks.pitch);
                 }
-                self.draw_imu_throttle_bar(4, H - 30, 14, 26, quad.throttle_pct, quad.imu_climb_cmd, quad.on_ground);
-                self.draw_text(W - 26, H - 39, "IMU", cyan, 1, true);
-                self.draw_imu_tilt_box(W - 30, H - 30, 26, sticks.roll, sticks.pitch, show_trails);
+                self.draw_imu_throttle_bar(4 * s, h - 30 * s, 14 * s, 26 * s, quad.throttle_pct, quad.imu_climb_cmd, quad.on_ground, s);
+                self.draw_text(w - 26 * s, h - 39 * s, "IMU", cyan, s, true);
+                self.draw_imu_tilt_box(w - 30 * s, h - 30 * s, 26 * s, sticks.roll, sticks.pitch, show_trails, s);
             } else {
                 let lx = sticks.yaw;
                 let ly = sticks.throttle * 2.0 - 1.0;
@@ -1442,11 +1583,11 @@ impl Renderer {
                 let ry = sticks.pitch;
                 if cfg.stick_overlay == StickOverlay::Trails {
                     self.push_stick_trail(lx, ly, rx, ry);
-                    self.draw_stick_box_trails(4, H - 30, 26, lx, ly, true);
-                    self.draw_stick_box_trails(W - 30, H - 30, 26, rx, ry, false);
+                    self.draw_stick_box_trails(4 * s, h - 30 * s, 26 * s, lx, ly, true, s);
+                    self.draw_stick_box_trails(w - 30 * s, h - 30 * s, 26 * s, rx, ry, false, s);
                 } else {
-                    self.draw_stick_box(4, H - 30, 26, lx, ly);
-                    self.draw_stick_box(W - 30, H - 30, 26, rx, ry);
+                    self.draw_stick_box(4 * s, h - 30 * s, 26 * s, lx, ly, s);
+                    self.draw_stick_box(w - 30 * s, h - 30 * s, 26 * s, rx, ry, s);
                 }
             }
         }
@@ -1456,10 +1597,10 @@ impl Renderer {
         let ui = ui_colors(cfg.ui_theme);
         let mx = 46;
         let my = 20;
-        let mw = W - 92;
-        let mh = H - 40;
-        self.fill_rect(mx, my, mw, mh, ui.header_bg);
-        self.draw_rect(mx, my, mw, mh, ui.sel_border);
+        let mw = UI_W - 92;
+        let mh = UI_H - 40;
+        self.ui_fill_rect(mx, my, mw, mh, ui.header_bg);
+        self.ui_draw_rect(mx, my, mw, mh, ui.sel_border);
 
         let title = if quad.battery_empty {
             "BATTERY EMPTY"
@@ -1467,8 +1608,8 @@ impl Renderer {
             "DISARMED - STATS"
         };
         let tcol = if quad.battery_empty { rgb565(255, 80, 80) } else { ui.sel_label };
-        self.draw_text(W / 2 - (title.len() as i32) * 3, my + 8, title, tcol, 1, false);
-        self.draw_hline(mx + 8, mx + mw - 9, my + 19, ui.header_line);
+        self.ui_draw_text(UI_W / 2 - (title.len() as i32) * 3, my + 8, title, tcol, 1, false);
+        self.ui_draw_hline(mx + 8, mx + mw - 9, my + 19, ui.header_line);
 
         let ft = quad.flight_time as u32;
         let mins = ft / 60;
@@ -1483,8 +1624,8 @@ impl Renderer {
 
         for (i, (k, v)) in lines.iter().enumerate() {
             let y = my + 26 + (i as i32) * 15;
-            self.draw_text(mx + 14, y, k, ui.label, 1, false);
-            self.draw_text(mx + 124, y, v, ui.sel_val, 1, false);
+            self.ui_draw_text(mx + 14, y, k, ui.label, 1, false);
+            self.ui_draw_text(mx + 124, y, v, ui.sel_val, 1, false);
         }
 
         let footer = if quad.battery_empty {
@@ -1494,26 +1635,26 @@ impl Renderer {
         } else {
             "R: FRESH PACK | ESC: MENU"
         };
-        self.draw_text(W / 2 - (footer.len() as i32) * 3, my + mh - 14, footer, ui.tag, 1, false);
+        self.ui_draw_text(UI_W / 2 - (footer.len() as i32) * 3, my + mh - 14, footer, ui.tag, 1, false);
     }
 
-    fn draw_stick_box(&mut self, x: i32, y: i32, size: i32, sx: f32, sy: f32) {
+    fn draw_stick_box(&mut self, x: i32, y: i32, size: i32, sx: f32, sy: f32, s: i32) {
         let border = rgb565(150, 165, 185);
         let bg = rgb565(18, 22, 30);
         let dot = rgb565(255, 190, 40);
         self.fill_rect(x, y, size, size, bg);
-        self.draw_rect(x, y, size, size, border);
+        self.draw_rect_thick(x, y, size, size, s, border);
         let cx = x + size / 2;
         let cy = y + size / 2;
-        self.put_pixel(cx, cy, rgb565(80, 90, 105));
-        let half = (size / 2 - 2) as f32;
+        self.fill_rect(cx, cy, s, s, rgb565(80, 90, 105));
+        let half = (size / 2 - 2 * s).max(1) as f32;
         let dx = cx + (clampf(sx, -1.0, 1.0) * half) as i32;
         let dy = cy - (clampf(sy, -1.0, 1.0) * half) as i32;
-        self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
+        self.fill_rect(dx - s, dy - s, 3 * s, 3 * s, dot);
     }
 
     /// Zero-allocation fading stick-trail gimbal box (~0.002 ms per frame).
-    fn draw_stick_box_trails(&mut self, x: i32, y: i32, size: i32, sx: f32, sy: f32, left_stick: bool) {
+    fn draw_stick_box_trails(&mut self, x: i32, y: i32, size: i32, sx: f32, sy: f32, left_stick: bool, s: i32) {
         let border = rgb565(150, 165, 185);
         let bg = rgb565(18, 22, 30);
         let dot = rgb565(255, 232, 90);
@@ -1523,11 +1664,11 @@ impl Renderer {
             (rgb565(115, 52, 18), rgb565(255, 165, 50))  // Deep -> bright orange trail for pitch/roll
         };
         self.fill_rect(x, y, size, size, bg);
-        self.draw_rect(x, y, size, size, border);
+        self.draw_rect_thick(x, y, size, size, s, border);
         let cx = x + size / 2;
         let cy = y + size / 2;
-        self.put_pixel(cx, cy, rgb565(75, 85, 100));
-        let half = (size / 2 - 2) as f32;
+        self.fill_rect(cx, cy, s, s, rgb565(75, 85, 100));
+        let half = (size / 2 - 2 * s).max(1) as f32;
 
         let n = self.trail_len;
         if n >= 2 {
@@ -1542,8 +1683,12 @@ impl Renderer {
                 let col = lerp_rgb565(trail_old, trail_new, age_t);
                 if let Some((ox, oy)) = prev {
                     self.draw_line(ox, oy, px, py, col);
+                    if s > 1 {
+                        self.draw_line(ox + 1, oy, px + 1, py, col);
+                        self.draw_line(ox, oy + 1, px, py + 1, col);
+                    }
                 } else {
-                    self.put_pixel(px, py, col);
+                    self.fill_rect(px, py, s, s, col);
                 }
                 prev = Some((px, py));
             }
@@ -1551,7 +1696,7 @@ impl Renderer {
 
         let dx = cx + (clampf(sx, -1.0, 1.0) * half) as i32;
         let dy = cy - (clampf(sy, -1.0, 1.0) * half) as i32;
-        self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
+        self.fill_rect(dx - s, dy - s, 3 * s, 3 * s, dot);
     }
 
     /// Simplified vertical throttle/altitude gauge for CardputerZero IMU flight (replaces left 2D gimbal).
@@ -1564,6 +1709,7 @@ impl Renderer {
         throttle_pct: u8,
         climb_cmd: f32,
         on_ground: bool,
+        s: i32,
     ) {
         let bg = rgb565(18, 22, 30);
         let border = rgb565(102, 217, 239);
@@ -1579,28 +1725,28 @@ impl Renderer {
         };
 
         self.fill_rect(x, y, w, h, bg);
-        self.draw_rect(x, y, w, h, border);
+        self.draw_rect_thick(x, y, w, h, s, border);
 
         // Center auto-hover tick reference
         let mid_y = y + h / 2;
-        self.draw_hline(x + 2, x + w - 3, mid_y, hover_tick);
+        self.fill_rect(x + 2 * s, mid_y, (w - 4 * s).max(1), s, hover_tick);
 
         // Live vertical throttle fill
-        let inner_h = (h - 4).max(1);
+        let inner_h = (h - 4 * s).max(1);
         let frac = (throttle_pct as f32 / 100.0).clamp(0.0, 1.0);
         let fill_h = (frac * inner_h as f32).round() as i32;
         if fill_h > 0 {
-            let fy = y + h - 2 - fill_h;
-            self.fill_rect(x + 2, fy, (w - 4).max(1), fill_h, fill_col);
-            self.draw_hline(x + 2, x + w - 3, fy, rgb565(255, 245, 150));
+            let fy = y + h - 2 * s - fill_h;
+            self.fill_rect(x + 2 * s, fy, (w - 4 * s).max(1), fill_h, fill_col);
+            self.fill_rect(x + 2 * s, fy, (w - 4 * s).max(1), s, rgb565(255, 245, 150));
         }
 
         // Compact climb / hover / descend indicator right next to gauge
-        self.draw_text(x + w + 3, y + h / 2 - 3, cue, cue_col, 1, true);
+        self.draw_text(x + w + 3 * s, y + h / 2 - 3 * s, cue, cue_col, s, true);
     }
 
     /// Simplified 2D IMU tilt reticle box (replaces right gimbal with an attitude/tilt horizon pad).
-    fn draw_imu_tilt_box(&mut self, x: i32, y: i32, size: i32, roll: f32, pitch: f32, trails: bool) {
+    fn draw_imu_tilt_box(&mut self, x: i32, y: i32, size: i32, roll: f32, pitch: f32, trails: bool, s: i32) {
         let border = rgb565(102, 217, 239);
         let bg = rgb565(18, 22, 30);
         let guide = rgb565(46, 62, 78);
@@ -1610,16 +1756,16 @@ impl Renderer {
         let trail_new = rgb565(255, 165, 50);
 
         self.fill_rect(x, y, size, size, bg);
-        self.draw_rect(x, y, size, size, border);
+        self.draw_rect_thick(x, y, size, size, s, border);
 
         let cx = x + size / 2;
         let cy = y + size / 2;
         // Crosshair axes + small center deadzone box so it visually reads as an IMU tilt pad
-        self.draw_hline(x + 2, x + size - 3, cy, guide);
-        self.draw_vline(cx, y + 2, y + size - 3, guide);
-        self.draw_rect(cx - 2, cy - 2, 5, 5, dz_col);
+        self.fill_rect(x + 2 * s, cy, (size - 4 * s).max(1), s, guide);
+        self.fill_rect(cx, y + 2 * s, s, (size - 4 * s).max(1), guide);
+        self.draw_rect_thick(cx - 2 * s, cy - 2 * s, 5 * s, 5 * s, s, dz_col);
 
-        let half = (size / 2 - 2) as f32;
+        let half = (size / 2 - 2 * s).max(1) as f32;
         if trails && self.trail_len >= 2 {
             let n = self.trail_len;
             let start = (self.trail_head + STICK_TRAIL_LEN - n) % STICK_TRAIL_LEN;
@@ -1632,8 +1778,12 @@ impl Renderer {
                 let col = lerp_rgb565(trail_old, trail_new, age_t);
                 if let Some((ox, oy)) = prev {
                     self.draw_line(ox, oy, px, py, col);
+                    if s > 1 {
+                        self.draw_line(ox + 1, oy, px + 1, py, col);
+                        self.draw_line(ox, oy + 1, px, py + 1, col);
+                    }
                 } else {
-                    self.put_pixel(px, py, col);
+                    self.fill_rect(px, py, s, s, col);
                 }
                 prev = Some((px, py));
             }
@@ -1641,20 +1791,22 @@ impl Renderer {
 
         let dx = cx + (clampf(roll, -1.0, 1.0) * half) as i32;
         let dy = cy - (clampf(pitch, -1.0, 1.0) * half) as i32;
-        self.fill_rect(dx - 1, dy - 1, 3, 3, dot);
+        self.fill_rect(dx - s, dy - s, 3 * s, 3 * s, dot);
     }
 
     // -----------------------------------------------------------------------
-    // Menu UIs (320 x 170 tailored for CardputerZero 1.9" display)
+    // Menu UIs (320 x 170 virtual layout, scaled cleanly to 640x360 / 960x540 on HDMI)
     // -----------------------------------------------------------------------
 
     fn draw_header(&mut self, title: &str, right_tag: &str, ui: UiColors) {
+        let s = self.ui_scale();
+        let (_, oy) = self.ui_origin();
         self.clear(ui.bg);
-        self.fill_rect(0, 0, W, 22, ui.header_bg);
-        self.draw_hline(0, W - 1, 22, ui.header_line);
-        self.draw_text(8, 4, title, ui.title, 2, false);
+        self.fill_rect(0, 0, self.w(), oy + 22 * s, ui.header_bg);
+        self.fill_rect(0, oy + 22 * s, self.w(), s, ui.header_line);
+        self.ui_draw_text(8, 4, title, ui.title, 2, false);
         let rw = (right_tag.len() as i32) * 6;
-        self.draw_text(W - rw - 6, 8, right_tag, ui.tag, 1, false);
+        self.ui_draw_text(UI_W - rw - 6, 8, right_tag, ui.tag, 1, false);
     }
 
     pub fn render_main_menu(
@@ -1698,13 +1850,13 @@ impl Renderer {
             let y = 28 + (i as i32) * 20;
             let is_sel = i == selected;
             if is_sel {
-                self.fill_rect(6, y - 2, W - 12, 17, ui.sel_bg);
-                self.draw_rect(6, y - 2, W - 12, 17, ui.sel_border);
+                self.ui_fill_rect(6, y - 2, UI_W - 12, 17, ui.sel_bg);
+                self.ui_draw_rect(6, y - 2, UI_W - 12, 17, ui.sel_border);
             }
             let lcol = if is_sel { ui.sel_label } else { ui.label };
             let vcol = if is_sel { ui.sel_val } else { ui.val };
-            self.draw_text(12, y + 3, label, lcol, 1, false);
-            self.draw_text(86, y + 3, val, vcol, 1, false);
+            self.ui_draw_text(12, y + 3, label, lcol, 1, false);
+            self.ui_draw_text(86, y + 3, val, vcol, 1, false);
         }
 
         let (dot_col, hint) = match input.control_source() {
@@ -1712,8 +1864,8 @@ impl Renderer {
             FlightControlSource::ImuSimplified => (ui.tag, "IMU Tilt Ready | Ent:Select | Hold Esc:Exit"),
             FlightControlSource::None => (ui.warn, "Controller Req! | Ent:Select | Hold Esc:Exit"),
         };
-        self.fill_rect(8, H - 14, 6, 6, dot_col);
-        self.draw_text(18, H - 14, hint, ui.muted, 1, false);
+        self.ui_fill_rect(8, UI_H - 14, 6, 6, dot_col);
+        self.ui_draw_text(18, UI_H - 14, hint, ui.muted, 1, false);
     }
 
     /// Launch warning modal shown when no IMU sensor is detected and/or running on CardputerZero Lite
@@ -1729,42 +1881,42 @@ impl Renderer {
 
         let mx = 18;
         let my = 24;
-        let mw = W - 36;
-        let mh = H - 42;
-        let cx = W / 2;
+        let mw = UI_W - 36;
+        let mh = UI_H - 42;
+        let cx = UI_W / 2;
         let warn_border = rgb565(255, 110, 45);
         let banner_bg = rgb565(75, 24, 20);
         let banner_txt = rgb565(255, 215, 70);
 
-        self.fill_rect(mx, my, mw, mh, ui.header_bg);
-        self.draw_rect(mx, my, mw, mh, warn_border);
-        self.draw_rect(mx + 1, my + 1, mw - 2, mh - 2, warn_border);
+        self.ui_fill_rect(mx, my, mw, mh, ui.header_bg);
+        self.ui_draw_rect(mx, my, mw, mh, warn_border);
+        self.ui_draw_rect(mx + 1, my + 1, mw - 2, mh - 2, warn_border);
 
-        self.fill_rect(mx + 2, my + 2, mw - 4, 19, banner_bg);
-        self.draw_hline(mx + 2, mx + mw - 3, my + 21, warn_border);
+        self.ui_fill_rect(mx + 2, my + 2, mw - 4, 19, banner_bg);
+        self.ui_draw_hline(mx + 2, mx + mw - 3, my + 21, warn_border);
         let title = "! CONTROLLER REQUIRED !";
-        self.draw_text(cx - (title.len() as i32) * 3, my + 8, title, banner_txt, 1, false);
+        self.ui_draw_text(cx - (title.len() as i32) * 3, my + 8, title, banner_txt, 1, false);
 
         let reason = if input.is_cardputer_lite() {
             "CardputerZero Lite detected (no IMU)"
         } else {
             "No IMU sensor detected"
         };
-        self.draw_text(cx - (reason.len() as i32) * 3, my + 29, reason, ui.title, 1, false);
+        self.ui_draw_text(cx - (reason.len() as i32) * 3, my + 29, reason, ui.title, 1, false);
 
         let l1 = "A USB-C or Bluetooth controller";
         let l2 = "is required to fly StickZero.";
-        self.draw_text(cx - (l1.len() as i32) * 3, my + 45, l1, ui.label, 1, false);
-        self.draw_text(cx - (l2.len() as i32) * 3, my + 57, l2, ui.label, 1, false);
+        self.ui_draw_text(cx - (l1.len() as i32) * 3, my + 45, l1, ui.label, 1, false);
+        self.ui_draw_text(cx - (l2.len() as i32) * 3, my + 57, l2, ui.label, 1, false);
 
         let l3 = "Pair a BT gamepad / ELRS radio";
         let l4 = "or connect via USB-C Host mode.";
-        self.draw_text(cx - (l3.len() as i32) * 3, my + 74, l3, ui.tag, 1, false);
-        self.draw_text(cx - (l4.len() as i32) * 3, my + 86, l4, ui.tag, 1, false);
+        self.ui_draw_text(cx - (l3.len() as i32) * 3, my + 74, l3, ui.tag, 1, false);
+        self.ui_draw_text(cx - (l4.len() as i32) * 3, my + 86, l4, ui.tag, 1, false);
 
-        self.draw_hline(mx + 10, mx + mw - 11, my + 103, ui.muted);
+        self.ui_draw_hline(mx + 10, mx + mw - 11, my + 103, ui.muted);
         let footer = "Enter/Esc: Continue | Hold Esc: Exit";
-        self.draw_text(cx - (footer.len() as i32) * 3, my + 111, footer, ui.sel_label, 1, false);
+        self.ui_draw_text(cx - (footer.len() as i32) * 3, my + 111, footer, ui.sel_label, 1, false);
     }
 
     pub fn render_drone_tuning_menu(&mut self, cfg: &Config, selected: usize) {
@@ -1798,16 +1950,16 @@ impl Renderer {
             let y = 27 + (slot as i32) * 16;
             let is_sel = i == selected;
             if is_sel {
-                self.fill_rect(6, y - 2, W - 12, 14, ui.sel_bg);
-                self.draw_rect(6, y - 2, W - 12, 14, ui.sel_border);
+                self.ui_fill_rect(6, y - 2, UI_W - 12, 14, ui.sel_bg);
+                self.ui_draw_rect(6, y - 2, UI_W - 12, 14, ui.sel_border);
             }
             let kcol = if is_sel { ui.sel_label } else { ui.label };
             let vcol = if is_sel { ui.sel_val } else { ui.val };
-            self.draw_text(12, y + 1, k, kcol, 1, false);
-            self.draw_text(128, y + 1, v, vcol, 1, false);
+            self.ui_draw_text(12, y + 1, k, kcol, 1, false);
+            self.ui_draw_text(128, y + 1, v, vcol, 1, false);
         }
 
-        self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Tune | Esc:Save & Back", ui.muted, 1, false);
+        self.ui_draw_text(8, UI_H - 12, "F/X:Scroll | Z/C:Tune | Esc:Save & Back", ui.muted, 1, false);
     }
 
     pub fn render_pause_menu(&mut self, cfg: &Config, selected: usize) {
@@ -1816,19 +1968,19 @@ impl Renderer {
         let my = 24;
         let mw = 184;
         let mh = 120;
-        self.fill_rect(mx, my, mw, mh, ui.header_bg);
-        self.draw_rect(mx, my, mw, mh, ui.sel_border);
-        self.draw_text(mx + 56, my + 8, "PAUSED", ui.title, 2, false);
+        self.ui_fill_rect(mx, my, mw, mh, ui.header_bg);
+        self.ui_draw_rect(mx, my, mw, mh, ui.sel_border);
+        self.ui_draw_text(mx + 56, my + 8, "PAUSED", ui.title, 2, false);
 
         let items = ["RESUME FLIGHT", "RESPAWN START", "DRONE TUNING", "SETTINGS", "MAIN MENU"];
         for (i, label) in items.iter().enumerate() {
             let y = my + 32 + (i as i32) * 16;
             if i == selected {
-                self.fill_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_bg);
-                self.draw_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_border);
+                self.ui_fill_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_bg);
+                self.ui_draw_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_border);
             }
             let col = if i == selected { ui.sel_label } else { ui.label };
-            self.draw_text(mx + 22, y + 1, label, col, 1, false);
+            self.ui_draw_text(mx + 22, y + 1, label, col, 1, false);
         }
     }
 
@@ -1852,7 +2004,7 @@ impl Renderer {
             (DisplayOutput::HdmiOnly, None) => "HDMI Only [No HDMI]".to_string(),
             (DisplayOutput::LcdOnly, _) => "LCD Only".to_string(),
         };
-        let rows: [(&str, String); 18] = [
+        let rows: [(&str, String); 20] = [
             ("Game Mode", cfg.game_mode.name().to_string()),
             ("Flight Mode", flight_mode_val),
             ("Rate Preset", cfg.rates.name().to_string()),
@@ -1871,6 +2023,8 @@ impl Renderer {
             ("Stick Mode", cfg.stick_mode.name().to_string()),
             ("Throttle Mode", cfg.throttle_mode.name().to_string()),
             ("Display", display_val),
+            ("HDMI Res", cfg.hdmi_resolution.name().to_string()),
+            ("HDMI LCD", cfg.hdmi_lcd_backlight.name().to_string()),
         ];
 
         let tag = format!("{}/{}", selected + 1, rows.len());
@@ -1889,8 +2043,8 @@ impl Renderer {
             let is_sel = i == selected;
             let is_locked = imu_mode && i == 1;
             if is_sel {
-                self.fill_rect(6, y - 2, W - 12, 14, ui.sel_bg);
-                self.draw_rect(6, y - 2, W - 12, 14, ui.sel_border);
+                self.ui_fill_rect(6, y - 2, UI_W - 12, 14, ui.sel_bg);
+                self.ui_draw_rect(6, y - 2, UI_W - 12, 14, ui.sel_border);
             }
             let kcol = if is_locked {
                 ui.muted
@@ -1906,26 +2060,26 @@ impl Renderer {
             } else {
                 ui.val
             };
-            self.draw_text(12, y + 1, k, kcol, 1, false);
-            self.draw_text(126, y + 1, v, vcol, 1, false);
+            self.ui_draw_text(12, y + 1, k, kcol, 1, false);
+            self.ui_draw_text(126, y + 1, v, vcol, 1, false);
         }
 
-        self.draw_text(8, H - 12, "F/X:Scroll | Z/C:Adjust | Esc:Save", ui.muted, 1, false);
+        self.ui_draw_text(8, UI_H - 12, "F/X:Scroll | Z/C:Adjust | Esc:Save", ui.muted, 1, false);
     }
 
     /// Static status card drawn once on the built-in 1.9" LCD when `HDMI Only` mode is active.
     pub fn render_hdmi_lcd_notice(&mut self, cfg: &Config, hdmi_info: &str) {
         let ui = ui_colors(cfg.ui_theme);
         self.draw_header("STICKZERO", "HDMI ONLY", ui);
-        let cx = W / 2;
+        let cx = UI_W / 2;
 
-        self.fill_rect(18, 34, W - 36, 98, ui.header_bg);
-        self.draw_rect(18, 34, W - 36, 98, ui.sel_border);
+        self.ui_fill_rect(18, 34, UI_W - 36, 98, ui.header_bg);
+        self.ui_draw_rect(18, 34, UI_W - 36, 98, ui.sel_border);
 
         let title = "HDMI OUTPUT ACTIVE";
-        self.draw_text(cx - (title.len() as i32) * 6, 46, title, ui.sel_label, 2, false);
+        self.ui_draw_text(cx - (title.len() as i32) * 6, 46, title, ui.sel_label, 2, false);
 
-        self.draw_text(
+        self.ui_draw_text(
             cx - (hdmi_info.len() as i32) * 3,
             74,
             hdmi_info,
@@ -1934,13 +2088,17 @@ impl Renderer {
             false,
         );
 
-        let l1 = "LCD paused to save battery & SPI";
+        let l1 = if cfg.hdmi_lcd_backlight == HdmiLcdBacklight::Dim {
+            "LCD dimmed to save battery & SPI"
+        } else {
+            "LCD paused to save battery & SPI"
+        };
         let l2 = "Unplug HDMI to return to LCD";
-        self.draw_text(cx - (l1.len() as i32) * 3, 96, l1, ui.label, 1, false);
-        self.draw_text(cx - (l2.len() as i32) * 3, 110, l2, ui.muted, 1, false);
+        self.ui_draw_text(cx - (l1.len() as i32) * 3, 96, l1, ui.label, 1, false);
+        self.ui_draw_text(cx - (l2.len() as i32) * 3, 110, l2, ui.muted, 1, false);
 
-        let footer = "Settings -> Display: Auto / LCD";
-        self.draw_text(cx - (footer.len() as i32) * 3, H - 14, footer, ui.muted, 1, false);
+        let footer = "Settings -> Display / HDMI LCD";
+        self.ui_draw_text(cx - (footer.len() as i32) * 3, UI_H - 14, footer, ui.muted, 1, false);
     }
 
     pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {
@@ -1978,25 +2136,25 @@ impl Renderer {
         };
 
         let dev_col = if ctrl_src == FlightControlSource::None { ui.warn } else { ui.sel_label };
-        self.draw_text(8, 25, &dev_tag, dev_col, 1, false);
-        self.draw_text(8, 35, &sub_summary, ui.tag, 1, false);
+        self.ui_draw_text(8, 25, &dev_tag, dev_col, 1, false);
+        self.ui_draw_text(8, 35, &sub_summary, ui.tag, 1, false);
 
         if let Some(ref wiz) = input.calib {
-            self.fill_rect(10, 48, W - 20, 74, ui.header_bg);
-            self.draw_rect(10, 48, W - 20, 74, ui.accent);
-            self.draw_text(18, 56, "CALIBRATE STICKS", ui.tag, 1, false);
-            self.draw_text(18, 72, wiz.step_prompt(), ui.sel_label, 1, false);
+            self.ui_fill_rect(10, 48, UI_W - 20, 74, ui.header_bg);
+            self.ui_draw_rect(10, 48, UI_W - 20, 74, ui.accent);
+            self.ui_draw_text(18, 56, "CALIBRATE STICKS", ui.tag, 1, false);
+            self.ui_draw_text(18, 72, wiz.step_prompt(), ui.sel_label, 1, false);
             let msg: String = wiz.message.chars().take(44).collect();
-            self.draw_text(18, 90, &msg, ui.ok, 1, false);
-            self.draw_text(18, 106, "Esc: Cancel Calibration", ui.muted, 1, false);
+            self.ui_draw_text(18, 90, &msg, ui.ok, 1, false);
+            self.ui_draw_text(18, 106, "Esc: Cancel Calibration", ui.muted, 1, false);
         } else if let Some(ref aw) = input.aux_wiz {
-            self.fill_rect(10, 48, W - 20, 74, ui.header_bg);
-            self.draw_rect(10, 48, W - 20, 74, ui.ok);
-            self.draw_text(18, 56, "BIND RADIO AUX SWITCHES", ui.ok, 1, false);
-            self.draw_text(18, 72, aw.step_prompt(), ui.sel_label, 1, false);
+            self.ui_fill_rect(10, 48, UI_W - 20, 74, ui.header_bg);
+            self.ui_draw_rect(10, 48, UI_W - 20, 74, ui.ok);
+            self.ui_draw_text(18, 56, "BIND RADIO AUX SWITCHES", ui.ok, 1, false);
+            self.ui_draw_text(18, 72, aw.step_prompt(), ui.sel_label, 1, false);
             let msg: String = aw.message.chars().take(44).collect();
-            self.draw_text(18, 90, &msg, ui.tag, 1, false);
-            self.draw_text(18, 106, "Enter: Skip Step | Esc: Cancel", ui.muted, 1, false);
+            self.ui_draw_text(18, 90, &msg, ui.tag, 1, false);
+            self.ui_draw_text(18, 106, "Enter: Skip Step | Esc: Cancel", ui.muted, 1, false);
         } else {
             let sticks = input.flight_sticks(cfg);
             let bars: [(&str, f32); 4] = [
@@ -2008,28 +2166,30 @@ impl Renderer {
 
             for (i, (lbl, val)) in bars.iter().enumerate() {
                 let y = 49 + (i as i32) * 16;
-                self.draw_text(8, y + 2, lbl, ui.label, 1, false);
+                self.ui_draw_text(8, y + 2, lbl, ui.label, 1, false);
                 let bx = 38;
                 let bw = 152;
-                self.fill_rect(bx, y, bw, 10, ui.header_bg);
-                self.draw_rect(bx, y, bw, 10, ui.muted);
+                self.ui_fill_rect(bx, y, bw, 10, ui.header_bg);
+                self.ui_draw_rect(bx, y, bw, 10, ui.muted);
                 let mid = bx + bw / 2;
-                self.draw_vline(mid, y + 1, y + 8, ui.muted);
+                self.ui_draw_vline(mid, y + 1, y + 8, ui.muted);
                 let pos = bx + ((clampf(*val, -1.0, 1.0) + 1.0) * 0.5 * (bw - 4) as f32) as i32;
-                self.fill_rect(pos, y + 2, 4, 6, ui.ok);
+                self.ui_fill_rect(pos, y + 2, 4, 6, ui.ok);
             }
 
+            let s = self.ui_scale();
+            let (ox, oy) = self.ui_origin();
             if ctrl_src == FlightControlSource::ImuSimplified {
                 let thr_pct = (sticks.throttle * 100.0).round() as u8;
-                self.draw_imu_throttle_bar(204, 51, 18, 46, thr_pct, input.imu_climb_cmd(), false);
-                self.draw_imu_tilt_box(260, 51, 46, sticks.roll, sticks.pitch, false);
-                self.draw_text(204, 101, "ALT", ui.muted, 1, false);
-                self.draw_text(274, 101, "IMU", ui.tag, 1, false);
+                self.draw_imu_throttle_bar(ox + 204 * s, oy + 51 * s, 18 * s, 46 * s, thr_pct, input.imu_climb_cmd(), false, s);
+                self.draw_imu_tilt_box(ox + 260 * s, oy + 51 * s, 46 * s, sticks.roll, sticks.pitch, false, s);
+                self.ui_draw_text(204, 101, "ALT", ui.muted, 1, false);
+                self.ui_draw_text(274, 101, "IMU", ui.tag, 1, false);
             } else {
-                self.draw_stick_box(204, 51, 46, sticks.yaw, sticks.throttle * 2.0 - 1.0);
-                self.draw_stick_box(260, 51, 46, sticks.roll, sticks.pitch);
-                self.draw_text(214, 101, "L-STK", ui.muted, 1, false);
-                self.draw_text(270, 101, "R-STK", ui.muted, 1, false);
+                self.draw_stick_box(ox + 204 * s, oy + 51 * s, 46 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
+                self.draw_stick_box(ox + 260 * s, oy + 51 * s, 46 * s, sticks.roll, sticks.pitch, s);
+                self.ui_draw_text(214, 101, "L-STK", ui.muted, 1, false);
+                self.ui_draw_text(270, 101, "R-STK", ui.muted, 1, false);
             }
         }
 
@@ -2039,20 +2199,20 @@ impl Renderer {
             FlightControlSource::None => input.imu.summary(),
         };
         let raw_trim: String = raw.chars().take(50).collect();
-        self.draw_text(8, 127, &raw_trim, if ctrl_src == FlightControlSource::None { ui.warn } else { ui.ok }, 1, false);
+        self.ui_draw_text(8, 127, &raw_trim, if ctrl_src == FlightControlSource::None { ui.warn } else { ui.ok }, 1, false);
 
         match ctrl_src {
             FlightControlSource::Controller => {
-                self.draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", ui.sel_val, 1, false);
-                self.draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
+                self.ui_draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", ui.sel_val, 1, false);
+                self.ui_draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
             }
             FlightControlSource::ImuSimplified => {
-                self.draw_text(8, 141, "C:Zero IMU | F/X:Alt | R:Rescan BT/USB", ui.sel_val, 1, false);
-                self.draw_text(8, 154, "Connect USB/BT radio for full sticks", ui.muted, 1, false);
+                self.ui_draw_text(8, 141, "C:Zero IMU | F/X:Alt | R:Rescan BT/USB", ui.sel_val, 1, false);
+                self.ui_draw_text(8, 154, "Connect USB/BT radio for full sticks", ui.muted, 1, false);
             }
             FlightControlSource::None => {
-                self.draw_text(8, 141, "Connect USB-C Host or BT Controller", ui.sel_val, 1, false);
-                self.draw_text(8, 154, "R:Rescan | N:NextDev | Esc:Back", ui.muted, 1, false);
+                self.ui_draw_text(8, 141, "Connect USB-C Host or BT Controller", ui.sel_val, 1, false);
+                self.ui_draw_text(8, 154, "R:Rescan | N:NextDev | Esc:Back", ui.muted, 1, false);
             }
         }
     }

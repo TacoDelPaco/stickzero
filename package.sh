@@ -34,6 +34,8 @@ cat > "$STAGE/usr/lib/udev/rules.d/70-stickzero.rules" <<'EOF'
 ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ELRS*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ExpressLRS*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Allow StickZero (video group) to dim/restore CardputerZero's built-in LCD backlight when HDMI is active.
+ACTION=="add|change", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys$devpath/brightness", RUN+="/bin/chmod g+w /sys$devpath/brightness"
 EOF
 chmod 644 "$STAGE/usr/lib/udev/rules.d/70-stickzero.rules"
 
@@ -51,10 +53,11 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 
-# 1. Reload udev rules so /dev/hidraw* gets input-group read access immediately
+# 1. Reload udev rules so /dev/hidraw* and /sys/class/backlight/*/brightness get group access immediately
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules >/dev/null 2>&1 || true
     udevadm trigger --subsystem-match=hidraw >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=backlight >/dev/null 2>&1 || true
 fi
 
 # 2. Tune BlueZ [LE] connection parameters for low-latency BLE HID controllers (7.5-11.25ms, 0 latency)

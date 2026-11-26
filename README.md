@@ -80,14 +80,23 @@ Installing the `.deb` package automatically configures `/usr/lib/udev/rules.d/70
 StickZero automatically detects CardputerZero's built-in 320×170 ST7789v3 LCD (honoring `APPLAUNCH_LINUX_FBDEV_DEVICE`, `LV_LINUX_FBDEV_DEVICE`, `/proc/fb`, and `/dev/fb_lcd`) **and** supports live-hotplug **Mini-HDMI output** to TVs, monitors, and HDMI-in FPV goggles with zero external dependencies:
 
 - **Display Modes (`Settings → Display`)**:
-  - **`Auto (Mirror)`** *(default)*: Mirrors to HDMI automatically whenever a monitor/goggles are plugged in (hotplug checked every 1.5s) while keeping the built-in 1.9" LCD active.
+  - **`Auto (Mirror)`** *(default)*: Mirrors to HDMI automatically whenever a monitor/goggles are plugged in (hotplug checked every 1.5s) while keeping the built-in 1.9" LCD active (downscaled cleanly from HDMI resolution when dimmed/on, or paused when `HDMI LCD` is `Off`).
   - **`HDMI Only`**: Outputs exclusively to HDMI and displays a static status card on the 1.9" LCD to save SPI bandwidth and battery; automatically returns to the built-in LCD if HDMI is unplugged.
   - **`LCD Only`**: Renders strictly to the 1.9" LCD and ignores HDMI.
+- **HDMI Render Resolution (`Settings → HDMI Res`)**:
+  - **`640×360 (16:9)`** *(default)*: Renders true 16:9 HD (~4.2× sharper than `320×170`) with **zero black letterbox bars** (exact 2× integer scale to 720p, exact 3× to 1080p) at locked 60 FPS on Pi CM0.
+  - **`960×540 (qHD)`**: Extra-sharp 16:9 render (exact 2× integer scale to 1080p).
+  - **`320×170 (1x)`**: Native LCD resolution for lowest CPU & power draw.
+- **Battery-Saving LCD Backlight (`Settings → HDMI LCD`)**:
+  - **`Dim (12%)`** *(default)*: Automatically dims CardputerZero's ST7789v3 PWM backlight (`/sys/class/backlight/backlight/brightness`) to ~12% while HDMI is active and restores your original brightness on unplug or exit.
+  - **`Off (0%)`**: Turns the built-in LCD backlight completely off and pauses 60 Hz SPI transfers while HDMI is active for maximum battery life; automatically restores brightness on unplug or exit.
+  - **`Keep On`**: Leaves the built-in LCD backlight untouched.
 - **Zero-Dependency HDMI Backends (auto-selected in order)**:
-  1. **Wayland (`WL`)**: Connects directly to stock CardputerZero's `labwc-pi` compositor (`wayland-0`) fullscreen on the HDMI output, using `wp_viewporter` for GPU-accelerated scaling (<0.15 ms CPU, <450 KB RAM) and non-blocking double-buffered `wl_shm`.
-  2. **DRM/KMS (`DRM`)**: Drives `/dev/dri/card*` `HDMI-A`/`HDMI-B` directly when no compositor owns DRM master (headless / `lightdm` disabled / Raspberry Pi OS Lite), preferring **1280×720 @ 60 Hz** (exact 4× integer scale = `1280×680`) and 16-bit `DRM_FORMAT_RGB565` with automatic `XRGB8888` fallback and clean CRTC restore on exit.
+  1. **Wayland (`WL`)**: Connects directly to stock CardputerZero's `labwc-pi` compositor (`wayland-0`) fullscreen on the HDMI output, using `wp_viewporter` for GPU-accelerated scaling (<0.15 ms CPU) and non-blocking double-buffered `wl_shm` that resizes live with `HDMI Res`.
+  2. **DRM/KMS (`DRM`)**: Drives `/dev/dri/card*` `HDMI-A`/`HDMI-B` directly when no compositor owns DRM master (headless / `lightdm` disabled / Raspberry Pi OS Lite), preferring **1280×720 @ 60 Hz** (exact 2× integer scale of `640×360`) and 16-bit `DRM_FORMAT_RGB565` with automatic `XRGB8888` fallback and clean CRTC restore on exit.
   3. **Linux fbdev (`FB`)**: Fast LUT + row-repeat scaled blitting for 16-bit RGB565, 24-bit RGB888, and 32-bit XRGB8888/XBGR8888 framebuffers (`vc4drmfb`, `BCM2708 FB`, `simpledrm`).
 - **Optional Environment Overrides**:
   - `STICKZERO_FBDEV=/dev/fbX` — force a single specific framebuffer device.
   - `STICKZERO_HDMI_BACKEND=wayland|drm|fbdev` — force a specific HDMI backend.
+  - `STICKZERO_BACKLIGHT_DIR=/sys/class/backlight/<name>` — override LCD backlight sysfs directory.
   - `STICKZERO_AUDIO_DEV=plughw:CARD=vc4hdmi,DEV=0` — override ALSA `aplay -D` device (e.g. for HDMI audio on ALSA-only setups).

@@ -9,7 +9,7 @@
 //!   to full 1080p/720p HDMI at ~0.1 ms CPU cost and <450 KB RAM (with CPU-scaled fallback)
 //! - Non-blocking double-buffered `wl_shm` presentation so 30 Hz TVs never stall the 60 Hz sim
 
-use crate::display::{compute_fit_rect, Blitter, PixelLayout, SCREEN_H, SCREEN_W};
+use crate::display::{compute_fit_rect, compute_fit_rect_for, Blitter, PixelLayout, SCREEN_H, SCREEN_W};
 use crate::linux_sys::{
     close, ftruncate, getuid, mmap, munmap, open, poll, recvmsg, sendmsg, syscall, unlink,
     Cmsghdr, Iovec, Msghdr, PollFd, MAP_SHARED, MFD_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL,
@@ -66,6 +66,8 @@ pub struct WaylandDisplay {
     pool_id: u32,
     buf_ids: [u32; 2],
     buf_busy: [bool; 2],
+    src_w: usize,
+    src_h: usize,
     buf_w: usize,
     buf_h: usize,
     buf_stride: usize,
@@ -473,6 +475,8 @@ impl WaylandDisplay {
             pool_id,
             buf_ids: [buf0_id, buf1_id],
             buf_busy: [false, false],
+            src_w: SCREEN_W,
+            src_h: SCREEN_H,
             buf_w,
             buf_h,
             buf_stride,
@@ -486,6 +490,150 @@ impl WaylandDisplay {
             alive: true,
             rx_buf,
         })
+    }
+
+    fn ensure_source_size(&mut self, src_w: usize, src_h: usize) -> bool {
+        if src_w == self.src_w && src_h == self.src_h {
+            return true;
+        }
+        self.src_w = src_w;
+        self.src_h = src_h;
+
+        if !self.use_viewporter {
+            if self.blitter.ensure_source(src_w, src_h) && !self.shm_ptr.is_null() {
+                unsafe {
+                    ptr::write_bytes(self.shm_ptr, 0, self.shm_len);
+                }
+            }
+            return true;
+        }
+
+        // Reallocate double-buffered wl_shm at the exact new source resolution so the GPU
+        // (`wp_viewporter`) scales the sharp new framebuffer to HDMI with ~0.1 ms CPU cost.
+        let bpp = if self.use_rgb565 { 2usize } else { 4usize };
+        let new_stride = src_w * bpp;
+        let new_buf_size = new_stride * src_h;
+        let new_shm_len = new_buf_size * 2;
+
+        let Ok(new_fd) = create_shm_fd(new_shm_len) else {
+            self.alive = false;
+            return false;
+        };
+        let new_mapped = unsafe {
+            mmap(
+                ptr::null_mut(),
+                new_shm_len,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                new_fd,
+                0,
+            )
+        };
+        if new_mapped == (!0usize as *mut c_void) || new_mapped.is_null() {
+            unsafe { close(new_fd) };
+            self.alive = false;
+            return false;
+        }
+        unsafe {
+            ptr::write_bytes(new_mapped as *mut u8, 0, new_shm_len);
+        }
+
+        let fd = self.stream.as_raw_fd();
+        let mut destroy_msg = Vec::with_capacity(32);
+        push_msg(&mut destroy_msg, self.buf_ids[0], 0, &[]);
+        push_msg(&mut destroy_msg, self.buf_ids[1], 0, &[]);
+        push_msg(&mut destroy_msg, self.pool_id, 1, &[]);
+        if send_bytes(fd, &destroy_msg, None).is_err() {
+            unsafe {
+                munmap(new_mapped, new_shm_len);
+                close(new_fd);
+            }
+            self.alive = false;
+            return false;
+        }
+
+        let new_pool_id = self.next_id;
+        self.next_id += 1;
+        let new_buf0_id = self.next_id;
+        self.next_id += 1;
+        let new_buf1_id = self.next_id;
+        self.next_id += 1;
+
+        let mut pool_msg = Vec::with_capacity(20);
+        push_msg(&mut pool_msg, self.wl_shm_id, 0, &[new_pool_id, new_shm_len as u32]);
+        if send_bytes(fd, &pool_msg, Some(new_fd)).is_err() {
+            unsafe {
+                munmap(new_mapped, new_shm_len);
+                close(new_fd);
+            }
+            self.alive = false;
+            return false;
+        }
+
+        let wl_fmt = if self.use_rgb565 {
+            WL_SHM_FORMAT_RGB565
+        } else {
+            WL_SHM_FORMAT_XRGB8888
+        };
+        let mut create_msg = Vec::with_capacity(96);
+        push_msg(
+            &mut create_msg,
+            new_pool_id,
+            0,
+            &[new_buf0_id, 0, src_w as u32, src_h as u32, new_stride as u32, wl_fmt],
+        );
+        push_msg(
+            &mut create_msg,
+            new_pool_id,
+            0,
+            &[
+                new_buf1_id,
+                new_buf_size as u32,
+                src_w as u32,
+                src_h as u32,
+                new_stride as u32,
+                wl_fmt,
+            ],
+        );
+        if let Some(vp_id) = self.wp_viewport_id {
+            let (fit_w, fit_h, _, _) = compute_fit_rect_for(src_w, src_h, self.width, self.height);
+            push_msg(&mut create_msg, vp_id, 2, &[fit_w as u32, fit_h as u32]);
+        }
+        if send_bytes(fd, &create_msg, None).is_err() {
+            unsafe {
+                munmap(new_mapped, new_shm_len);
+                close(new_fd);
+            }
+            self.alive = false;
+            return false;
+        }
+
+        if !self.shm_ptr.is_null() && self.shm_len > 0 {
+            unsafe {
+                munmap(self.shm_ptr as *mut c_void, self.shm_len);
+            }
+        }
+        if self.shm_fd >= 0 {
+            unsafe { close(self.shm_fd) };
+        }
+
+        let layout = if self.use_rgb565 {
+            PixelLayout::Rgb565
+        } else {
+            PixelLayout::xrgb8888()
+        };
+        self.shm_fd = new_fd;
+        self.shm_ptr = new_mapped as *mut u8;
+        self.shm_len = new_shm_len;
+        self.pool_id = new_pool_id;
+        self.buf_ids = [new_buf0_id, new_buf1_id];
+        self.buf_busy = [false, false];
+        self.buf_w = src_w;
+        self.buf_h = src_h;
+        self.buf_stride = new_stride;
+        self.buf_size = new_buf_size;
+        self.blitter = Blitter::new_for_source(src_w, src_h, src_w, src_h, new_stride, layout);
+        true
     }
 
     fn pump_events_nonblocking(&mut self) {
@@ -557,7 +705,8 @@ impl WaylandDisplay {
                     self.width = new_w;
                     self.height = new_h;
                     if let Some(vp_id) = self.wp_viewport_id {
-                        let (fit_w, fit_h, _, _) = compute_fit_rect(new_w, new_h);
+                        let (fit_w, fit_h, _, _) =
+                            compute_fit_rect_for(self.src_w, self.src_h, new_w, new_h);
                         push_msg(&mut replies, vp_id, 2, &[fit_w as u32, fit_h as u32]);
                     }
                 }
@@ -573,12 +722,15 @@ impl WaylandDisplay {
         }
     }
 
-    pub fn present(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H]) -> bool {
+    pub fn present(&mut self, rgb565: &[u16], src_w: usize, src_h: usize) -> bool {
         if !self.alive {
             return false;
         }
         self.pump_events_nonblocking();
         if !self.alive {
+            return false;
+        }
+        if !self.ensure_source_size(src_w, src_h) {
             return false;
         }
 
@@ -592,7 +744,8 @@ impl WaylandDisplay {
         };
 
         let dst_ptr = unsafe { self.shm_ptr.add(slot * self.buf_size) };
-        self.blitter.blit_rgb565(rgb565, dst_ptr, self.buf_size);
+        self.blitter
+            .blit_rgb565(rgb565, src_w, src_h, dst_ptr, self.buf_size);
 
         let mut out = Vec::with_capacity(64);
         // wl_surface::attach(buf_id, 0, 0) [opcode 1]
@@ -1015,11 +1168,12 @@ mod tests {
             conn.write_all(&ev).unwrap();
 
             // 4. Verify client sends ack_configure(42), create_pool (with SCM_RIGHTS fd), create_buffer, attach, commit
+            //    and then a second shm fd + attach when switching live to 640x360.
             let mut saw_ack = false;
-            let mut saw_attach = false;
-            let mut got_fd: Option<i32> = None;
-            let deadline = Instant::now() + Duration::from_millis(1000);
-            while !(saw_ack && saw_attach && got_fd.is_some()) && Instant::now() < deadline {
+            let mut attach_count = 0usize;
+            let mut fd_count = 0usize;
+            let deadline = Instant::now() + Duration::from_millis(1200);
+            while !(saw_ack && attach_count >= 2 && fd_count >= 2) && Instant::now() < deadline {
                 let mut tmp = [0u8; 4096];
                 let mut iov = Iovec {
                     iov_base: tmp.as_mut_ptr() as *mut c_void,
@@ -1050,7 +1204,8 @@ mod tests {
                     && cbuf.hdr.cmsg_type == SCM_RIGHTS
                     && cbuf.fd >= 0
                 {
-                    got_fd = Some(cbuf.fd);
+                    fd_count += 1;
+                    unsafe { close(cbuf.fd) };
                 }
                 rx.extend_from_slice(&tmp[..n as usize]);
                 while let Some((obj, op, payload)) = next_event(&mut rx) {
@@ -1059,16 +1214,13 @@ mod tests {
                         assert_eq!(serial, 42);
                         saw_ack = true;
                     } else if op == 1 && payload.len() == 12 {
-                        saw_attach = true;
+                        attach_count += 1;
                     }
                 }
             }
-            if let Some(f) = got_fd {
-                unsafe { close(f) };
-            }
             assert!(saw_ack, "expected xdg_surface::ack_configure");
-            assert!(got_fd.is_some(), "expected SCM_RIGHTS shm fd");
-            assert!(saw_attach, "expected wl_surface::attach on present()");
+            assert!(fd_count >= 2, "expected initial + resized SCM_RIGHTS shm fds");
+            assert!(attach_count >= 2, "expected wl_surface::attach for 320x170 and 640x360");
         });
 
         let mut disp = WaylandDisplay::connect_path(&sock_path, true).unwrap();
@@ -1076,7 +1228,11 @@ mod tests {
         assert_eq!(disp.debug_info(), (true, true, SCREEN_W, SCREEN_H));
 
         let fb = [0xF800u16; SCREEN_W * SCREEN_H];
-        assert!(disp.present(&fb));
+        assert!(disp.present(&fb, SCREEN_W, SCREEN_H));
+
+        let fb_hd = vec![0x07E0u16; 640 * 360];
+        assert!(disp.present(&fb_hd, 640, 360));
+        assert_eq!(disp.debug_info(), (true, true, 640, 360));
 
         server.join().unwrap();
         drop(disp);

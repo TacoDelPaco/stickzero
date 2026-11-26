@@ -10,7 +10,7 @@
 //! Also supports live HDMI hotplug/unplug detection and explicit `STICKZERO_FBDEV` /
 //! `STICKZERO_HDMI_BACKEND` overrides.
 
-use crate::config::DisplayOutput;
+use crate::config::{DisplayOutput, HdmiLcdBacklight, HdmiResolution};
 use crate::drm::DrmDisplay;
 use crate::linux_sys::{
     close, ioctl, mmap, munmap, open, FbFixScreenInfo, FbVarScreenInfo, FBIOGET_FSCREENINFO,
@@ -102,40 +102,50 @@ impl PixelLayout {
 }
 
 /// Compute aspect-preserving centered output rectangle `(out_w, out_h, x_off, y_off)` for
-/// mapping our 320x170 framebuffer onto an arbitrary `(dst_w, dst_h)` display.
+/// mapping a `(src_w, src_h)` framebuffer onto an arbitrary `(dst_w, dst_h)` display.
 ///
-/// Prefers crisp exact integer scaling (e.g. 4x = 1280x680 on 720p, 6x = 1920x1020 on 1080p)
-/// whenever an integer multiple fills at least 85% of either axis; otherwise uses full
-/// aspect-preserving nearest-neighbor fit.
-pub fn compute_fit_rect(dst_w: usize, dst_h: usize) -> (usize, usize, usize, usize) {
-    if dst_w == 0 || dst_h == 0 {
+/// Prefers crisp exact integer scaling (e.g. 640x360 -> 2x=1280x720 / 3x=1920x1080,
+/// 320x170 -> 4x=1280x680 / 6x=1920x1020) whenever an integer multiple fills at least 85%
+/// of either axis; otherwise uses full aspect-preserving nearest-neighbor fit (including
+/// downscaling e.g. 640x360 -> 302x170 on the built-in 320x170 LCD).
+pub fn compute_fit_rect_for(
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> (usize, usize, usize, usize) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return (0, 0, 0, 0);
     }
-    if dst_w <= SCREEN_W && dst_h <= SCREEN_H {
-        let out_w = dst_w.min(SCREEN_W);
-        let out_h = dst_h.min(SCREEN_H);
-        return (
-            out_w,
-            out_h,
-            (dst_w.saturating_sub(out_w)) / 2,
-            (dst_h.saturating_sub(out_h)) / 2,
-        );
+    if dst_w == src_w && dst_h == src_h {
+        return (dst_w, dst_h, 0, 0);
     }
 
-    let int_scale = (dst_w / SCREEN_W).min(dst_h / SCREEN_H);
-    let (out_w, out_h) = if int_scale >= 1
-        && (SCREEN_W * int_scale * 100 >= dst_w * 85 || SCREEN_H * int_scale * 100 >= dst_h * 85)
-    {
-        (SCREEN_W * int_scale, SCREEN_H * int_scale)
-    } else if dst_w * SCREEN_H <= dst_h * SCREEN_W {
-        (dst_w, ((dst_w * SCREEN_H) / SCREEN_W).max(1).min(dst_h))
+    let (out_w, out_h) = if dst_w >= src_w && dst_h >= src_h {
+        let int_scale = (dst_w / src_w).min(dst_h / src_h);
+        if int_scale >= 1
+            && (src_w * int_scale * 100 >= dst_w * 85 || src_h * int_scale * 100 >= dst_h * 85)
+        {
+            (src_w * int_scale, src_h * int_scale)
+        } else if dst_w * src_h <= dst_h * src_w {
+            (dst_w, ((dst_w * src_h) / src_w).max(1).min(dst_h))
+        } else {
+            (((dst_h * src_w) / src_h).max(1).min(dst_w), dst_h)
+        }
+    } else if dst_w * src_h <= dst_h * src_w {
+        (dst_w, ((dst_w * src_h) / src_w).max(1).min(dst_h))
     } else {
-        (((dst_h * SCREEN_W) / SCREEN_H).max(1).min(dst_w), dst_h)
+        (((dst_h * src_w) / src_h).max(1).min(dst_w), dst_h)
     };
 
     let x_off = (dst_w.saturating_sub(out_w)) / 2;
     let y_off = (dst_h.saturating_sub(out_h)) / 2;
     (out_w, out_h, x_off, y_off)
+}
+
+/// Convenience wrapper for mapping CardputerZero's native 320x170 framebuffer onto `(dst_w, dst_h)`.
+pub fn compute_fit_rect(dst_w: usize, dst_h: usize) -> (usize, usize, usize, usize) {
+    compute_fit_rect_for(SCREEN_W, SCREEN_H, dst_w, dst_h)
 }
 
 #[inline(always)]
@@ -149,13 +159,15 @@ fn expand_rgb565_to_u32(c: u16, r_shift: u32, g_shift: u32, b_shift: u32, alpha_
     alpha_mask | (r << r_shift) | (g << g_shift) | (b << b_shift)
 }
 
-/// Fast zero-allocation-per-frame scaler/converter from 320x170 RGB565 to any
-/// 16-bit, 24-bit, or 32-bit linear framebuffer.
+/// Fast zero-allocation-per-frame scaler/converter from an arbitrary `(src_w, src_h)` RGB565
+/// framebuffer to any 16-bit, 24-bit, or 32-bit linear framebuffer.
 ///
-/// Uses a precomputed 64K RGB565->u32 LUT and an L1-cached staging row buffer so each of
-/// the 170 source scanlines is converted once and burst-copied (`memcpy`) across repeated
+/// Uses a precomputed 64K RGB565->u32 LUT and an L1-cached staging row buffer so each
+/// source scanline is converted once and burst-copied (`memcpy`) across repeated
 /// destination rows — critical for maintaining 60 FPS on Raspberry Pi CM0 LPDDR2.
 pub struct Blitter {
+    src_w: usize,
+    src_h: usize,
     dst_w: usize,
     dst_h: usize,
     stride: usize,
@@ -176,7 +188,18 @@ pub struct Blitter {
 
 impl Blitter {
     pub fn new(dst_w: usize, dst_h: usize, stride: usize, layout: PixelLayout) -> Self {
-        Self::with_origin(dst_w, dst_h, stride, layout, 0)
+        Self::with_source_and_origin(SCREEN_W, SCREEN_H, dst_w, dst_h, stride, layout, 0)
+    }
+
+    pub fn new_for_source(
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        stride: usize,
+        layout: PixelLayout,
+    ) -> Self {
+        Self::with_source_and_origin(src_w, src_h, dst_w, dst_h, stride, layout, 0)
     }
 
     pub fn with_origin(
@@ -186,25 +209,26 @@ impl Blitter {
         layout: PixelLayout,
         origin_byte_offset: usize,
     ) -> Self {
-        let (out_w, out_h, x_off, y_off) = compute_fit_rect(dst_w, dst_h);
-        let int_scale = if out_w > 0
-            && out_h > 0
-            && out_w % SCREEN_W == 0
-            && out_h % SCREEN_H == 0
-            && out_w / SCREEN_W == out_h / SCREEN_H
-        {
-            Some(out_w / SCREEN_W)
-        } else {
-            None
-        };
+        Self::with_source_and_origin(
+            SCREEN_W,
+            SCREEN_H,
+            dst_w,
+            dst_h,
+            stride,
+            layout,
+            origin_byte_offset,
+        )
+    }
 
-        let x_lut: Vec<u16> = (0..out_w)
-            .map(|x| ((x * SCREEN_W) / out_w.max(1)).min(SCREEN_W - 1) as u16)
-            .collect();
-        let y_lut: Vec<u16> = (0..out_h)
-            .map(|y| ((y * SCREEN_H) / out_h.max(1)).min(SCREEN_H - 1) as u16)
-            .collect();
-
+    pub fn with_source_and_origin(
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        stride: usize,
+        layout: PixelLayout,
+        origin_byte_offset: usize,
+    ) -> Self {
         let lut32 = match layout {
             PixelLayout::Rgb32 {
                 r_shift,
@@ -222,44 +246,100 @@ impl Blitter {
             _ => None,
         };
 
-        let row16 = if matches!(layout, PixelLayout::Rgb565) {
-            vec![0u16; out_w]
-        } else {
-            Vec::new()
-        };
-        let row24 = if matches!(layout, PixelLayout::Rgb24 { .. }) {
-            vec![0u8; out_w * 3]
-        } else {
-            Vec::new()
-        };
-        let row32 = if matches!(layout, PixelLayout::Rgb32 { .. }) {
-            vec![0u32; out_w]
-        } else {
-            Vec::new()
-        };
-
-        Self {
+        let mut blitter = Self {
+            src_w: 0,
+            src_h: 0,
             dst_w,
             dst_h,
             stride,
             layout,
-            out_w,
-            out_h,
-            x_off,
-            y_off,
+            out_w: 0,
+            out_h: 0,
+            x_off: 0,
+            y_off: 0,
             origin_byte_offset,
-            int_scale,
-            x_lut,
-            y_lut,
+            int_scale: None,
+            x_lut: Vec::new(),
+            y_lut: Vec::new(),
             lut32,
-            row16,
-            row24,
-            row32,
-        }
+            row16: Vec::new(),
+            row24: Vec::new(),
+            row32: Vec::new(),
+        };
+        blitter.ensure_source(src_w, src_h);
+        blitter
     }
 
-    pub fn blit_rgb565(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H], dst_ptr: *mut u8, dst_len: usize) {
-        if self.out_w == 0 || self.out_h == 0 || dst_ptr.is_null() {
+    /// Reconfigure scaling LUTs if the source framebuffer resolution changed.
+    /// Returns `true` if geometry changed (callers can clear stale letterbox borders once).
+    pub fn ensure_source(&mut self, src_w: usize, src_h: usize) -> bool {
+        if self.src_w == src_w && self.src_h == src_h {
+            return false;
+        }
+        self.src_w = src_w;
+        self.src_h = src_h;
+
+        let (out_w, out_h, x_off, y_off) = compute_fit_rect_for(src_w, src_h, self.dst_w, self.dst_h);
+        self.out_w = out_w;
+        self.out_h = out_h;
+        self.x_off = x_off;
+        self.y_off = y_off;
+
+        self.int_scale = if src_w > 0
+            && src_h > 0
+            && out_w >= src_w
+            && out_h >= src_h
+            && out_w % src_w == 0
+            && out_h % src_h == 0
+            && out_w / src_w == out_h / src_h
+        {
+            Some(out_w / src_w)
+        } else {
+            None
+        };
+
+        self.x_lut.clear();
+        self.x_lut.reserve(out_w);
+        for x in 0..out_w {
+            let sx = if out_w < src_w && out_w > 1 {
+                (x * (src_w - 1)) / (out_w - 1)
+            } else {
+                (x * src_w) / out_w.max(1)
+            };
+            self.x_lut.push(sx.min(src_w.saturating_sub(1)) as u16);
+        }
+        self.y_lut.clear();
+        self.y_lut.reserve(out_h);
+        for y in 0..out_h {
+            let sy = if out_h < src_h && out_h > 1 {
+                (y * (src_h - 1)) / (out_h - 1)
+            } else {
+                (y * src_h) / out_h.max(1)
+            };
+            self.y_lut.push(sy.min(src_h.saturating_sub(1)) as u16);
+        }
+
+        match self.layout {
+            PixelLayout::Rgb565 => self.row16.resize(out_w, 0),
+            PixelLayout::Rgb24 { .. } => self.row24.resize(out_w * 3, 0),
+            PixelLayout::Rgb32 { .. } => self.row32.resize(out_w, 0),
+        }
+        true
+    }
+
+    pub fn blit_rgb565(
+        &mut self,
+        rgb565: &[u16],
+        src_w: usize,
+        src_h: usize,
+        dst_ptr: *mut u8,
+        dst_len: usize,
+    ) {
+        if src_w == 0 || src_h == 0 || rgb565.len() < src_w * src_h || dst_ptr.is_null() {
+            return;
+        }
+        self.ensure_source(src_w, src_h);
+        if self.out_w == 0 || self.out_h == 0 {
             return;
         }
         match self.layout {
@@ -273,15 +353,15 @@ impl Blitter {
         }
     }
 
-    fn blit_16(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H], dst_ptr: *mut u8, dst_len: usize) {
-        // Ultra-fast 1:1 path for CardputerZero 320x170 ST7789v3 LCD and 320x170 Wayland RGB565.
-        if self.dst_w == SCREEN_W
-            && self.dst_h == SCREEN_H
-            && self.stride == SCREEN_W * 2
+    fn blit_16(&mut self, rgb565: &[u16], dst_ptr: *mut u8, dst_len: usize) {
+        // Ultra-fast 1:1 path for CardputerZero 320x170 ST7789v3 LCD and 1:1 Wayland RGB565.
+        if self.src_w == self.dst_w
+            && self.src_h == self.dst_h
+            && self.stride == self.dst_w * 2
             && self.x_off == 0
             && self.y_off == 0
         {
-            let bytes = SCREEN_W * SCREEN_H * 2;
+            let bytes = self.src_w * self.src_h * 2;
             if self.origin_byte_offset + bytes <= dst_len {
                 unsafe {
                     ptr::copy_nonoverlapping(
@@ -294,6 +374,7 @@ impl Blitter {
             return;
         }
 
+        let src_w = self.src_w;
         let row_bytes = self.out_w * 2;
         let x_bytes = self.x_off * 2;
         let mut last_sy = usize::MAX;
@@ -301,7 +382,7 @@ impl Blitter {
         for dy in 0..self.out_h {
             let sy = self.y_lut[dy] as usize;
             if sy != last_sy {
-                let src_row = &rgb565[sy * SCREEN_W..(sy + 1) * SCREEN_W];
+                let src_row = &rgb565[sy * src_w..(sy + 1) * src_w];
                 match self.int_scale {
                     Some(1) => self.row16.copy_from_slice(src_row),
                     Some(scale) => {
@@ -332,10 +413,11 @@ impl Blitter {
         }
     }
 
-    fn blit_32(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H], dst_ptr: *mut u8, dst_len: usize) {
+    fn blit_32(&mut self, rgb565: &[u16], dst_ptr: *mut u8, dst_len: usize) {
         let Some(ref lut) = self.lut32 else {
             return;
         };
+        let src_w = self.src_w;
         let row_bytes = self.out_w * 4;
         let x_bytes = self.x_off * 4;
         let mut last_sy = usize::MAX;
@@ -343,7 +425,7 @@ impl Blitter {
         for dy in 0..self.out_h {
             let sy = self.y_lut[dy] as usize;
             if sy != last_sy {
-                let src_row = &rgb565[sy * SCREEN_W..(sy + 1) * SCREEN_W];
+                let src_row = &rgb565[sy * src_w..(sy + 1) * src_w];
                 match self.int_scale {
                     Some(1) => {
                         for (dst, &c) in self.row32.iter_mut().zip(src_row.iter()) {
@@ -381,13 +463,14 @@ impl Blitter {
 
     fn blit_24(
         &mut self,
-        rgb565: &[u16; SCREEN_W * SCREEN_H],
+        rgb565: &[u16],
         dst_ptr: *mut u8,
         dst_len: usize,
         r_byte: usize,
         g_byte: usize,
         b_byte: usize,
     ) {
+        let src_w = self.src_w;
         let row_bytes = self.out_w * 3;
         let x_bytes = self.x_off * 3;
         let mut last_sy = usize::MAX;
@@ -395,7 +478,7 @@ impl Blitter {
         for dy in 0..self.out_h {
             let sy = self.y_lut[dy] as usize;
             if sy != last_sy {
-                let src_row = &rgb565[sy * SCREEN_W..(sy + 1) * SCREEN_W];
+                let src_row = &rgb565[sy * src_w..(sy + 1) * src_w];
                 for (dx, &sx) in self.x_lut.iter().enumerate() {
                     let c = src_row[sx as usize];
                     let r5 = ((c >> 11) & 0x1F) as u8;
@@ -499,8 +582,12 @@ impl FbDisplay {
         Ok(disp)
     }
 
-    pub fn present(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H]) {
-        self.blitter.blit_rgb565(rgb565, self.ptr, self.len);
+    pub fn present(&mut self, rgb565: &[u16], src_w: usize, src_h: usize) {
+        if self.blitter.ensure_source(src_w, src_h) {
+            self.clear_black();
+        }
+        self.blitter
+            .blit_rgb565(rgb565, src_w, src_h, self.ptr, self.len);
     }
 
     pub fn clear_black(&mut self) {
@@ -520,6 +607,115 @@ impl Drop for FbDisplay {
     }
 }
 
+/// Zero-dependency sysfs backlight controller for CardputerZero's 1.9" ST7789v3 PWM LCD
+/// (`/sys/class/backlight/backlight/{brightness,max_brightness}`).
+///
+/// Automatically saves the user's pre-HDMI brightness level, dims or turns off the backlight
+/// while HDMI output is active, and unconditionally restores the original brightness on HDMI
+/// unplug, mode switch, or `Drop` (app exit / SIGINT / SIGTERM).
+pub struct LcdBacklight {
+    brightness_path: PathBuf,
+    max_brightness: u32,
+    saved_brightness: Option<u32>,
+    applied_mode: Option<HdmiLcdBacklight>,
+}
+
+impl LcdBacklight {
+    pub fn detect() -> Option<Self> {
+        if let Ok(dir) = std::env::var("STICKZERO_BACKLIGHT_DIR") {
+            let dir = dir.trim();
+            if !dir.is_empty() {
+                return Self::open_dir(Path::new(dir));
+            }
+        }
+        // CardputerZero stock driver (`pwm_bl_m5stack.ko`) exposes `/sys/class/backlight/backlight`.
+        let preferred = Path::new("/sys/class/backlight/backlight");
+        if let Some(bl) = Self::open_dir(preferred) {
+            return Some(bl);
+        }
+        let entries = fs::read_dir("/sys/class/backlight").ok()?;
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            if let Some(bl) = Self::open_dir(&dir) {
+                return Some(bl);
+            }
+        }
+        None
+    }
+
+    pub fn open_dir(dir: &Path) -> Option<Self> {
+        let brightness_path = dir.join("brightness");
+        let max_path = dir.join("max_brightness");
+        if !brightness_path.exists() || !max_path.exists() {
+            return None;
+        }
+        let max_brightness = read_u32_file(&max_path)?.max(1);
+        Some(Self {
+            brightness_path,
+            max_brightness,
+            saved_brightness: None,
+            applied_mode: None,
+        })
+    }
+
+    /// Synchronize the LCD backlight with the current HDMI active state and user policy.
+    /// Does zero sysfs I/O on steady-state frames when state has not changed.
+    pub fn sync(&mut self, hdmi_active: bool, policy: HdmiLcdBacklight) {
+        if !hdmi_active || policy == HdmiLcdBacklight::KeepOn {
+            self.restore();
+            return;
+        }
+        if self.applied_mode == Some(policy) {
+            return;
+        }
+        if self.saved_brightness.is_none() {
+            if let Some(cur) = read_u32_file(&self.brightness_path) {
+                self.saved_brightness = Some(cur.min(self.max_brightness));
+            }
+        }
+        let target = match policy {
+            HdmiLcdBacklight::Off => 0,
+            HdmiLcdBacklight::Dim => {
+                let dim = ((self.max_brightness.saturating_mul(12)) / 100).max(1);
+                match self.saved_brightness {
+                    Some(orig) => dim.min(orig),
+                    None => dim,
+                }
+            }
+            HdmiLcdBacklight::KeepOn => return,
+        };
+        if write_u32_file(&self.brightness_path, target) {
+            self.applied_mode = Some(policy);
+        }
+    }
+
+    pub fn restore(&mut self) {
+        if let Some(orig) = self.saved_brightness.take() {
+            let _ = write_u32_file(&self.brightness_path, orig.min(self.max_brightness));
+        }
+        self.applied_mode = None;
+    }
+}
+
+impl Drop for LcdBacklight {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn read_u32_file(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+}
+
+fn write_u32_file(path: &Path, val: u32) -> bool {
+    fs::write(path, val.to_string()).is_ok()
+}
+
 pub enum HdmiOutput {
     Wayland(WaylandDisplay),
     Drm(DrmDisplay),
@@ -527,12 +723,12 @@ pub enum HdmiOutput {
 }
 
 impl HdmiOutput {
-    pub fn present(&mut self, rgb565: &[u16; SCREEN_W * SCREEN_H]) -> bool {
+    pub fn present(&mut self, rgb565: &[u16], src_w: usize, src_h: usize) -> bool {
         match self {
-            Self::Wayland(w) => w.present(rgb565),
-            Self::Drm(d) => d.present(rgb565),
+            Self::Wayland(w) => w.present(rgb565, src_w, src_h),
+            Self::Drm(d) => d.present(rgb565, src_w, src_h),
             Self::Fb(fb) => {
-                fb.present(rgb565);
+                fb.present(rgb565, src_w, src_h);
                 true
             }
         }
@@ -567,14 +763,19 @@ pub struct DisplayManager {
     lcd: Option<FbDisplay>,
     lcd_canonical: Option<PathBuf>,
     hdmi: Option<HdmiOutput>,
+    backlight: Option<LcdBacklight>,
     explicit_fbdev: bool,
     lcd_showing_hdmi_notice: bool,
+    last_lcd_backlight_mode: HdmiLcdBacklight,
     last_hotplug_check: Instant,
     last_hdmi_connected: bool,
 }
 
 impl DisplayManager {
-    pub fn open(output_mode: DisplayOutput) -> Result<Self, String> {
+    pub fn open(
+        output_mode: DisplayOutput,
+        lcd_backlight_mode: HdmiLcdBacklight,
+    ) -> Result<Self, String> {
         // Explicit STICKZERO_FBDEV override retains exact legacy single-display behavior.
         if let Ok(dev) = std::env::var("STICKZERO_FBDEV") {
             let dev = dev.trim();
@@ -585,8 +786,10 @@ impl DisplayManager {
                     lcd: Some(fb),
                     lcd_canonical: Some(canon),
                     hdmi: None,
+                    backlight: None,
                     explicit_fbdev: true,
                     lcd_showing_hdmi_notice: false,
+                    last_lcd_backlight_mode: lcd_backlight_mode,
                     last_hotplug_check: Instant::now(),
                     last_hdmi_connected: false,
                 });
@@ -611,8 +814,10 @@ impl DisplayManager {
                     lcd: Some(fb0),
                     lcd_canonical: Some(canonicalize_path("/dev/fb0")),
                     hdmi: None,
+                    backlight: None,
                     explicit_fbdev: false,
                     lcd_showing_hdmi_notice: false,
+                    last_lcd_backlight_mode: lcd_backlight_mode,
                     last_hotplug_check: Instant::now(),
                     last_hdmi_connected: false,
                 });
@@ -620,12 +825,23 @@ impl DisplayManager {
             return Err("no LCD framebuffer or HDMI display found".to_string());
         }
 
+        let mut backlight = if lcd.is_some() {
+            LcdBacklight::detect()
+        } else {
+            None
+        };
+        if let Some(ref mut bl) = backlight {
+            bl.sync(hdmi.is_some(), lcd_backlight_mode);
+        }
+
         Ok(Self {
             lcd,
             lcd_canonical,
             hdmi,
+            backlight,
             explicit_fbdev: false,
             lcd_showing_hdmi_notice: false,
+            last_lcd_backlight_mode: lcd_backlight_mode,
             last_hotplug_check: Instant::now(),
             last_hdmi_connected: connected,
         })
@@ -639,6 +855,16 @@ impl DisplayManager {
     #[allow(dead_code)]
     pub fn hdmi_active(&self) -> bool {
         self.hdmi.is_some()
+    }
+
+    /// Active software render resolution: uses `hdmi_res` whenever HDMI is active,
+    /// otherwise CardputerZero's native `320x170`.
+    pub fn desired_render_size(&self, hdmi_res: HdmiResolution) -> (usize, usize) {
+        if self.hdmi.is_some() {
+            hdmi_res.dimensions()
+        } else {
+            (SCREEN_W, SCREEN_H)
+        }
     }
 
     /// Short status string for Settings / LCD notice (e.g. `"1280x720 DRM"`, `"1920x1080 WL"`, `"Off"`).
@@ -660,11 +886,27 @@ impl DisplayManager {
         Some(format!("{height}p {}", h.backend_tag()))
     }
 
-    /// Immediately apply a new `DisplayOutput` setting or check for HDMI hotplug/unplug.
+    fn sync_backlight(&mut self, lcd_backlight_mode: HdmiLcdBacklight) {
+        if let Some(ref mut bl) = self.backlight {
+            bl.sync(self.hdmi.is_some(), lcd_backlight_mode);
+        }
+    }
+
+    /// Immediately apply new display/backlight settings or check for HDMI hotplug/unplug.
     /// Returns `true` if HDMI active state changed.
-    pub fn sync_hotplug(&mut self, output_mode: DisplayOutput, force: bool) -> bool {
+    pub fn sync_hotplug(
+        &mut self,
+        output_mode: DisplayOutput,
+        lcd_backlight_mode: HdmiLcdBacklight,
+        force: bool,
+    ) -> bool {
         if self.explicit_fbdev {
             return false;
+        }
+        if lcd_backlight_mode != self.last_lcd_backlight_mode {
+            self.last_lcd_backlight_mode = lcd_backlight_mode;
+            self.lcd_showing_hdmi_notice = false;
+            self.sync_backlight(lcd_backlight_mode);
         }
         if !force && self.last_hotplug_check.elapsed() < HOTPLUG_INTERVAL {
             return false;
@@ -679,6 +921,7 @@ impl DisplayManager {
                 self.lcd_showing_hdmi_notice = false;
             }
             self.last_hdmi_connected = is_hdmi_connected(self.lcd_canonical.as_deref());
+            self.sync_backlight(lcd_backlight_mode);
             return was_active != self.hdmi.is_some();
         }
 
@@ -690,6 +933,7 @@ impl DisplayManager {
                 self.hdmi = None;
                 self.lcd_showing_hdmi_notice = false;
             }
+            self.sync_backlight(lcd_backlight_mode);
             return was_active != self.hdmi.is_some();
         }
 
@@ -708,43 +952,61 @@ impl DisplayManager {
             }
         }
 
-        if output_mode != DisplayOutput::HdmiOnly {
+        if output_mode != DisplayOutput::HdmiOnly && lcd_backlight_mode != HdmiLcdBacklight::Off {
             self.lcd_showing_hdmi_notice = false;
         }
 
+        self.sync_backlight(lcd_backlight_mode);
         was_active != self.hdmi.is_some()
     }
 
     /// Returns true when the built-in LCD needs a one-shot static HDMI status screen drawn.
-    pub fn needs_hdmi_notice(&self, output_mode: DisplayOutput) -> bool {
+    pub fn needs_hdmi_notice(
+        &self,
+        output_mode: DisplayOutput,
+        lcd_backlight_mode: HdmiLcdBacklight,
+    ) -> bool {
         self.lcd.is_some()
-            && output_mode == DisplayOutput::HdmiOnly
             && self.hdmi.is_some()
+            && output_mode == DisplayOutput::HdmiOnly
+            && lcd_backlight_mode != HdmiLcdBacklight::Off
             && !self.lcd_showing_hdmi_notice
     }
 
-    /// Present the rendered 320x170 RGB565 frame to active displays.
+    /// Present the rendered RGB565 frame (`src_w` x `src_h`) to active displays.
     ///
-    /// In `DisplayOutput::HdmiOnly` mode (when HDMI is active and an LCD is also present),
-    /// renders the static `hdmi_notice_fb` to the built-in LCD once and skips 60 Hz SPI blits.
+    /// - When `lcd_backlight_mode == Off` and HDMI is active, clears the built-in LCD black once
+    ///   and skips 60 Hz SPI blits for maximum battery savings (even in `Auto` mode).
+    /// - In `DisplayOutput::HdmiOnly` mode (with backlight Dim/KeepOn), renders the static
+    ///   `320x170` `hdmi_notice_fb` to the built-in LCD once and skips 60 Hz SPI blits.
     pub fn present(
         &mut self,
-        rgb565: &[u16; SCREEN_W * SCREEN_H],
+        rgb565: &[u16],
+        src_w: usize,
+        src_h: usize,
         output_mode: DisplayOutput,
-        hdmi_notice_fb: Option<&[u16; SCREEN_W * SCREEN_H]>,
+        lcd_backlight_mode: HdmiLcdBacklight,
+        hdmi_notice_fb: Option<&[u16]>,
     ) {
         if let Some(ref mut h) = self.hdmi {
-            if !h.present(rgb565) {
+            if !h.present(rgb565, src_w, src_h) {
                 self.hdmi = None;
                 self.lcd_showing_hdmi_notice = false;
+                self.sync_backlight(lcd_backlight_mode);
             }
         }
 
         if let Some(ref mut lcd) = self.lcd {
-            if output_mode == DisplayOutput::HdmiOnly && self.hdmi.is_some() {
+            let hdmi_on = self.hdmi.is_some();
+            if hdmi_on && lcd_backlight_mode == HdmiLcdBacklight::Off {
+                if !self.lcd_showing_hdmi_notice {
+                    lcd.clear_black();
+                    self.lcd_showing_hdmi_notice = true;
+                }
+            } else if hdmi_on && output_mode == DisplayOutput::HdmiOnly {
                 if !self.lcd_showing_hdmi_notice {
                     if let Some(notice) = hdmi_notice_fb {
-                        lcd.present(notice);
+                        lcd.present(notice, SCREEN_W, SCREEN_H);
                     } else {
                         lcd.clear_black();
                     }
@@ -752,7 +1014,7 @@ impl DisplayManager {
                 }
             } else {
                 self.lcd_showing_hdmi_notice = false;
-                lcd.present(rgb565);
+                lcd.present(rgb565, src_w, src_h);
             }
         }
     }
@@ -927,6 +1189,14 @@ mod tests {
         assert_eq!(compute_fit_rect(640, 480), (640, 340, 0, 70));
         // 800x480: 2x is 640x340 (80% < 85%), so uses full aspect fit 800x425
         assert_eq!(compute_fit_rect(800, 480), (800, 425, 0, 27));
+        // True 16:9 640x360 -> 720p (2x) and 1080p (3x): zero black bars!
+        assert_eq!(compute_fit_rect_for(640, 360, 1280, 720), (1280, 720, 0, 0));
+        assert_eq!(compute_fit_rect_for(640, 360, 1920, 1080), (1920, 1080, 0, 0));
+        // True 16:9 960x540 -> 1080p (2x) and 720p (aspect fit): zero black bars!
+        assert_eq!(compute_fit_rect_for(960, 540, 1920, 1080), (1920, 1080, 0, 0));
+        assert_eq!(compute_fit_rect_for(960, 540, 1280, 720), (1280, 720, 0, 0));
+        // Downscaling 640x360 -> 320x170 LCD mirror: centered 302x170
+        assert_eq!(compute_fit_rect_for(640, 360, 320, 170), (302, 170, 9, 0));
     }
 
     #[test]
@@ -960,7 +1230,7 @@ mod tests {
         let stride = w * 2;
         let mut dst = vec![0u8; stride * h];
         let mut blitter = Blitter::new(w, h, stride, PixelLayout::Rgb565);
-        blitter.blit_rgb565(&src, dst.as_mut_ptr(), dst.len());
+        blitter.blit_rgb565(&src, SCREEN_W, SCREEN_H, dst.as_mut_ptr(), dst.len());
 
         // Letterbox row 0..20 stays black
         let top_px = u16::from_ne_bytes([dst[0], dst[1]]);
@@ -984,6 +1254,45 @@ mod tests {
     }
 
     #[test]
+    fn test_blitter_dynamic_640x360_upscale_720p_and_downscale_lcd() {
+        let (sw, sh) = (640usize, 360usize);
+        let mut src = vec![0u16; sw * sh];
+        src[0] = 0xF800; // Red top-left
+        src[sw * sh - 1] = 0x07E0; // Green bottom-right
+
+        // Upscale 640x360 -> 1280x720 (exact 2x, full frame, no letterbox)
+        let (w, h) = (1280usize, 720usize);
+        let stride = w * 2;
+        let mut dst = vec![0u8; stride * h];
+        let mut blitter = Blitter::new(w, h, stride, PixelLayout::Rgb565);
+        blitter.blit_rgb565(&src, sw, sh, dst.as_mut_ptr(), dst.len());
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let off = dy * stride + dx * 2;
+                assert_eq!(u16::from_ne_bytes([dst[off], dst[off + 1]]), 0xF800);
+            }
+        }
+        let last_off = (h - 1) * stride + (w - 1) * 2;
+        assert_eq!(u16::from_ne_bytes([dst[last_off], dst[last_off + 1]]), 0x07E0);
+
+        // Downscale 640x360 -> 320x170 built-in LCD mirror (302x170 centered at x=9)
+        let lcd_stride = SCREEN_W * 2;
+        let mut lcd_dst = vec![0u8; lcd_stride * SCREEN_H];
+        let mut lcd_blitter = Blitter::new(SCREEN_W, SCREEN_H, lcd_stride, PixelLayout::Rgb565);
+        lcd_blitter.blit_rgb565(&src, sw, sh, lcd_dst.as_mut_ptr(), lcd_dst.len());
+        let first_active = 9 * 2;
+        assert_eq!(
+            u16::from_ne_bytes([lcd_dst[first_active], lcd_dst[first_active + 1]]),
+            0xF800
+        );
+        let last_active = (SCREEN_H - 1) * lcd_stride + (9 + 301) * 2;
+        assert_eq!(
+            u16::from_ne_bytes([lcd_dst[last_active], lcd_dst[last_active + 1]]),
+            0x07E0
+        );
+    }
+
+    #[test]
     fn test_blitter_32bit_xrgb8888_and_xbgr8888_channel_order() {
         let mut src = [0u16; SCREEN_W * SCREEN_H];
         src[0] = 0xF800; // Red (r=31, g=0, b=0) -> 0xFF, 0x00, 0x00
@@ -993,7 +1302,7 @@ mod tests {
         let stride = SCREEN_W * 4;
         let mut dst = vec![0u8; stride * SCREEN_H];
         let mut blitter = Blitter::new(SCREEN_W, SCREEN_H, stride, PixelLayout::xrgb8888());
-        blitter.blit_rgb565(&src, dst.as_mut_ptr(), dst.len());
+        blitter.blit_rgb565(&src, SCREEN_W, SCREEN_H, dst.as_mut_ptr(), dst.len());
 
         let p0 = u32::from_ne_bytes(dst[0..4].try_into().unwrap());
         let p1 = u32::from_ne_bytes(dst[4..8].try_into().unwrap());
@@ -1010,7 +1319,7 @@ mod tests {
             alpha_mask: 0xFF00_0000,
         };
         let mut blitter_bgr = Blitter::new(SCREEN_W, SCREEN_H, stride, bgr_layout);
-        blitter_bgr.blit_rgb565(&src, dst.as_mut_ptr(), dst.len());
+        blitter_bgr.blit_rgb565(&src, SCREEN_W, SCREEN_H, dst.as_mut_ptr(), dst.len());
         let b0 = u32::from_ne_bytes(dst[0..4].try_into().unwrap());
         let b2 = u32::from_ne_bytes(dst[8..12].try_into().unwrap());
         assert_eq!(b0, 0xFF00_00FF);
@@ -1037,7 +1346,7 @@ mod tests {
                 b_byte: 0,
             },
         );
-        blitter.blit_rgb565(&src, dst.as_mut_ptr(), dst.len());
+        blitter.blit_rgb565(&src, SCREEN_W, SCREEN_H, dst.as_mut_ptr(), dst.len());
 
         // Fit rect for 800x480 is (800, 425, 0, 27)
         assert_eq!(&dst[0..3], &[0, 0, 0]);
@@ -1045,5 +1354,50 @@ mod tests {
         assert_eq!(&dst[top_active..top_active + 3], &[0, 0, 255]); // BGR24 red
         let last_active = (27 + 424) * stride + 799 * 3;
         assert_eq!(&dst[last_active..last_active + 3], &[0, 255, 0]); // BGR24 green
+    }
+
+    #[test]
+    fn test_lcd_backlight_dim_off_and_restore_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "stickzero-bl-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("max_brightness"), "255\n").unwrap();
+        fs::write(dir.join("brightness"), "180\n").unwrap();
+
+        {
+            let mut bl = LcdBacklight::open_dir(&dir).unwrap();
+            // HDMI active + Dim -> ~12% of 255 = 30
+            bl.sync(true, HdmiLcdBacklight::Dim);
+            assert_eq!(read_u32_file(&dir.join("brightness")), Some(30));
+
+            // Switch to Off -> 0
+            bl.sync(true, HdmiLcdBacklight::Off);
+            assert_eq!(read_u32_file(&dir.join("brightness")), Some(0));
+
+            // Unplug HDMI -> restores exact saved 180
+            bl.sync(false, HdmiLcdBacklight::Off);
+            assert_eq!(read_u32_file(&dir.join("brightness")), Some(180));
+
+            // User already dimmer than 12% (e.g. 10) -> Dim must not brighten it
+            fs::write(dir.join("brightness"), "10\n").unwrap();
+            bl.sync(true, HdmiLcdBacklight::Dim);
+            assert_eq!(read_u32_file(&dir.join("brightness")), Some(10));
+            // Drop while dimmed must restore 10 cleanly
+        }
+        assert_eq!(read_u32_file(&dir.join("brightness")), Some(10));
+
+        // Verify Drop restores from dimmed high brightness too
+        fs::write(dir.join("brightness"), "200\n").unwrap();
+        {
+            let mut bl = LcdBacklight::open_dir(&dir).unwrap();
+            bl.sync(true, HdmiLcdBacklight::Off);
+            assert_eq!(read_u32_file(&dir.join("brightness")), Some(0));
+        }
+        assert_eq!(read_u32_file(&dir.join("brightness")), Some(200));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
