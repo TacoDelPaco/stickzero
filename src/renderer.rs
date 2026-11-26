@@ -40,6 +40,74 @@ fn lerp_rgb565(a: u16, b: u16, t: f32) -> u16 {
     ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (bl & 0x1F)
 }
 
+/// Fast zero-float RGB565 alpha blend (`alpha_8` in `0..=8`, where 8 = 100% `src`).
+#[inline(always)]
+fn blend_rgb565(dst: u16, src: u16, alpha_8: u16) -> u16 {
+    if alpha_8 >= 8 {
+        return src;
+    }
+    if alpha_8 == 0 {
+        return dst;
+    }
+    let inv = 8 - alpha_8;
+    let r = ((((dst >> 11) & 0x1F) * inv + ((src >> 11) & 0x1F) * alpha_8) >> 3) & 0x1F;
+    let g = ((((dst >> 5) & 0x3F) * inv + ((src >> 5) & 0x3F) * alpha_8) >> 3) & 0x3F;
+    let b = (((dst & 0x1F) * inv + (src & 0x1F) * alpha_8) >> 3) & 0x1F;
+    (r << 11) | (g << 5) | b
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SettingsTab {
+    Flight,
+    Rates,
+    Camera,
+    System,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 4] = [
+        SettingsTab::Flight,
+        SettingsTab::Rates,
+        SettingsTab::Camera,
+        SettingsTab::System,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Flight => 0,
+            Self::Rates => 1,
+            Self::Camera => 2,
+            Self::System => 3,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flight => "FLIGHT",
+            Self::Rates => "RATES",
+            Self::Camera => "CAMERA",
+            Self::System => "SYSTEM",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn row_count(self) -> usize {
+        match self {
+            Self::Flight => 4,
+            Self::Rates => 4,
+            Self::Camera => 5,
+            Self::System => 7,
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 struct UiColors {
     bg: u16,
@@ -289,6 +357,56 @@ impl Renderer {
         let s = self.ui_scale();
         let (ox, oy) = self.ui_origin();
         self.draw_text(ox + vx * s, oy + vy * s, text, color, scale * s, outline);
+    }
+
+    /// Translucent rectangle fill blended over the existing framebuffer (`alpha_8` in `0..=8`).
+    pub fn fill_rect_alpha(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16, alpha_8: u16) {
+        if alpha_8 >= 8 {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        if alpha_8 == 0 {
+            return;
+        }
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(self.w());
+        let y1 = (y + h).min(self.h());
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = self.width;
+        for py in y0..y1 {
+            let row = (py as usize) * stride;
+            let slice = &mut self.fb[row + (x0 as usize)..row + (x1 as usize)];
+            for px in slice.iter_mut() {
+                *px = blend_rgb565(*px, color, alpha_8);
+            }
+        }
+    }
+
+    fn ui_fill_rect_alpha(&mut self, vx: i32, vy: i32, vw: i32, vh: i32, color: u16, alpha_8: u16) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        self.fill_rect_alpha(ox + vx * s, oy + vy * s, vw * s, vh * s, color, alpha_8);
+    }
+
+    fn ui_draw_panel(&mut self, vx: i32, vy: i32, vw: i32, vh: i32, bg: u16, border: u16, alpha_8: u16) {
+        self.ui_fill_rect_alpha(vx, vy, vw, vh, bg, alpha_8);
+        self.ui_draw_rect(vx, vy, vw, vh, border);
+    }
+
+    fn ui_draw_line(&mut self, vx0: i32, vy0: i32, vx1: i32, vy1: i32, color: u16) {
+        let s = self.ui_scale();
+        let (ox, oy) = self.ui_origin();
+        let x0 = ox + vx0 * s + s / 2;
+        let y0 = oy + vy0 * s + s / 2;
+        let x1 = ox + vx1 * s + s / 2;
+        let y1 = oy + vy1 * s + s / 2;
+        self.draw_line(x0, y0, x1, y1, color);
+        if s >= 2 {
+            self.draw_line(x0, y0 + 1, x1, y1 + 1, color);
+        }
     }
 
     pub fn reset_stick_trail(&mut self) {
@@ -1044,15 +1162,14 @@ impl Renderer {
         }
     }
 
-    /// Render the full 3D FPV scene with per-pixel Z-buffer + Betaflight OSD!
-    pub fn render_flight(
+    /// Render the 3D world (sky, ground grid, Z-buffered structures & gates) from an arbitrary camera.
+    fn render_world_scene(
         &mut self,
-        quad: &QuadState,
+        cam_pos: Vec3,
+        cam_rot: Quat,
         cfg: &Config,
         track: &Track,
-        sticks: StickInput,
-        fps: u32,
-        frame_ms: f32,
+        active_gate: Option<usize>,
     ) {
         let pal = palette(cfg.theme);
         let half_fov_rad = ((cfg.fov_deg as f32).clamp(70.0, 115.0) * 0.5).to_radians();
@@ -1061,10 +1178,7 @@ impl Renderer {
         // Clear 16-bit per-pixel Z-buffer (0 = farthest)
         self.zbuf.fill(0);
 
-        let tilt = -(cfg.camera_tilt_deg as f32).to_radians();
-        let cam_rot = quad.rot.mul(Quat::from_axis_angle(Vec3::RIGHT, tilt)).normalized();
         let cam_inv = cam_rot.conjugate();
-        let cam_pos = quad.pos;
 
         // 1. Sky & Ground + Horizon Line + Sun/Moon/Stars
         self.draw_sky_and_ground(cam_rot, pal, cfg.detail_high);
@@ -1246,7 +1360,7 @@ impl Renderer {
 
         // 4. Solid 3D Racing Gates (Z-buffered volume posts & beams so they never disappear!)
         for (idx, g) in track.gates.iter().enumerate() {
-            let is_next = cfg.game_mode == GameMode::Freestyle || idx == quad.next_gate;
+            let is_next = active_gate.map_or(true, |ag| idx == ag);
             let main_col = if is_next { pal.active_gate } else { pal.idle_gate };
             let hi_col = if is_next {
                 pal.active_gate_hi
@@ -1305,6 +1419,28 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Render the full 3D FPV scene with per-pixel Z-buffer + Betaflight OSD!
+    pub fn render_flight(
+        &mut self,
+        quad: &QuadState,
+        cfg: &Config,
+        track: &Track,
+        sticks: StickInput,
+        fps: u32,
+        frame_ms: f32,
+    ) {
+        let tilt = -(cfg.camera_tilt_deg as f32).to_radians();
+        let cam_rot = quad.rot.mul(Quat::from_axis_angle(Vec3::RIGHT, tilt)).normalized();
+        let cam_inv = cam_rot.conjugate();
+        let cam_pos = quad.pos;
+        let active_gate = if cfg.game_mode == GameMode::Freestyle {
+            None
+        } else {
+            Some(quad.next_gate)
+        };
+        self.render_world_scene(cam_pos, cam_rot, cfg, track, active_gate);
 
         // 5. Hit flash border
         if quad.hit_flash > 0.0 {
@@ -1795,18 +1931,322 @@ impl Renderer {
     }
 
     // -----------------------------------------------------------------------
-    // Menu UIs (320 x 170 virtual layout, scaled cleanly to 640x360 / 960x540 on HDMI)
+    // Steam-Sim Menu UIs (320 x 170 virtual layout, scaled cleanly to 640x360 / 960x540 on HDMI)
     // -----------------------------------------------------------------------
 
-    fn draw_header(&mut self, title: &str, right_tag: &str, ui: UiColors) {
+    /// Live orbiting 3D camera over the currently selected track, dimmed behind floating UI panels.
+    fn render_menu_backdrop(&mut self, cfg: &Config, menu_time: f32, dim_alpha: u16) {
+        let track = &TRACKS[cfg.track_index.min(TRACKS.len() - 1)];
+        let (mut cx, mut cz) = (track.start_pos.x, track.start_pos.z + 24.0);
+        if !track.gates.is_empty() {
+            let mut sx = 0.0_f32;
+            let mut sz = 0.0_f32;
+            for g in track.gates {
+                sx += g.pos.x;
+                sz += g.pos.z;
+            }
+            let n = track.gates.len() as f32;
+            cx = sx / n;
+            cz = sz / n;
+        }
+
+        let angle = menu_time * 0.16 + 0.55;
+        let radius = 34.0;
+        let cam_pos = Vec3::new(
+            cx + angle.cos() * radius,
+            11.0 + (menu_time * 0.35).sin() * 1.8,
+            cz + angle.sin() * radius,
+        );
+        let dx = cx - cam_pos.x;
+        let dz = cz - cam_pos.z;
+        let yaw = dx.atan2(dz);
+        let pitch = 0.22;
+        let cam_rot = Quat::from_axis_angle(Vec3::UP, yaw)
+            .mul(Quat::from_axis_angle(Vec3::RIGHT, pitch))
+            .normalized();
+
+        self.render_world_scene(cam_pos, cam_rot, cfg, track, Some(0));
+
+        let ui = ui_colors(cfg.ui_theme);
+        self.fill_rect_alpha(0, 0, self.w(), self.h(), ui.bg, dim_alpha);
+    }
+
+    fn draw_topbar(&mut self, title: &str, right_badge: &str, dot_col: Option<u16>, ui: UiColors) {
         let s = self.ui_scale();
         let (_, oy) = self.ui_origin();
-        self.clear(ui.bg);
-        self.fill_rect(0, 0, self.w(), oy + 22 * s, ui.header_bg);
-        self.fill_rect(0, oy + 22 * s, self.w(), s, ui.header_line);
-        self.ui_draw_text(8, 4, title, ui.title, 2, false);
-        let rw = (right_tag.len() as i32) * 6;
-        self.ui_draw_text(UI_W - rw - 6, 8, right_tag, ui.tag, 1, false);
+        let bar_h = oy + 20 * s;
+        self.fill_rect_alpha(0, 0, self.w(), bar_h, ui.header_bg, 7);
+        self.fill_rect(0, 0, 3 * s, bar_h, ui.header_line);
+        self.fill_rect(0, bar_h, self.w(), s, ui.header_line);
+        self.ui_draw_text(8, 3, title, ui.title, 2, false);
+
+        let rw = (right_badge.len() as i32) * 6;
+        let pill_w = rw + if dot_col.is_some() { 16 } else { 8 };
+        let px = UI_W - pill_w - 5;
+        self.ui_fill_rect(px, 4, pill_w, 12, ui.bg);
+        self.ui_draw_rect(px, 4, pill_w, 12, ui.muted);
+        let tx = if let Some(dc) = dot_col {
+            self.ui_fill_rect(px + 4, 8, 4, 4, dc);
+            px + 11
+        } else {
+            px + 4
+        };
+        self.ui_draw_text(tx, 7, right_badge, ui.tag, 1, false);
+    }
+
+    fn draw_footer(&mut self, hint: &str, dot_col: Option<u16>, ui: UiColors) {
+        let s = self.ui_scale();
+        let (_, oy) = self.ui_origin();
+        let fy = oy + (UI_H - 13) * s;
+        self.fill_rect_alpha(0, fy, self.w(), self.h() - fy, ui.header_bg, 7);
+        self.fill_rect(0, fy, self.w(), s, ui.muted);
+        let tx = if let Some(dc) = dot_col {
+            self.ui_fill_rect(6, UI_H - 9, 5, 5, dc);
+            15
+        } else {
+            6
+        };
+        self.ui_draw_text(tx, UI_H - 10, hint, ui.muted, 1, false);
+    }
+
+    fn draw_slider_bar(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        frac: f32,
+        fill_col: u16,
+        ui: UiColors,
+        selected: bool,
+    ) {
+        let f = clampf(frac, 0.0, 1.0);
+        self.ui_fill_rect(x, y, w, h, ui.header_bg);
+        let border = if selected { ui.sel_border } else { ui.muted };
+        self.ui_draw_rect(x, y, w, h, border);
+        let inner_w = (w - 2).max(1);
+        let fill_w = ((inner_w as f32) * f).round() as i32;
+        if fill_w > 0 {
+            self.ui_fill_rect(x + 1, y + 1, fill_w, (h - 2).max(1), fill_col);
+        }
+        if selected {
+            let knob_x = (x + 1 + fill_w - 1).clamp(x + 1, x + w - 3);
+            self.ui_fill_rect(knob_x, y - 1, 3, h + 2, ui.title);
+        }
+    }
+
+    fn draw_toggle_pill(&mut self, x: i32, y: i32, on: bool, ui: UiColors, selected: bool) {
+        let w = 34;
+        let h = 11;
+        let bg = if on {
+            blend_rgb565(ui.header_bg, ui.ok, 3)
+        } else {
+            ui.header_bg
+        };
+        let border = if selected {
+            ui.sel_border
+        } else if on {
+            ui.ok
+        } else {
+            ui.muted
+        };
+        self.ui_fill_rect(x, y, w, h, bg);
+        self.ui_draw_rect(x, y, w, h, border);
+        if on {
+            self.ui_fill_rect(x + w - 9, y + 2, 7, h - 4, ui.ok);
+            self.ui_draw_text(x + 4, y + 2, "ON", ui.title, 1, false);
+        } else {
+            self.ui_fill_rect(x + 2, y + 2, 7, h - 4, ui.muted);
+            self.ui_draw_text(x + 12, y + 2, "OFF", ui.muted, 1, false);
+        }
+    }
+
+    /// Top-down 2D tactical track minimap showing structures, race path, and gates.
+    fn draw_track_minimap(&mut self, x: i32, y: i32, w: i32, h: i32, track: &Track, ui: UiColors) {
+        self.ui_fill_rect(x, y, w, h, ui.header_bg);
+        self.ui_draw_rect(x, y, w, h, ui.muted);
+
+        let mut min_x = track.start_pos.x;
+        let mut max_x = track.start_pos.x;
+        let mut min_z = track.start_pos.z;
+        let mut max_z = track.start_pos.z;
+        for g in track.gates {
+            min_x = min_x.min(g.pos.x);
+            max_x = max_x.max(g.pos.x);
+            min_z = min_z.min(g.pos.z);
+            max_z = max_z.max(g.pos.z);
+        }
+        for s in track.structures {
+            min_x = min_x.min(s.min.x);
+            max_x = max_x.max(s.max.x);
+            min_z = min_z.min(s.min.z);
+            max_z = max_z.max(s.max.z);
+        }
+        let span_x = (max_x - min_x).max(20.0);
+        let span_z = (max_z - min_z).max(20.0);
+        let pad = 7.0;
+        let avail_w = (w as f32 - pad * 2.0).max(8.0);
+        let avail_h = (h as f32 - pad * 2.0).max(8.0);
+        let scale = (avail_w / span_x).min(avail_h / span_z);
+        let cx = (min_x + max_x) * 0.5;
+        let cz = (min_z + max_z) * 0.5;
+        let map_pt = |wx: f32, wz: f32| -> (i32, i32) {
+            let px = x + w / 2 + ((wx - cx) * scale) as i32;
+            let py = y + h / 2 - ((wz - cz) * scale) as i32;
+            (px.clamp(x + 2, x + w - 3), py.clamp(y + 2, y + h - 3))
+        };
+
+        self.ui_draw_hline(x + 2, x + w - 3, y + h / 2, blend_rgb565(ui.header_bg, ui.muted, 2));
+        self.ui_draw_vline(x + w / 2, y + 2, y + h - 3, blend_rgb565(ui.header_bg, ui.muted, 2));
+
+        let struct_col = blend_rgb565(ui.header_bg, ui.muted, 4);
+        for s in track.structures {
+            let (sx0, sy1) = map_pt(s.min.x, s.min.z);
+            let (sx1, sy0) = map_pt(s.max.x, s.max.z);
+            let rx = sx0.min(sx1);
+            let ry = sy0.min(sy1);
+            let rw = (sx1 - sx0).abs().max(2);
+            let rh = (sy1 - sy0).abs().max(2);
+            self.ui_fill_rect(rx, ry, rw, rh, struct_col);
+        }
+
+        let path_col = blend_rgb565(ui.header_bg, ui.tag, 4);
+        if track.gates.len() >= 2 {
+            for i in 0..track.gates.len() {
+                let g0 = &track.gates[i];
+                let g1 = &track.gates[(i + 1) % track.gates.len()];
+                let (x0, y0) = map_pt(g0.pos.x, g0.pos.z);
+                let (x1, y1) = map_pt(g1.pos.x, g1.pos.z);
+                self.ui_draw_line(x0, y0, x1, y1, path_col);
+            }
+        }
+
+        for (i, g) in track.gates.iter().enumerate() {
+            let (gx, gy) = map_pt(g.pos.x, g.pos.z);
+            let col = if i == 0 { ui.ok } else { ui.val };
+            self.ui_fill_rect(gx - 2, gy - 2, 5, 5, col);
+        }
+
+        let (sp_x, sp_y) = map_pt(track.start_pos.x, track.start_pos.z);
+        self.ui_fill_rect(sp_x - 2, sp_y - 2, 4, 4, ui.title);
+        self.ui_draw_rect(sp_x - 3, sp_y - 3, 6, 6, ui.tag);
+    }
+
+    /// Live Betaflight Actual Rates response curve (`0..100%` stick -> `deg/s`).
+    fn draw_rates_curve(&mut self, x: i32, y: i32, w: i32, h: i32, cfg: &Config, ui: UiColors) {
+        self.ui_draw_panel(x, y, w, h, ui.header_bg, ui.muted, 7);
+        self.ui_draw_text(x + 5, y + 4, "ACTUAL CURVE", ui.tag, 1, false);
+
+        let gx = x + 6;
+        let gy = y + 16;
+        let gw = w - 12;
+        let gh = h - 38;
+        self.ui_fill_rect(gx, gy, gw, gh, ui.bg);
+        self.ui_draw_rect(gx, gy, gw, gh, ui.muted);
+
+        let grid_col = blend_rgb565(ui.bg, ui.muted, 2);
+        for q in 1..4 {
+            let lx = gx + (gw * q) / 4;
+            let ly = gy + (gh * q) / 4;
+            self.ui_draw_vline(lx, gy + 1, gy + gh - 2, grid_col);
+            self.ui_draw_hline(gx + 1, gx + gw - 2, ly, grid_col);
+        }
+
+        let (center_sens, max_rate, expo) = cfg.actual_rates();
+        let y_ceil = max_rate.max(600.0);
+
+        let mut prev_px = gx + 1;
+        let mut prev_py = gy + gh - 2;
+        for step in 1..=24 {
+            let s = (step as f32) / 24.0;
+            let deg_s = QuadState::betaflight_actual(s, center_sens, max_rate, expo).to_degrees();
+            let px = gx + 1 + ((s * (gw - 3) as f32).round() as i32);
+            let py = gy + gh - 2 - (((deg_s / y_ceil).clamp(0.0, 1.0) * (gh - 3) as f32).round() as i32);
+            self.ui_draw_line(prev_px, prev_py, px, py, ui.ok);
+            prev_px = px;
+            prev_py = py;
+        }
+
+        let mid_deg = QuadState::betaflight_actual(0.5, center_sens, max_rate, expo).to_degrees();
+        let mx = gx + gw / 2;
+        let my = gy + gh - 2 - (((mid_deg / y_ceil).clamp(0.0, 1.0) * (gh - 3) as f32).round() as i32);
+        self.ui_fill_rect(mx - 2, my - 2, 5, 5, ui.sel_border);
+
+        let mid_txt = format!("50%:{:.0}d/s", mid_deg);
+        let max_txt = format!("MAX:{}d/s", cfg.rate_max);
+        self.ui_draw_text(x + 6, y + h - 18, &mid_txt, ui.sel_border, 1, false);
+        self.ui_draw_text(x + 6, y + h - 9, &max_txt, ui.title, 1, false);
+    }
+
+    /// Live Betaflight Throttle Mid/Expo curve (`0..100%` stick -> motor thrust).
+    fn draw_throttle_curve(&mut self, x: i32, y: i32, w: i32, h: i32, cfg: &Config, ui: UiColors) {
+        self.ui_fill_rect(x, y, w, h, ui.bg);
+        self.ui_draw_rect(x, y, w, h, ui.muted);
+
+        let grid_col = blend_rgb565(ui.bg, ui.muted, 2);
+        self.ui_draw_vline(x + w / 2, y + 1, y + h - 2, grid_col);
+        self.ui_draw_hline(x + 1, x + w - 2, y + h / 2, grid_col);
+        self.ui_draw_line(x + 1, y + h - 2, x + w - 2, y + 1, grid_col);
+
+        let mut prev_px = x + 1;
+        let mut prev_py = y + h - 2;
+        for step in 1..=20 {
+            let s = (step as f32) / 20.0;
+            let out = QuadState::apply_throttle_expo(s, cfg.thr_mid, cfg.thr_expo);
+            let px = x + 1 + ((s * (w - 3) as f32).round() as i32);
+            let py = y + h - 2 - ((out.clamp(0.0, 1.0) * (h - 3) as f32).round() as i32);
+            self.ui_draw_line(prev_px, prev_py, px, py, ui.tag);
+            prev_px = px;
+            prev_py = py;
+        }
+
+        let m = (cfg.thr_mid as f32 / 100.0).clamp(0.20, 0.70);
+        let mx = x + 1 + ((m * (w - 3) as f32).round() as i32);
+        let my = y + h - 2 - ((m * (h - 3) as f32).round() as i32);
+        self.ui_fill_rect(mx - 2, my - 2, 5, 5, ui.sel_border);
+    }
+
+    /// Live side-view quad camera tilt & FOV cone diagram.
+    fn draw_camera_preview(&mut self, x: i32, y: i32, w: i32, h: i32, cfg: &Config, ui: UiColors) {
+        self.ui_draw_panel(x, y, w, h, ui.header_bg, ui.muted, 7);
+        self.ui_draw_text(x + 5, y + 4, "CAMERA CONE", ui.tag, 1, false);
+
+        let bx = x + 6;
+        let by = y + 16;
+        let bw = w - 12;
+        let bh = h - 38;
+        self.ui_fill_rect(bx, by, bw, bh, ui.bg);
+        self.ui_draw_rect(bx, by, bw, bh, ui.muted);
+
+        let qx = bx + 18;
+        let qy = by + (bh * 2) / 3;
+        let horiz_col = blend_rgb565(ui.bg, ui.muted, 3);
+        self.ui_draw_hline(bx + 2, bx + bw - 3, qy, horiz_col);
+
+        self.ui_fill_rect(qx - 9, qy - 1, 18, 3, ui.title);
+        self.ui_draw_hline(qx - 12, qx - 4, qy - 3, ui.muted);
+        self.ui_draw_hline(qx + 4, qx + 12, qy - 3, ui.muted);
+
+        let tilt_rad = (cfg.camera_tilt_deg as f32).to_radians();
+        let half_fov = (cfg.fov_deg as f32 * 0.32).to_radians();
+        let ray_len = (bw - 24) as f32;
+        let end_pt = |ang: f32| -> (i32, i32) {
+            let ex = qx + (ang.cos() * ray_len) as i32;
+            let ey = qy - (ang.sin() * ray_len) as i32;
+            (ex.clamp(bx + 2, bx + bw - 3), ey.clamp(by + 2, by + bh - 3))
+        };
+        let (cx, cy) = end_pt(tilt_rad);
+        let (tx, ty) = end_pt(tilt_rad + half_fov);
+        let (lx, ly) = end_pt(tilt_rad - half_fov);
+        self.ui_draw_line(qx + 2, qy - 1, tx, ty, ui.tag);
+        self.ui_draw_line(qx + 2, qy - 1, lx, ly, ui.tag);
+        self.ui_draw_line(qx + 2, qy - 1, cx, cy, ui.sel_border);
+        self.ui_fill_rect(qx, qy - 3, 4, 4, ui.ok);
+
+        let l1 = format!("TILT: {} deg", cfg.camera_tilt_deg);
+        let l2 = format!("FOV : {} deg", cfg.fov_deg);
+        self.ui_draw_text(x + 6, y + h - 18, &l1, ui.sel_border, 1, false);
+        self.ui_draw_text(x + 6, y + h - 9, &l2, ui.title, 1, false);
     }
 
     pub fn render_main_menu(
@@ -1815,57 +2255,239 @@ impl Renderer {
         selected: usize,
         input: &InputManager,
         hdmi_tag: Option<&str>,
+        menu_time: f32,
     ) {
         let ui = ui_colors(cfg.ui_theme);
-        let right_tag = match hdmi_tag {
-            Some(tag) => format!("HDMI {tag}"),
-            None => "RUST FPV".to_string(),
+        let dim = if selected == 3 { 2 } else { 4 };
+        self.render_menu_backdrop(cfg, menu_time, dim);
+
+        let (ctrl_dot, ctrl_short) = match input.control_source() {
+            FlightControlSource::Controller => (ui.ok, "CTRL OK"),
+            FlightControlSource::ImuSimplified => (ui.tag, "IMU EASY"),
+            FlightControlSource::None => (ui.warn, "NO CTRL"),
         };
-        self.draw_header("STICKZERO", &right_tag, ui);
+        let right_badge = match hdmi_tag {
+            Some(tag) => format!("HDMI {tag}"),
+            None => format!("{} | {}", cfg.quad.craft_name(), ctrl_short),
+        };
+        self.draw_topbar("STICKZERO", &right_badge, Some(ctrl_dot), ui);
 
         let track = &TRACKS[cfg.track_index.min(TRACKS.len() - 1)];
-        let items: [(&str, String); 6] = [
-            ("FLY NOW", format!("{} [{}]", track.name, cfg.game_mode.name())),
-            ("TRACK", format!("{} ({})", track.name, track.subtitle)),
-            (
-                "DRONE",
-                format!("{} | {}g {}", cfg.quad.craft_name(), cfg.weight_g, cfg.battery_pack.short_name()),
-            ),
-            ("THEME", format!("{} / {} deg", cfg.theme.name(), cfg.camera_tilt_deg)),
-            (
-                "SETTINGS",
-                format!(
-                    "{} | Rates, Gfx, OSD",
-                    if input.control_source() == FlightControlSource::ImuSimplified {
-                        "IMU EASY"
-                    } else {
-                        cfg.flight_mode.name()
-                    }
-                ),
-            ),
-            ("CONTROLLER", input.controller_name().chars().take(24).collect()),
-        ];
 
-        for (i, (label, val)) in items.iter().enumerate() {
-            let y = 28 + (i as i32) * 20;
-            let is_sel = i == selected;
+        // --- Left Navigation Rail ---
+        let nav_x = 6;
+        let nav_w = 108;
+
+        // Primary CTA: FLY NOW
+        {
+            let y = 25;
+            let h = 22;
+            let is_sel = selected == 0;
+            let bg = if is_sel {
+                blend_rgb565(ui.sel_bg, ui.ok, 2)
+            } else {
+                ui.header_bg
+            };
+            let border = if is_sel { ui.ok } else { ui.muted };
+            self.ui_draw_panel(nav_x, y, nav_w, h, bg, border, 7);
             if is_sel {
-                self.ui_fill_rect(6, y - 2, UI_W - 12, 17, ui.sel_bg);
-                self.ui_draw_rect(6, y - 2, UI_W - 12, 17, ui.sel_border);
+                self.ui_fill_rect(nav_x + 1, y + 1, 3, h - 2, ui.ok);
             }
-            let lcol = if is_sel { ui.sel_label } else { ui.label };
-            let vcol = if is_sel { ui.sel_val } else { ui.val };
-            self.ui_draw_text(12, y + 3, label, lcol, 1, false);
-            self.ui_draw_text(86, y + 3, val, vcol, 1, false);
+            let lbl = if is_sel { "> FLY NOW" } else { "  FLY NOW" };
+            self.ui_draw_text(nav_x + 7, y + 7, lbl, if is_sel { ui.title } else { ui.ok }, 1, false);
+            let mode_tag = if cfg.game_mode == GameMode::Race { "RACE" } else { "FREE" };
+            self.ui_draw_text(nav_x + nav_w - 28, y + 7, mode_tag, ui.sel_border, 1, false);
         }
 
-        let (dot_col, hint) = match input.control_source() {
-            FlightControlSource::Controller => (ui.ok, "BT/USB Ready | Ent:Select | Hold Esc:Exit"),
-            FlightControlSource::ImuSimplified => (ui.tag, "IMU Tilt Ready | Ent:Select | Hold Esc:Exit"),
-            FlightControlSource::None => (ui.warn, "Controller Req! | Ent:Select | Hold Esc:Exit"),
+        let nav_items: [&str; 5] = ["TRACK", "WORKBENCH", "THEME", "SETTINGS", "CONTROLLER"];
+        for (idx, label) in nav_items.iter().enumerate() {
+            let item_i = idx + 1;
+            let y = 51 + (idx as i32) * 20;
+            let h = 17;
+            let is_sel = selected == item_i;
+            let bg = if is_sel { ui.sel_bg } else { ui.header_bg };
+            let border = if is_sel { ui.sel_border } else { blend_rgb565(ui.bg, ui.muted, 4) };
+            self.ui_draw_panel(nav_x, y, nav_w, h, bg, border, if is_sel { 7 } else { 6 });
+            if is_sel {
+                self.ui_fill_rect(nav_x + 1, y + 1, 3, h - 2, ui.header_line);
+            }
+            let col = if is_sel { ui.sel_label } else { ui.label };
+            let prefix = if is_sel { "> " } else { "  " };
+            self.ui_draw_text(nav_x + 6, y + 5, prefix, ui.header_line, 1, false);
+            self.ui_draw_text(nav_x + 18, y + 5, label, col, 1, false);
+        }
+
+        // --- Right Context Preview Card ---
+        let cx = 120;
+        let cy = 25;
+        let cw = 194;
+        let ch = 124;
+        let card_alpha = if selected == 3 { 5 } else { 7 };
+        self.ui_draw_panel(cx, cy, cw, ch, ui.bg, ui.muted, card_alpha);
+        self.ui_fill_rect_alpha(cx + 1, cy + 1, cw - 2, 15, ui.header_bg, 7);
+        self.ui_draw_hline(cx + 1, cx + cw - 2, cy + 16, ui.muted);
+
+        match selected {
+            0 => {
+                self.ui_draw_text(cx + 6, cy + 5, "FLIGHT BRIEFING", ui.tag, 1, false);
+                let g_tag = format!("{} GATES", track.gates.len());
+                self.ui_draw_text(cx + cw - (g_tag.len() as i32) * 6 - 5, cy + 5, &g_tag, ui.sel_border, 1, false);
+
+                self.ui_draw_text(cx + 6, cy + 21, track.name, ui.title, 1, false);
+                self.draw_track_minimap(cx + 6, cy + 32, 86, 68, track, ui);
+
+                let sx = cx + 98;
+                self.ui_draw_text(sx, cy + 33, cfg.quad.craft_name(), ui.sel_label, 1, false);
+                let wt = format!("{}g {:.1}:1", cfg.weight_g, cfg.effective_twr());
+                self.ui_draw_text(sx, cy + 45, &wt, ui.title, 1, false);
+                self.ui_draw_text(sx, cy + 57, cfg.battery_pack.short_name(), ui.val, 1, false);
+                let fm = if input.control_source() == FlightControlSource::ImuSimplified {
+                    "IMU EASY"
+                } else {
+                    cfg.flight_mode.name()
+                };
+                self.ui_draw_text(sx, cy + 69, fm, ui.tag, 1, false);
+                let cam = format!("{}d FOV{}", cfg.camera_tilt_deg, cfg.fov_deg);
+                self.ui_draw_text(sx, cy + 81, &cam, ui.muted, 1, false);
+                self.ui_fill_rect(sx, cy + 93, 5, 5, ctrl_dot);
+                self.ui_draw_text(sx + 8, cy + 92, ctrl_short, ui.title, 1, false);
+
+                self.ui_fill_rect(cx + 6, cy + 106, cw - 12, 13, blend_rgb565(ui.header_bg, ui.ok, 2));
+                self.ui_draw_rect(cx + 6, cy + 106, cw - 12, 13, ui.ok);
+                self.ui_draw_text(cx + 30, cy + 109, "ENTER: LAUNCH FLIGHT", ui.title, 1, false);
+            }
+            1 => {
+                self.ui_draw_text(cx + 6, cy + 5, "TRACK SELECTOR", ui.tag, 1, false);
+                let idx_tag = format!("{}/{}", cfg.track_index + 1, TRACKS.len());
+                self.ui_draw_text(cx + cw - (idx_tag.len() as i32) * 6 - 5, cy + 5, &idx_tag, ui.sel_border, 1, false);
+
+                self.ui_draw_text(cx + 6, cy + 21, track.name, ui.title, 1, false);
+                let sub: String = track.subtitle.chars().take(30).collect();
+                self.ui_draw_text(cx + 6, cy + 31, &sub, ui.val, 1, false);
+                self.draw_track_minimap(cx + 6, cy + 42, cw - 12, 64, track, ui);
+                self.ui_draw_text(cx + 6, cy + 111, "< Z/C > Switch Track", ui.sel_label, 1, false);
+                let mode_lbl = cfg.game_mode.name();
+                self.ui_draw_text(cx + cw - (mode_lbl.len() as i32) * 6 - 6, cy + 111, mode_lbl, ui.tag, 1, false);
+            }
+            2 => {
+                self.ui_draw_text(cx + 6, cy + 5, "DRONE WORKBENCH", ui.tag, 1, false);
+                let twr_tag = format!("{:.1}:1", cfg.effective_twr());
+                self.ui_draw_text(cx + cw - (twr_tag.len() as i32) * 6 - 5, cy + 5, &twr_tag, ui.ok, 1, false);
+
+                self.ui_draw_text(cx + 6, cy + 21, cfg.quad.name(), ui.title, 1, false);
+                self.ui_draw_text(cx + 6, cy + 32, cfg.battery_pack.name(), ui.val, 1, false);
+
+                let stats: [(&str, f32, String, u16); 4] = [
+                    ("TWR ", (cfg.effective_twr() / 9.0).clamp(0.0, 1.0), format!("{:.1}:1", cfg.effective_twr()), ui.ok),
+                    ("AUW ", ((cfg.weight_g as f32 - 15.0) / 1485.0).clamp(0.02, 1.0).sqrt(), format!("{}g", cfg.weight_g), ui.tag),
+                    ("GRIP", (cfg.rotor_grip as f32 / 100.0).clamp(0.0, 1.0), format!("{:.2}", cfg.rotor_grip as f32 / 100.0), ui.accent),
+                    ("RESP", (1.0 - (cfg.motor_lag_ms as f32 - 5.0) / 40.0).clamp(0.05, 1.0), format!("{}ms", cfg.motor_lag_ms), ui.val),
+                ];
+                for (i, (lbl, frac, val, col)) in stats.iter().enumerate() {
+                    let sy = cy + 47 + (i as i32) * 15;
+                    self.ui_draw_text(cx + 6, sy, lbl, ui.label, 1, false);
+                    self.draw_slider_bar(cx + 38, sy, 102, 7, *frac, *col, ui, false);
+                    self.ui_draw_text(cx + 146, sy, val, ui.title, 1, false);
+                }
+                self.ui_draw_text(cx + 6, cy + 111, "<Z/C> Quad | ENT: Tune", ui.sel_label, 1, false);
+            }
+            3 => {
+                self.ui_draw_text(cx + 6, cy + 5, "ENVIRONMENT", ui.tag, 1, false);
+                self.ui_draw_text(cx + cw - 48, cy + 5, "LIVE 3D", ui.ok, 1, false);
+
+                let themes = [
+                    (VisualTheme::Summer, "SUM"),
+                    (VisualTheme::Evening, "EVE"),
+                    (VisualTheme::Night, "NGT"),
+                    (VisualTheme::Wireframe, "WIR"),
+                ];
+                for (i, (th, short)) in themes.iter().enumerate() {
+                    let sx = cx + 6 + (i as i32) * 46;
+                    let sy = cy + 23;
+                    let p = palette(*th);
+                    let active = cfg.theme == *th;
+                    self.ui_fill_rect(sx, sy, 42, 16, p.sky_top);
+                    self.ui_fill_rect(sx, sy + 16, 42, 12, p.ground_near);
+                    self.ui_draw_hline(sx, sx + 41, sy + 16, p.active_gate);
+                    self.ui_draw_rect(sx, sy, 42, 28, if active { ui.sel_border } else { ui.muted });
+                    if active {
+                        self.ui_draw_rect(sx + 1, sy + 1, 40, 26, ui.sel_border);
+                    }
+                    self.ui_draw_text(sx + 12, sy + 32, short, if active { ui.sel_label } else { ui.muted }, 1, false);
+                }
+
+                let cur = format!("Active: {}", cfg.theme.name());
+                self.ui_draw_text(cx + 6, cy + 72, &cur, ui.title, 1, false);
+                let cam = format!("Tilt: {} deg | FOV: {} deg", cfg.camera_tilt_deg, cfg.fov_deg);
+                self.ui_draw_text(cx + 6, cy + 86, &cam, ui.val, 1, false);
+                let fx = format!("Analog FX: {} | Sky: {}", if cfg.analog_filter { "ON" } else { "OFF" }, if cfg.sky_detail { "ON" } else { "OFF" });
+                self.ui_draw_text(cx + 6, cy + 98, &fx, ui.muted, 1, false);
+                self.ui_draw_text(cx + 6, cy + 111, "< Z/C > Cycle Env Theme", ui.sel_label, 1, false);
+            }
+            4 => {
+                self.ui_draw_text(cx + 6, cy + 5, "SIM SETTINGS", ui.tag, 1, false);
+                self.ui_draw_text(cx + cw - 42, cy + 5, "4 TABS", ui.sel_border, 1, false);
+
+                let fm = if input.control_source() == FlightControlSource::ImuSimplified {
+                    "IMU EASY"
+                } else {
+                    cfg.flight_mode.name()
+                };
+                let rows: [(&str, String); 4] = [
+                    ("FLIGHT", format!("{} / {}", cfg.game_mode.name(), fm)),
+                    ("RATES ", format!("{} {}/{}", cfg.rates.name(), cfg.rate_center, cfg.rate_max)),
+                    ("CAMERA", format!("{}d FOV{} FX:{}", cfg.camera_tilt_deg, cfg.fov_deg, if cfg.analog_filter { "ON" } else { "OFF" })),
+                    ("SYSTEM", format!("{} | {}", cfg.ui_theme.name(), cfg.hdmi_resolution.name())),
+                ];
+                for (i, (k, v)) in rows.iter().enumerate() {
+                    let ry = cy + 25 + (i as i32) * 20;
+                    self.ui_fill_rect(cx + 6, ry - 2, cw - 12, 16, ui.header_bg);
+                    self.ui_draw_text(cx + 10, ry + 2, k, ui.sel_border, 1, false);
+                    let vt: String = v.chars().take(20).collect();
+                    self.ui_draw_text(cx + 52, ry + 2, &vt, ui.title, 1, false);
+                }
+                self.ui_draw_text(cx + 6, cy + 111, "ENTER: Open Settings", ui.sel_label, 1, false);
+            }
+            _ => {
+                self.ui_draw_text(cx + 6, cy + 5, "RADIO / INPUT", ui.tag, 1, false);
+                self.ui_draw_text(cx + cw - (ctrl_short.len() as i32) * 6 - 5, cy + 5, ctrl_short, ctrl_dot, 1, false);
+
+                let cname: String = input.controller_name().chars().take(30).collect();
+                self.ui_draw_text(cx + 6, cy + 21, &cname, ui.title, 1, false);
+
+                let sticks = input.flight_sticks(cfg);
+                let s = self.ui_scale();
+                let (ox, oy) = self.ui_origin();
+                if input.control_source() == FlightControlSource::ImuSimplified {
+                    let thr_pct = (sticks.throttle * 100.0).round() as u8;
+                    self.draw_imu_throttle_bar(ox + (cx + 30) * s, oy + (cy + 36) * s, 16 * s, 44 * s, thr_pct, input.imu_climb_cmd(), false, s);
+                    self.draw_imu_tilt_box(ox + (cx + 88) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, false, s);
+                    self.ui_draw_text(cx + 30, cy + 84, "ALT", ui.muted, 1, false);
+                    self.ui_draw_text(cx + 100, cy + 84, "IMU", ui.tag, 1, false);
+                } else {
+                    self.draw_stick_box(ox + (cx + 30) * s, oy + (cy + 36) * s, 44 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
+                    self.draw_stick_box(ox + (cx + 114) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, s);
+                    self.ui_draw_text(cx + 38, cy + 84, "L-STK", ui.muted, 1, false);
+                    self.ui_draw_text(cx + 122, cy + 84, "R-STK", ui.muted, 1, false);
+                }
+
+                let aux_s = format!(
+                    "ARM:{} MOD:{} TRT:{}",
+                    cfg.aux_arm.short_label(),
+                    cfg.aux_mode.short_label(),
+                    cfg.aux_turtle.short_label()
+                );
+                self.ui_draw_text(cx + 6, cy + 97, &aux_s, ui.val, 1, false);
+                self.ui_draw_text(cx + 6, cy + 111, "ENTER: Calibrate & AUX", ui.sel_label, 1, false);
+            }
+        }
+
+        let footer = match input.control_source() {
+            FlightControlSource::Controller => "F/X:Nav | Z/C:Cycle | Ent:Select | Hold Esc:Exit",
+            FlightControlSource::ImuSimplified => "IMU Ready | F/X:Nav | Ent:Select | Hold Esc:Exit",
+            FlightControlSource::None => "Connect USB/BT Ctrl | Ent:Select | Hold Esc:Exit",
         };
-        self.ui_fill_rect(8, UI_H - 14, 6, 6, dot_col);
-        self.ui_draw_text(18, UI_H - 14, hint, ui.muted, 1, false);
+        self.draw_footer(footer, Some(ctrl_dot), ui);
     }
 
     /// Launch warning modal shown when no IMU sensor is detected and/or running on CardputerZero Lite
@@ -1876,8 +2498,9 @@ impl Renderer {
         input: &InputManager,
         hdmi_tag: Option<&str>,
     ) {
-        self.render_main_menu(cfg, 0, input, hdmi_tag);
+        self.render_main_menu(cfg, 0, input, hdmi_tag, 0.5);
         let ui = ui_colors(cfg.ui_theme);
+        self.fill_rect_alpha(0, 0, self.w(), self.h(), ui.header_bg, 4);
 
         let mx = 18;
         let my = 24;
@@ -1919,26 +2542,34 @@ impl Renderer {
         self.ui_draw_text(cx - (footer.len() as i32) * 3, my + 111, footer, ui.sel_label, 1, false);
     }
 
-    pub fn render_drone_tuning_menu(&mut self, cfg: &Config, selected: usize) {
+    pub fn render_drone_tuning_menu(&mut self, cfg: &Config, selected: usize, menu_time: f32) {
         let ui = ui_colors(cfg.ui_theme);
-        let rows: [(&str, String); 11] = [
-            ("Quad Preset", cfg.quad.name().to_string()),
-            ("Battery Pack", cfg.battery_pack.name().to_string()),
-            ("Prop Wash", cfg.prop_wash.name().to_string()),
-            ("Weight (g)", format!("{}", cfg.weight_g)),
-            ("Thrust (g)", format!("{} ({:.1}:1)", cfg.thrust_g, cfg.effective_twr())),
-            ("Air Drag", format!("{:.2}", cfg.air_drag as f32 / 100.0)),
-            ("Rotor Grip", format!("{:.2}", cfg.rotor_grip as f32 / 100.0)),
-            ("Motor Lag (ms)", format!("{}", cfg.motor_lag_ms)),
-            ("Thr Mid", format!("{:.2}", cfg.thr_mid as f32 / 100.0)),
-            ("Thr Expo", format!("{:.2}", cfg.thr_expo as f32 / 100.0)),
-            ("Reset Tuning", "Enter -> Stock".to_string()),
+        self.render_menu_backdrop(cfg, menu_time, 5);
+
+        let badge = format!("{} | {}g", cfg.quad.craft_name(), cfg.weight_g);
+        self.draw_topbar("WORKBENCH", &badge, Some(ui.ok), ui);
+
+        let rows: [(&str, String, Option<f32>); 11] = [
+            ("Quad", cfg.quad.craft_name().to_string(), None),
+            ("Battery", cfg.battery_pack.short_name().to_string(), None),
+            ("Prop Wash", cfg.prop_wash.name().to_string(), None),
+            ("Weight", format!("{}g", cfg.weight_g), Some(((cfg.weight_g as f32 - 15.0) / 1485.0).clamp(0.0, 1.0).sqrt())),
+            ("Thrust", format!("{}g", cfg.thrust_g), Some(((cfg.thrust_g as f32 - 40.0) / 7960.0).clamp(0.0, 1.0).sqrt())),
+            ("Air Drag", format!("{:.2}", cfg.air_drag as f32 / 100.0), Some(((cfg.air_drag as f32 - 5.0) / 95.0).clamp(0.0, 1.0))),
+            ("Rotor Grip", format!("{:.2}", cfg.rotor_grip as f32 / 100.0), Some((cfg.rotor_grip as f32 / 100.0).clamp(0.0, 1.0))),
+            ("Motor Lag", format!("{}ms", cfg.motor_lag_ms), Some(((cfg.motor_lag_ms as f32 - 5.0) / 40.0).clamp(0.0, 1.0))),
+            ("Thr Mid", format!("{:.2}", cfg.thr_mid as f32 / 100.0), Some(((cfg.thr_mid as f32 - 20.0) / 50.0).clamp(0.0, 1.0))),
+            ("Thr Expo", format!("{:.2}", cfg.thr_expo as f32 / 100.0), Some((cfg.thr_expo as f32 / 80.0).clamp(0.0, 1.0))),
+            ("Reset", "Enter -> Stock".to_string(), None),
         ];
 
-        let tag = format!("{}/{}", selected + 1, rows.len());
-        self.draw_header("DRONE TUNING", &tag, ui);
+        let lx = 6;
+        let ly = 24;
+        let lw = 190;
+        let lh = 128;
+        self.ui_draw_panel(lx, ly, lw, lh, ui.bg, ui.muted, 7);
 
-        const VISIBLE: usize = 8;
+        const VISIBLE: usize = 7;
         let start = if selected >= VISIBLE {
             (selected + 1 - VISIBLE).min(rows.len() - VISIBLE)
         } else {
@@ -1946,131 +2577,351 @@ impl Renderer {
         };
 
         for (slot, i) in (start..(start + VISIBLE).min(rows.len())).enumerate() {
-            let (k, ref v) = rows[i];
-            let y = 27 + (slot as i32) * 16;
+            let (k, ref v, frac) = rows[i];
+            let ry = ly + 5 + (slot as i32) * 17;
             let is_sel = i == selected;
             if is_sel {
-                self.ui_fill_rect(6, y - 2, UI_W - 12, 14, ui.sel_bg);
-                self.ui_draw_rect(6, y - 2, UI_W - 12, 14, ui.sel_border);
+                self.ui_fill_rect(lx + 3, ry - 2, lw - 11, 15, ui.sel_bg);
+                self.ui_draw_rect(lx + 3, ry - 2, lw - 11, 15, ui.sel_border);
+                self.ui_fill_rect(lx + 3, ry - 2, 3, 15, ui.header_line);
             }
             let kcol = if is_sel { ui.sel_label } else { ui.label };
             let vcol = if is_sel { ui.sel_val } else { ui.val };
-            self.ui_draw_text(12, y + 1, k, kcol, 1, false);
-            self.ui_draw_text(128, y + 1, v, vcol, 1, false);
+            self.ui_draw_text(lx + 9, ry + 2, k, kcol, 1, false);
+
+            if let Some(f) = frac {
+                self.draw_slider_bar(lx + 78, ry + 2, 54, 7, f, if is_sel { ui.ok } else { ui.tag }, ui, is_sel);
+                self.ui_draw_text(lx + 137, ry + 2, v, vcol, 1, false);
+            } else {
+                let disp = if is_sel && i < 10 { format!("< {v} >") } else { v.clone() };
+                self.ui_draw_text(lx + 78, ry + 2, &disp, vcol, 1, false);
+            }
         }
 
-        self.ui_draw_text(8, UI_H - 12, "F/X:Scroll | Z/C:Tune | Esc:Save & Back", ui.muted, 1, false);
+        let sb_x = lx + lw - 5;
+        let sb_y = ly + 5;
+        let sb_h = lh - 10;
+        self.ui_fill_rect(sb_x, sb_y, 2, sb_h, ui.header_bg);
+        let thumb_h = ((sb_h * VISIBLE as i32) / rows.len() as i32).max(12);
+        let thumb_y = sb_y + ((sb_h - thumb_h) * start as i32) / (rows.len() - VISIBLE).max(1) as i32;
+        self.ui_fill_rect(sb_x, thumb_y, 2, thumb_h, ui.tag);
+
+        let rx = 202;
+        let ry = 24;
+        let rw = 112;
+        let rh = 128;
+        self.ui_draw_panel(rx, ry, rw, rh, ui.header_bg, ui.muted, 7);
+        self.ui_draw_text(rx + 6, ry + 5, "TELEMETRY", ui.tag, 1, false);
+
+        let twr = cfg.effective_twr();
+        let hover_pct = ((1.0 / twr.max(1.0)) * 100.0).round().clamp(10.0, 95.0) as u8;
+        let twr_s = format!("TWR  {:.2}:1", twr);
+        let twr_col = if twr >= 5.0 { ui.ok } else if twr >= 2.8 { ui.tag } else { ui.warn };
+        self.ui_draw_text(rx + 6, ry + 18, &twr_s, ui.title, 1, false);
+        self.draw_slider_bar(rx + 6, ry + 28, rw - 12, 6, (twr / 9.0).clamp(0.0, 1.0), twr_col, ui, false);
+
+        let auw_s = format!("AUW {}g", cfg.weight_g);
+        let hov_s = format!("HOV {}%", hover_pct);
+        self.ui_draw_text(rx + 6, ry + 40, &auw_s, ui.label, 1, false);
+        self.ui_draw_text(rx + 62, ry + 40, &hov_s, ui.val, 1, false);
+
+        self.ui_draw_hline(rx + 4, rx + rw - 5, ry + 52, ui.muted);
+        self.ui_draw_text(rx + 6, ry + 57, "THR CURVE", ui.tag, 1, false);
+        self.draw_throttle_curve(rx + 6, ry + 68, rw - 12, 54, cfg, ui);
+
+        self.draw_footer("F/X:Scroll | Z/C:Tune | Ent:Reset | Esc:Save", None, ui);
     }
 
-    pub fn render_pause_menu(&mut self, cfg: &Config, selected: usize) {
+    pub fn render_pause_menu(&mut self, cfg: &Config, quad: &QuadState, selected: usize) {
         let ui = ui_colors(cfg.ui_theme);
-        let mx = 68;
-        let my = 24;
-        let mw = 184;
-        let mh = 120;
-        self.ui_fill_rect(mx, my, mw, mh, ui.header_bg);
-        self.ui_draw_rect(mx, my, mw, mh, ui.sel_border);
-        self.ui_draw_text(mx + 56, my + 8, "PAUSED", ui.title, 2, false);
+        self.fill_rect_alpha(0, 0, self.w(), self.h(), ui.header_bg, 4);
 
-        let items = ["RESUME FLIGHT", "RESPAWN START", "DRONE TUNING", "SETTINGS", "MAIN MENU"];
+        let mx = 52;
+        let my = 18;
+        let mw = 216;
+        let mh = 134;
+        self.ui_draw_panel(mx, my, mw, mh, ui.bg, ui.sel_border, 7);
+        self.ui_fill_rect(mx + 1, my + 1, mw - 2, 20, ui.header_bg);
+        self.ui_fill_rect(mx + 1, my + 1, 3, 20, ui.header_line);
+        self.ui_draw_hline(mx + 1, mx + mw - 2, my + 21, ui.header_line);
+        self.ui_draw_text(mx + 8, my + 4, "PAUSED", ui.title, 2, false);
+
+        let mins = (quad.flight_time as u32) / 60;
+        let secs = (quad.flight_time as u32) % 60;
+        let telem = format!("{:02}:{:02} {:.2}V", mins, secs, quad.cell_voltage);
+        self.ui_draw_text(mx + mw - (telem.len() as i32) * 6 - 6, my + 7, &telem, ui.tag, 1, false);
+
+        let items = [
+            "RESUME FLIGHT",
+            "RESTART RUN",
+            "DRONE WORKBENCH",
+            "SETTINGS",
+            "MAIN MENU",
+        ];
         for (i, label) in items.iter().enumerate() {
-            let y = my + 32 + (i as i32) * 16;
-            if i == selected {
-                self.ui_fill_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_bg);
-                self.ui_draw_rect(mx + 10, y - 2, mw - 20, 13, ui.sel_border);
+            let y = my + 28 + (i as i32) * 18;
+            let is_sel = i == selected;
+            if is_sel {
+                self.ui_fill_rect(mx + 10, y - 2, mw - 20, 15, ui.sel_bg);
+                self.ui_draw_rect(mx + 10, y - 2, mw - 20, 15, ui.sel_border);
+                self.ui_fill_rect(mx + 10, y - 2, 3, 15, ui.ok);
+            } else {
+                self.ui_fill_rect(mx + 10, y - 2, mw - 20, 15, ui.header_bg);
             }
-            let col = if i == selected { ui.sel_label } else { ui.label };
-            self.ui_draw_text(mx + 22, y + 1, label, col, 1, false);
+            let col = if is_sel { ui.sel_label } else { ui.label };
+            self.ui_draw_text(mx + 20, y + 2, label, col, 1, false);
         }
+
+        self.ui_draw_text(mx + 34, my + mh - 11, "Esc: Resume | Ent: Select", ui.muted, 1, false);
     }
 
     pub fn render_settings_menu(
         &mut self,
         cfg: &Config,
-        selected: usize,
+        tab: SettingsTab,
+        row: usize,
+        focus_tabs: bool,
         imu_mode: bool,
         hdmi_tag: Option<&str>,
+        menu_time: f32,
     ) {
         let ui = ui_colors(cfg.ui_theme);
-        let flight_mode_val = if imu_mode {
-            "IMU EASY (Locked)".to_string()
-        } else {
-            cfg.flight_mode.name().to_string()
-        };
-        let display_val = match (cfg.display_output, hdmi_tag) {
-            (DisplayOutput::Auto, Some(tag)) => format!("Auto [{tag}]"),
-            (DisplayOutput::Auto, None) => "Auto [LCD]".to_string(),
-            (DisplayOutput::HdmiOnly, Some(tag)) => format!("HDMI [{tag}]"),
-            (DisplayOutput::HdmiOnly, None) => "HDMI Only [No HDMI]".to_string(),
-            (DisplayOutput::LcdOnly, _) => "LCD Only".to_string(),
-        };
-        let rows: [(&str, String); 20] = [
-            ("Game Mode", cfg.game_mode.name().to_string()),
-            ("Flight Mode", flight_mode_val),
-            ("Rate Preset", cfg.rates.name().to_string()),
-            ("Center Sens", format!("{} deg/s", cfg.rate_center)),
-            ("Max Rate", format!("{} deg/s", cfg.rate_max)),
-            ("Rate Expo", format!("{:.2}", cfg.rate_expo as f32 / 100.0)),
-            ("Camera Tilt", format!("{} deg", cfg.camera_tilt_deg)),
-            ("FOV", format!("{} deg", cfg.fov_deg)),
-            ("Analog FX", if cfg.analog_filter { "On (NTSC/RF)" } else { "Off" }.to_string()),
-            ("UI Theme", cfg.ui_theme.name().to_string()),
-            ("Stick OSD", cfg.stick_overlay.name().to_string()),
-            ("Sound", if cfg.sound_on { "On (Whoop Audio)" } else { "Off" }.to_string()),
-            ("Debug OSD", if cfg.debug_osd { "On (FPS/ms)" } else { "Off" }.to_string()),
-            ("Gfx Detail", if cfg.detail_high { "High" } else { "Low" }.to_string()),
-            ("Sky Detail", if cfg.sky_detail { "On (Sun/Stars)" } else { "Off" }.to_string()),
-            ("Stick Mode", cfg.stick_mode.name().to_string()),
-            ("Throttle Mode", cfg.throttle_mode.name().to_string()),
-            ("Display", display_val),
-            ("HDMI Res", cfg.hdmi_resolution.name().to_string()),
-            ("HDMI LCD", cfg.hdmi_lcd_backlight.name().to_string()),
-        ];
+        self.render_menu_backdrop(cfg, menu_time, 5);
 
-        let tag = format!("{}/{}", selected + 1, rows.len());
-        self.draw_header("SETTINGS", &tag, ui);
-
-        const VISIBLE: usize = 8;
-        let start = if selected >= VISIBLE {
-            (selected + 1 - VISIBLE).min(rows.len() - VISIBLE)
-        } else {
-            0
+        let right_badge = match hdmi_tag {
+            Some(tag) => format!("HDMI {tag}"),
+            None => tab.label().to_string(),
         };
+        self.draw_topbar("SETTINGS", &right_badge, None, ui);
 
-        for (slot, i) in (start..(start + VISIBLE).min(rows.len())).enumerate() {
-            let (k, ref v) = rows[i];
-            let y = 27 + (slot as i32) * 16;
-            let is_sel = i == selected;
-            let is_locked = imu_mode && i == 1;
-            if is_sel {
-                self.ui_fill_rect(6, y - 2, UI_W - 12, 14, ui.sel_bg);
-                self.ui_draw_rect(6, y - 2, UI_W - 12, 14, ui.sel_border);
+        // --- Horizontal Category Tab Strip ---
+        let tab_y = 23;
+        let tab_h = 15;
+        let tab_w = 75;
+        for (i, t) in SettingsTab::ALL.iter().enumerate() {
+            let tx = 6 + (i as i32) * (tab_w + 2);
+            let active = *t == tab;
+            let bg = if active { ui.sel_bg } else { ui.header_bg };
+            let border = if active && focus_tabs {
+                ui.sel_border
+            } else if active {
+                ui.header_line
+            } else {
+                ui.muted
+            };
+            self.ui_draw_panel(tx, tab_y, tab_w, tab_h, bg, border, 7);
+            if active {
+                self.ui_fill_rect(tx + 1, tab_y + tab_h - 2, tab_w - 2, 2, if focus_tabs { ui.sel_border } else { ui.header_line });
             }
-            let kcol = if is_locked {
-                ui.muted
-            } else if is_sel {
-                ui.sel_label
+            let lbl = if active && focus_tabs {
+                format!("<{}>", t.label())
             } else {
-                ui.label
+                t.label().to_string()
             };
-            let vcol = if is_locked {
-                ui.muted
-            } else if is_sel {
-                ui.sel_val
-            } else {
-                ui.val
-            };
-            self.ui_draw_text(12, y + 1, k, kcol, 1, false);
-            self.ui_draw_text(126, y + 1, v, vcol, 1, false);
+            let lx = tx + (tab_w - (lbl.len() as i32) * 6) / 2;
+            let lcol = if active { ui.title } else { ui.muted };
+            self.ui_draw_text(lx, tab_y + 4, &lbl, lcol, 1, false);
         }
 
-        self.ui_draw_text(8, UI_H - 12, "F/X:Scroll | Z/C:Adjust | Esc:Save", ui.muted, 1, false);
+        // --- Tab Content ---
+        match tab {
+            SettingsTab::Flight => {
+                self.ui_draw_panel(6, 42, UI_W - 12, 82, ui.bg, ui.muted, 7);
+                let flight_mode_val = if imu_mode {
+                    "IMU EASY (Locked)".to_string()
+                } else {
+                    cfg.flight_mode.name().to_string()
+                };
+                let rows: [(&str, String, &str, bool); 4] = [
+                    ("Game Mode", cfg.game_mode.name().to_string(), "Race: timed gate laps | Freestyle: trick combos", false),
+                    ("Flight Mode", flight_mode_val, if imu_mode { "Locked to IMU Easy while no USB/BT controller" } else { "ACRO: manual | HORIZ: level+flip | ANGLE: 45d cap" }, imu_mode),
+                    ("Stick Mode", cfg.stick_mode.name().to_string(), "Mode 2: Thr left, Pit right | Mode 1: Thr right", false),
+                    ("Throttle Mode", cfg.throttle_mode.name().to_string(), "RC Full: 0-100% stick | Gamepad: spring-centered", false),
+                ];
+                for (i, (k, v, _, locked)) in rows.iter().enumerate() {
+                    let y = 47 + (i as i32) * 18;
+                    let is_sel = !focus_tabs && i == row;
+                    if is_sel {
+                        self.ui_fill_rect(10, y - 2, UI_W - 20, 15, ui.sel_bg);
+                        self.ui_draw_rect(10, y - 2, UI_W - 20, 15, ui.sel_border);
+                        self.ui_fill_rect(10, y - 2, 3, 15, ui.header_line);
+                    }
+                    let kcol = if *locked { ui.muted } else if is_sel { ui.sel_label } else { ui.label };
+                    let vcol = if *locked { ui.muted } else if is_sel { ui.sel_val } else { ui.val };
+                    self.ui_draw_text(18, y + 2, k, kcol, 1, false);
+                    let disp = if is_sel && !*locked { format!("< {v} >") } else { v.clone() };
+                    self.ui_draw_text(132, y + 2, &disp, vcol, 1, false);
+                }
+                self.ui_draw_panel(6, 128, UI_W - 12, 24, ui.header_bg, ui.muted, 7);
+                let desc = if focus_tabs {
+                    "Z/C: Switch category tab | Down/Enter: Edit items"
+                } else {
+                    rows[row.min(rows.len() - 1)].2
+                };
+                let desc_trim: String = desc.chars().take(50).collect();
+                self.ui_draw_text(12, 136, &desc_trim, ui.tag, 1, false);
+            }
+            SettingsTab::Rates => {
+                let lx = 6;
+                let lw = 178;
+                self.ui_draw_panel(lx, 42, lw, 110, ui.bg, ui.muted, 7);
+
+                let items: [(&str, String, Option<f32>); 4] = [
+                    ("Preset", cfg.rates.name().to_string(), None),
+                    ("Center", format!("{} d/s", cfg.rate_center), Some(((cfg.rate_center as f32 - 50.0) / 350.0).clamp(0.0, 1.0))),
+                    ("Max Rate", format!("{} d/s", cfg.rate_max), Some(((cfg.rate_max as f32 - 300.0) / 900.0).clamp(0.0, 1.0))),
+                    ("Expo", format!("{:.2}", cfg.rate_expo as f32 / 100.0), Some((cfg.rate_expo as f32 / 90.0).clamp(0.0, 1.0))),
+                ];
+                for (i, (k, v, frac)) in items.iter().enumerate() {
+                    let y = 47 + (i as i32) * 25;
+                    let is_sel = !focus_tabs && i == row;
+                    if is_sel {
+                        self.ui_fill_rect(lx + 4, y - 2, lw - 8, 22, ui.sel_bg);
+                        self.ui_draw_rect(lx + 4, y - 2, lw - 8, 22, ui.sel_border);
+                        self.ui_fill_rect(lx + 4, y - 2, 3, 22, ui.header_line);
+                    }
+                    let kcol = if is_sel { ui.sel_label } else { ui.label };
+                    let vcol = if is_sel { ui.sel_val } else { ui.val };
+                    self.ui_draw_text(lx + 11, y + 1, k, kcol, 1, false);
+                    let disp = if is_sel && frac.is_none() { format!("< {v} >") } else { v.clone() };
+                    self.ui_draw_text(lx + lw - (disp.len() as i32) * 6 - 8, y + 1, &disp, vcol, 1, false);
+                    if let Some(f) = frac {
+                        self.draw_slider_bar(lx + 11, y + 11, lw - 20, 6, *f, if is_sel { ui.ok } else { ui.tag }, ui, is_sel);
+                    } else {
+                        self.ui_draw_text(lx + 11, y + 11, "Betaflight Actual Rates", ui.muted, 1, false);
+                    }
+                }
+
+                self.draw_rates_curve(190, 42, 124, 110, cfg, ui);
+            }
+            SettingsTab::Camera => {
+                let lx = 6;
+                let lw = 190;
+                self.ui_draw_panel(lx, 42, lw, 110, ui.bg, ui.muted, 7);
+
+                let labels = ["Cam Tilt", "FOV", "Analog FX", "Stick OSD", "Debug OSD"];
+                for (i, k) in labels.iter().enumerate() {
+                    let y = 48 + (i as i32) * 20;
+                    let is_sel = !focus_tabs && i == row;
+                    if is_sel {
+                        self.ui_fill_rect(lx + 4, y - 2, lw - 8, 17, ui.sel_bg);
+                        self.ui_draw_rect(lx + 4, y - 2, lw - 8, 17, ui.sel_border);
+                        self.ui_fill_rect(lx + 4, y - 2, 3, 17, ui.header_line);
+                    }
+                    let kcol = if is_sel { ui.sel_label } else { ui.label };
+                    let vcol = if is_sel { ui.sel_val } else { ui.val };
+                    self.ui_draw_text(lx + 10, y + 3, k, kcol, 1, false);
+
+                    match i {
+                        0 => {
+                            let f = (cfg.camera_tilt_deg as f32 / 50.0).clamp(0.0, 1.0);
+                            self.draw_slider_bar(lx + 72, y + 3, 72, 7, f, if is_sel { ui.ok } else { ui.tag }, ui, is_sel);
+                            let v = format!("{}d", cfg.camera_tilt_deg);
+                            self.ui_draw_text(lx + 150, y + 3, &v, vcol, 1, false);
+                        }
+                        1 => {
+                            let f = ((cfg.fov_deg as f32 - 75.0) / 30.0).clamp(0.0, 1.0);
+                            self.draw_slider_bar(lx + 72, y + 3, 72, 7, f, if is_sel { ui.ok } else { ui.tag }, ui, is_sel);
+                            let v = format!("{}d", cfg.fov_deg);
+                            self.ui_draw_text(lx + 150, y + 3, &v, vcol, 1, false);
+                        }
+                        2 => {
+                            self.draw_toggle_pill(lx + 146, y + 1, cfg.analog_filter, ui, is_sel);
+                        }
+                        3 => {
+                            let s = cfg.stick_overlay.name();
+                            let disp = if is_sel { format!("<{s}>") } else { s.to_string() };
+                            self.ui_draw_text(lx + lw - (disp.len() as i32) * 6 - 8, y + 3, &disp, vcol, 1, false);
+                        }
+                        _ => {
+                            self.draw_toggle_pill(lx + 146, y + 1, cfg.debug_osd, ui, is_sel);
+                        }
+                    }
+                }
+
+                self.draw_camera_preview(202, 42, 112, 110, cfg, ui);
+            }
+            SettingsTab::System => {
+                self.ui_draw_panel(6, 42, UI_W - 12, 110, ui.bg, ui.muted, 7);
+                let display_val = match (cfg.display_output, hdmi_tag) {
+                    (DisplayOutput::Auto, Some(tag)) => format!("Auto [{tag}]"),
+                    (DisplayOutput::Auto, None) => "Auto [LCD]".to_string(),
+                    (DisplayOutput::HdmiOnly, Some(tag)) => format!("HDMI [{tag}]"),
+                    (DisplayOutput::HdmiOnly, None) => "HDMI Only [No HDMI]".to_string(),
+                    (DisplayOutput::LcdOnly, _) => "LCD Only".to_string(),
+                };
+                let labels = [
+                    "UI Theme",
+                    "Gfx Detail",
+                    "Sky Detail",
+                    "Sound",
+                    "Display",
+                    "HDMI Res",
+                    "LCD on HDMI",
+                ];
+                for (i, k) in labels.iter().enumerate() {
+                    let y = 46 + (i as i32) * 15;
+                    let is_sel = !focus_tabs && i == row;
+                    if is_sel {
+                        self.ui_fill_rect(10, y - 1, UI_W - 20, 13, ui.sel_bg);
+                        self.ui_draw_rect(10, y - 1, UI_W - 20, 13, ui.sel_border);
+                        self.ui_fill_rect(10, y - 1, 3, 13, ui.header_line);
+                    }
+                    let kcol = if is_sel { ui.sel_label } else { ui.label };
+                    let vcol = if is_sel { ui.sel_val } else { ui.val };
+                    self.ui_draw_text(18, y + 2, k, kcol, 1, false);
+
+                    match i {
+                        0 => {
+                            let s = cfg.ui_theme.name();
+                            let d = if is_sel { format!("< {s} >") } else { s.to_string() };
+                            self.ui_draw_text(126, y + 2, &d, vcol, 1, false);
+                        }
+                        1 => {
+                            let s = if cfg.detail_high { "High" } else { "Low" };
+                            let d = if is_sel { format!("< {s} >") } else { s.to_string() };
+                            self.ui_draw_text(126, y + 2, &d, vcol, 1, false);
+                        }
+                        2 => {
+                            self.draw_toggle_pill(126, y, cfg.sky_detail, ui, is_sel);
+                            self.ui_draw_text(168, y + 2, "Sun/Stars", ui.muted, 1, false);
+                        }
+                        3 => {
+                            self.draw_toggle_pill(126, y, cfg.sound_on, ui, is_sel);
+                            self.ui_draw_text(168, y + 2, "Whoop Audio", ui.muted, 1, false);
+                        }
+                        4 => {
+                            let d = if is_sel { format!("< {display_val} >") } else { display_val.clone() };
+                            self.ui_draw_text(126, y + 2, &d, vcol, 1, false);
+                        }
+                        5 => {
+                            let s = cfg.hdmi_resolution.name();
+                            let d = if is_sel { format!("< {s} >") } else { s.to_string() };
+                            self.ui_draw_text(126, y + 2, &d, vcol, 1, false);
+                        }
+                        _ => {
+                            let s = cfg.hdmi_lcd_backlight.name();
+                            let d = if is_sel { format!("< {s} >") } else { s.to_string() };
+                            self.ui_draw_text(126, y + 2, &d, vcol, 1, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        let footer = if focus_tabs {
+            "Z/C:Switch Tab | X/Ent:Edit | Tab:Next | Esc:Save"
+        } else {
+            "Tab:NextTab | F/X:Nav | Z/C:Adjust | Esc:Save"
+        };
+        self.draw_footer(footer, None, ui);
     }
 
     /// Static status card drawn once on the built-in 1.9" LCD when `HDMI Only` mode is active.
     pub fn render_hdmi_lcd_notice(&mut self, cfg: &Config, hdmi_info: &str) {
         let ui = ui_colors(cfg.ui_theme);
-        self.draw_header("STICKZERO", "HDMI ONLY", ui);
+        self.clear(ui.bg);
+        self.draw_topbar("STICKZERO", "HDMI ONLY", Some(ui.ok), ui);
         let cx = UI_W / 2;
 
         self.ui_fill_rect(18, 34, UI_W - 36, 98, ui.header_bg);
@@ -2097,19 +2948,22 @@ impl Renderer {
         self.ui_draw_text(cx - (l1.len() as i32) * 3, 96, l1, ui.label, 1, false);
         self.ui_draw_text(cx - (l2.len() as i32) * 3, 110, l2, ui.muted, 1, false);
 
-        let footer = "Settings -> Display / HDMI LCD";
-        self.ui_draw_text(cx - (footer.len() as i32) * 3, UI_H - 14, footer, ui.muted, 1, false);
+        self.draw_footer("Settings -> System -> Display / HDMI LCD", None, ui);
     }
 
-    pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager) {
+    pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager, menu_time: f32) {
         let ui = ui_colors(cfg.ui_theme);
+        self.render_menu_backdrop(cfg, menu_time, 5);
+
         let ctrl_src = input.control_source();
-        let header_tag = match ctrl_src {
-            FlightControlSource::Controller => "BT / USB-C",
-            FlightControlSource::ImuSimplified => "IMU EASY",
-            FlightControlSource::None => "NO INPUT",
+        let (dot_col, header_tag) = match ctrl_src {
+            FlightControlSource::Controller => (ui.ok, "BT / USB-C"),
+            FlightControlSource::ImuSimplified => (ui.tag, "IMU EASY"),
+            FlightControlSource::None => (ui.warn, "NO INPUT"),
         };
-        self.draw_header("CONTROLLER", header_tag, ui);
+        self.draw_topbar("CONTROLLER", header_tag, Some(dot_col), ui);
+
+        self.ui_draw_panel(6, 24, UI_W - 12, 128, ui.bg, ui.muted, 7);
 
         let name: String = input.controller_name().chars().take(36).collect();
         let dev_tag = match ctrl_src {
@@ -2136,25 +2990,25 @@ impl Renderer {
         };
 
         let dev_col = if ctrl_src == FlightControlSource::None { ui.warn } else { ui.sel_label };
-        self.ui_draw_text(8, 25, &dev_tag, dev_col, 1, false);
-        self.ui_draw_text(8, 35, &sub_summary, ui.tag, 1, false);
+        self.ui_draw_text(12, 28, &dev_tag, dev_col, 1, false);
+        self.ui_draw_text(12, 38, &sub_summary, ui.tag, 1, false);
 
         if let Some(ref wiz) = input.calib {
-            self.ui_fill_rect(10, 48, UI_W - 20, 74, ui.header_bg);
-            self.ui_draw_rect(10, 48, UI_W - 20, 74, ui.accent);
-            self.ui_draw_text(18, 56, "CALIBRATE STICKS", ui.tag, 1, false);
-            self.ui_draw_text(18, 72, wiz.step_prompt(), ui.sel_label, 1, false);
-            let msg: String = wiz.message.chars().take(44).collect();
-            self.ui_draw_text(18, 90, &msg, ui.ok, 1, false);
-            self.ui_draw_text(18, 106, "Esc: Cancel Calibration", ui.muted, 1, false);
+            self.ui_fill_rect(14, 50, UI_W - 28, 70, ui.header_bg);
+            self.ui_draw_rect(14, 50, UI_W - 28, 70, ui.accent);
+            self.ui_draw_text(22, 57, "CALIBRATE STICKS", ui.tag, 1, false);
+            self.ui_draw_text(22, 72, wiz.step_prompt(), ui.sel_label, 1, false);
+            let msg: String = wiz.message.chars().take(42).collect();
+            self.ui_draw_text(22, 89, &msg, ui.ok, 1, false);
+            self.ui_draw_text(22, 105, "Esc: Cancel Calibration", ui.muted, 1, false);
         } else if let Some(ref aw) = input.aux_wiz {
-            self.ui_fill_rect(10, 48, UI_W - 20, 74, ui.header_bg);
-            self.ui_draw_rect(10, 48, UI_W - 20, 74, ui.ok);
-            self.ui_draw_text(18, 56, "BIND RADIO AUX SWITCHES", ui.ok, 1, false);
-            self.ui_draw_text(18, 72, aw.step_prompt(), ui.sel_label, 1, false);
-            let msg: String = aw.message.chars().take(44).collect();
-            self.ui_draw_text(18, 90, &msg, ui.tag, 1, false);
-            self.ui_draw_text(18, 106, "Enter: Skip Step | Esc: Cancel", ui.muted, 1, false);
+            self.ui_fill_rect(14, 50, UI_W - 28, 70, ui.header_bg);
+            self.ui_draw_rect(14, 50, UI_W - 28, 70, ui.ok);
+            self.ui_draw_text(22, 57, "BIND RADIO AUX SWITCHES", ui.ok, 1, false);
+            self.ui_draw_text(22, 72, aw.step_prompt(), ui.sel_label, 1, false);
+            let msg: String = aw.message.chars().take(42).collect();
+            self.ui_draw_text(22, 89, &msg, ui.tag, 1, false);
+            self.ui_draw_text(22, 105, "Enter: Skip Step | Esc: Cancel", ui.muted, 1, false);
         } else {
             let sticks = input.flight_sticks(cfg);
             let bars: [(&str, f32); 4] = [
@@ -2165,10 +3019,10 @@ impl Renderer {
             ];
 
             for (i, (lbl, val)) in bars.iter().enumerate() {
-                let y = 49 + (i as i32) * 16;
-                self.ui_draw_text(8, y + 2, lbl, ui.label, 1, false);
-                let bx = 38;
-                let bw = 152;
+                let y = 51 + (i as i32) * 16;
+                self.ui_draw_text(12, y + 2, lbl, ui.label, 1, false);
+                let bx = 40;
+                let bw = 148;
                 self.ui_fill_rect(bx, y, bw, 10, ui.header_bg);
                 self.ui_draw_rect(bx, y, bw, 10, ui.muted);
                 let mid = bx + bw / 2;
@@ -2181,15 +3035,15 @@ impl Renderer {
             let (ox, oy) = self.ui_origin();
             if ctrl_src == FlightControlSource::ImuSimplified {
                 let thr_pct = (sticks.throttle * 100.0).round() as u8;
-                self.draw_imu_throttle_bar(ox + 204 * s, oy + 51 * s, 18 * s, 46 * s, thr_pct, input.imu_climb_cmd(), false, s);
-                self.draw_imu_tilt_box(ox + 260 * s, oy + 51 * s, 46 * s, sticks.roll, sticks.pitch, false, s);
-                self.ui_draw_text(204, 101, "ALT", ui.muted, 1, false);
-                self.ui_draw_text(274, 101, "IMU", ui.tag, 1, false);
+                self.draw_imu_throttle_bar(ox + 200 * s, oy + 52 * s, 18 * s, 46 * s, thr_pct, input.imu_climb_cmd(), false, s);
+                self.draw_imu_tilt_box(ox + 256 * s, oy + 52 * s, 46 * s, sticks.roll, sticks.pitch, false, s);
+                self.ui_draw_text(200, 102, "ALT", ui.muted, 1, false);
+                self.ui_draw_text(270, 102, "IMU", ui.tag, 1, false);
             } else {
-                self.draw_stick_box(ox + 204 * s, oy + 51 * s, 46 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
-                self.draw_stick_box(ox + 260 * s, oy + 51 * s, 46 * s, sticks.roll, sticks.pitch, s);
-                self.ui_draw_text(214, 101, "L-STK", ui.muted, 1, false);
-                self.ui_draw_text(270, 101, "R-STK", ui.muted, 1, false);
+                self.draw_stick_box(ox + 200 * s, oy + 52 * s, 46 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
+                self.draw_stick_box(ox + 256 * s, oy + 52 * s, 46 * s, sticks.roll, sticks.pitch, s);
+                self.ui_draw_text(210, 102, "L-STK", ui.muted, 1, false);
+                self.ui_draw_text(266, 102, "R-STK", ui.muted, 1, false);
             }
         }
 
@@ -2198,22 +3052,73 @@ impl Renderer {
             FlightControlSource::ImuSimplified => format!("IMU {}", input.imu.summary()),
             FlightControlSource::None => input.imu.summary(),
         };
-        let raw_trim: String = raw.chars().take(50).collect();
-        self.ui_draw_text(8, 127, &raw_trim, if ctrl_src == FlightControlSource::None { ui.warn } else { ui.ok }, 1, false);
+        let raw_trim: String = raw.chars().take(48).collect();
+        self.ui_draw_text(12, 124, &raw_trim, if ctrl_src == FlightControlSource::None { ui.warn } else { ui.ok }, 1, false);
 
-        match ctrl_src {
-            FlightControlSource::Controller => {
-                self.ui_draw_text(8, 141, "C:Sticks | B:Bind AUX | Ent:RC/Pad", ui.sel_val, 1, false);
-                self.ui_draw_text(8, 154, "N:NextDev | R:Reset Auto | Esc:Back", ui.muted, 1, false);
+        let action_line = match ctrl_src {
+            FlightControlSource::Controller => "C:Calibrate | B:Bind AUX | Ent:RC/Pad | N:Dev",
+            FlightControlSource::ImuSimplified => "C:Zero IMU | F/X:Alt | R:Rescan BT/USB",
+            FlightControlSource::None => "Connect USB-C Host or BT Controller | R:Rescan",
+        };
+        self.ui_draw_text(12, 138, action_line, ui.sel_val, 1, false);
+        self.draw_footer("R:Reset Auto | N:NextDev | Esc:Back", Some(dot_col), ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, UiTheme, VisualTheme};
+    use crate::input::InputManager;
+    use crate::physics::QuadState;
+    use crate::tracks::TRACKS;
+
+    #[test]
+    fn test_settings_tab_cycle_roundtrip() {
+        let mut t = SettingsTab::Flight;
+        for expected in [SettingsTab::Rates, SettingsTab::Camera, SettingsTab::System, SettingsTab::Flight] {
+            t = t.next();
+            assert_eq!(t, expected);
+        }
+        for expected in [SettingsTab::System, SettingsTab::Camera, SettingsTab::Rates, SettingsTab::Flight] {
+            t = t.prev();
+            assert_eq!(t, expected);
+        }
+        assert_eq!(SettingsTab::Flight.row_count(), 4);
+        assert_eq!(SettingsTab::Rates.row_count(), 4);
+        assert_eq!(SettingsTab::Camera.row_count(), 5);
+        assert_eq!(SettingsTab::System.row_count(), 7);
+    }
+
+    #[test]
+    fn test_steam_sim_menus_render_across_resolutions() {
+        let mut cfg = Config::default();
+        let input = InputManager::new();
+        let quad = QuadState::spawn(&TRACKS[0], &cfg);
+
+        for (w, h) in [(320, 170), (640, 360)] {
+            let mut r = Renderer::with_size(w, h);
+            for ui_theme in [UiTheme::Monokai, UiTheme::StickTime] {
+                cfg.ui_theme = ui_theme;
+                for vis in [VisualTheme::Summer, VisualTheme::Evening, VisualTheme::Night, VisualTheme::Wireframe] {
+                    cfg.theme = vis;
+                    for sel in 0..6 {
+                        r.render_main_menu(&cfg, sel, &input, Some("720p"), 1.2);
+                    }
+                }
+                for tab in SettingsTab::ALL {
+                    r.render_settings_menu(&cfg, tab, 0, true, false, None, 0.5);
+                    for row in 0..tab.row_count() {
+                        r.render_settings_menu(&cfg, tab, row, false, false, None, 0.5);
+                    }
+                }
+                for row in 0..11 {
+                    r.render_drone_tuning_menu(&cfg, row, 0.5);
+                }
+                r.render_pause_menu(&cfg, &quad, 0);
+                r.render_controller_screen(&cfg, &input, 0.5);
             }
-            FlightControlSource::ImuSimplified => {
-                self.ui_draw_text(8, 141, "C:Zero IMU | F/X:Alt | R:Rescan BT/USB", ui.sel_val, 1, false);
-                self.ui_draw_text(8, 154, "Connect USB/BT radio for full sticks", ui.muted, 1, false);
-            }
-            FlightControlSource::None => {
-                self.ui_draw_text(8, 141, "Connect USB-C Host or BT Controller", ui.sel_val, 1, false);
-                self.ui_draw_text(8, 154, "R:Rescan | N:NextDev | Esc:Back", ui.muted, 1, false);
-            }
+            assert!(r.fb.iter().any(|&px| px != r.fb[0]));
         }
     }
 }

@@ -252,7 +252,7 @@ impl QuadState {
 
     /// Betaflight throttle mid + expo curve (flattens sensitivity around `thr_mid`).
     #[inline]
-    fn apply_throttle_expo(raw: f32, mid_pct: u8, expo_pct: u8) -> f32 {
+    pub fn apply_throttle_expo(raw: f32, mid_pct: u8, expo_pct: u8) -> f32 {
         let x = clampf(raw, 0.0, 1.0);
         let e = (expo_pct as f32 / 100.0).clamp(0.0, 0.80);
         if e < 1e-3 {

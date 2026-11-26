@@ -313,6 +313,14 @@ impl RatesPreset {
         }
     }
 
+    pub fn prev_preset(self) -> Self {
+        match self {
+            Self::Soft | Self::Custom => Self::Fast,
+            Self::Normal => Self::Soft,
+            Self::Fast => Self::Normal,
+        }
+    }
+
     /// Betaflight Actual rate presets: (center_sens deg/s, max_rate deg/s, expo %)
     pub fn defaults(self) -> (u16, u16, u8) {
         match self {
@@ -348,6 +356,15 @@ impl VisualTheme {
             Self::Evening => Self::Night,
             Self::Night => Self::Wireframe,
             Self::Wireframe => Self::Summer,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Summer => Self::Wireframe,
+            Self::Evening => Self::Summer,
+            Self::Night => Self::Evening,
+            Self::Wireframe => Self::Night,
         }
     }
 }

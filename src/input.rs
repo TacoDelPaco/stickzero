@@ -529,6 +529,8 @@ pub struct MenuActions {
     pub right: bool,
     pub select: bool,
     pub back: bool,
+    pub tab_prev: bool,
+    pub tab_next: bool,
     pub respawn: bool,
     pub calibrate: bool,
     pub recenter_imu: bool,
@@ -1270,7 +1272,19 @@ impl InputManager {
                     match code {
                         BTN_SOUTH | BTN_TRIGGER => if in_menu { self.pending.select = true; },
                         BTN_EAST | BTN_THUMB | BTN_START | BTN_MODE => self.pending.back = true,
-                        BTN_SELECT | BTN_NORTH | BTN_TL => self.pending.respawn = true,
+                        BTN_SELECT | BTN_NORTH => self.pending.respawn = true,
+                        BTN_TL => {
+                            if in_menu {
+                                self.pending.tab_prev = true;
+                            } else {
+                                self.pending.respawn = true;
+                            }
+                        }
+                        BTN_TR => {
+                            if in_menu {
+                                self.pending.tab_next = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1455,7 +1469,13 @@ impl InputManager {
                 if pressed { self.pending.respawn = true; }
             }
             KEY_TAB => {
-                if pressed && !in_menu { self.kb_arm_toggle = true; }
+                if pressed {
+                    if in_menu {
+                        self.pending.tab_next = true;
+                    } else {
+                        self.kb_arm_toggle = true;
+                    }
+                }
             }
             KEY_E => {
                 if pressed && !in_menu { self.kb_mode_toggle = true; }

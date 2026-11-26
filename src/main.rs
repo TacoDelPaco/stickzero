@@ -29,7 +29,7 @@ use input::{FlightControlSource, InputManager};
 use linux_sys::{signal, SIGINT, SIGTERM};
 use math::{Quat, Vec3};
 use physics::{QuadState, StickInput, PHYSICS_DT};
-use renderer::Renderer;
+use renderer::{Renderer, SettingsTab};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -114,8 +114,8 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     let mut renderer = Renderer::new();
     let input = InputManager::new();
 
-    // 1. Main Menu (Monokai default)
-    renderer.render_main_menu(&cfg, 0, &input, None);
+    // 1. Main Menu (Monokai default — Steam-sim split-pane over live 3D Meadow Loop)
+    renderer.render_main_menu(&cfg, 0, &input, None, 0.8);
     png::save_rgb565_png(&dir.join("01-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 2. Summer Meadow Race Flight (with Analog FX + Betaflight OSD + Trailing Sticks)
@@ -162,7 +162,7 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
 
     // 4. Controller Monitor & AUX Switch Binder screen (Monokai)
     cfg.throttle_mode = ThrottleMode::RcFull;
-    renderer.render_controller_screen(&cfg, &input);
+    renderer.render_controller_screen(&cfg, &input, 0.8);
     png::save_rgb565_png(&dir.join("04-controller.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     println!("Saved 4 CardputerZero 320x170 screenshots to {}", dir.display());
@@ -174,26 +174,38 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     let mut renderer = Renderer::new();
     let input = InputManager::new();
 
-    // 1. Monokai Main Menu (Default)
+    // 1. Monokai Main Menu (Default — Fly Briefing + Minimap)
     cfg.ui_theme = UiTheme::Monokai;
-    renderer.render_main_menu(&cfg, 0, &input, None);
+    renderer.render_main_menu(&cfg, 0, &input, None, 0.8);
     png::save_rgb565_png(&dir.join("monokai-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 2. StickTime Main Menu (Alternate)
+    // 2. StickTime Main Menu (Track Selector + Minimap)
     cfg.ui_theme = UiTheme::StickTime;
-    renderer.render_main_menu(&cfg, 0, &input, None);
+    renderer.render_main_menu(&cfg, 1, &input, None, 0.8);
     png::save_rgb565_png(&dir.join("sticktime-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 3. Monokai Drone Tuning Menu (real physical units: Weight (g): 37 with Lava II 680mAh)
+    // 3. Monokai Drone Workbench (Telemetry + Live Throttle Curve)
     cfg.ui_theme = UiTheme::Monokai;
     cfg.set_battery_pack(BatteryPack::LavaII680);
-    renderer.render_drone_tuning_menu(&cfg, 3);
+    renderer.render_drone_tuning_menu(&cfg, 3, 0.8);
     png::save_rgb565_png(&dir.join("monokai-drone-tuning.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 4. Monokai Settings showing UI Theme + Stick OSD: Trails
+    // 4. Monokai Settings — Rates Tab (Live Betaflight Actual Rates Curve)
     cfg.flight_mode = FlightMode::Horizon;
     cfg.stick_overlay = StickOverlay::Trails;
-    renderer.render_settings_menu(&cfg, 10, false, None);
+    renderer.render_settings_menu(&cfg, SettingsTab::Rates, 2, false, false, None, 0.8);
+    png::save_rgb565_png(&dir.join("monokai-settings-rates.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 5. Monokai Settings — Camera Tab (Live Camera Tilt & FOV Cone)
+    renderer.render_settings_menu(&cfg, SettingsTab::Camera, 0, false, false, None, 0.8);
+    png::save_rgb565_png(&dir.join("monokai-settings-camera.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 6. Monokai Settings — System Tab (Display, HDMI Res, LCD on HDMI)
+    renderer.render_settings_menu(&cfg, SettingsTab::System, 5, false, false, Some("720p"), 0.8);
+    png::save_rgb565_png(&dir.join("monokai-settings-system.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 7. Monokai Settings — Flight Tab
+    renderer.render_settings_menu(&cfg, SettingsTab::Flight, 1, false, false, None, 0.8);
     png::save_rgb565_png(&dir.join("monokai-settings.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 4. Clean zero-overlap Wireframe Bando + Trailing Sticks OSD
@@ -322,7 +334,10 @@ fn main() {
     let mut menu_idx: usize = 0;
     let mut drone_idx: usize = 0;
     let mut pause_idx: usize = 0;
-    let mut settings_idx: usize = 0;
+    let mut settings_tab = SettingsTab::Flight;
+    let mut settings_row: usize = 0;
+    let mut settings_focus_tabs = false;
+    let mut menu_time: f32 = 0.0;
     let mut quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
     quad.control_source = input.control_source();
 
@@ -345,6 +360,9 @@ fn main() {
         let hdmi_tag = display.hdmi_compact_tag();
 
         let in_menu = screen != AppScreen::Flying;
+        if in_menu {
+            menu_time += dt;
+        }
         let motors_sounding = !in_menu && quad.armed && (!quad.turtle_active || quad.motor_thr > 0.03);
         audio.set_flying(motors_sounding, cfg.analog_filter);
         input.poll(dt, in_menu, &cfg);
@@ -400,11 +418,12 @@ fn main() {
                             }
                         }
                         3 => {
-                            cfg.theme = cfg.theme.next();
+                            cfg.theme = if act.left { cfg.theme.prev() } else { cfg.theme.next() };
                             cfg.save();
                         }
                         4 if act.select => {
-                            settings_idx = 0;
+                            settings_row = 0;
+                            settings_focus_tabs = false;
                             sub_return = AppScreen::MainMenu;
                             screen = AppScreen::Settings;
                         }
@@ -415,7 +434,7 @@ fn main() {
                         _ => {}
                     }
                 }
-                renderer.render_main_menu(&cfg, menu_idx, &input, hdmi_tag.as_deref());
+                renderer.render_main_menu(&cfg, menu_idx, &input, hdmi_tag.as_deref(), menu_time);
             }
             AppScreen::DroneTuning => {
                 const NUM_DRONE: usize = 11;
@@ -447,7 +466,6 @@ fn main() {
                                 };
                             }
                             3 => {
-                                // Weight (g): 1g steps for whoops (<=100g), 5g for micros, 10g for 5"
                                 let step: u16 = if cfg.weight_g <= 100 { 1 } else if cfg.weight_g <= 250 { 5 } else { 10 };
                                 cfg.weight_g = if act.left {
                                     cfg.weight_g.saturating_sub(step).max(15)
@@ -456,7 +474,6 @@ fn main() {
                                 };
                             }
                             4 => {
-                                // Thrust (g): 5g steps for whoops (<=300g), 20g for micros, 100g for 5"
                                 let step: u16 = if cfg.thrust_g <= 300 { 5 } else if cfg.thrust_g <= 1000 { 20 } else { 100 };
                                 cfg.thrust_g = if act.left {
                                     cfg.thrust_g.saturating_sub(step).max(40)
@@ -465,7 +482,6 @@ fn main() {
                                 };
                             }
                             5 => {
-                                // Air Drag (0.05..=1.00, step 0.02)
                                 cfg.air_drag = if act.left {
                                     cfg.air_drag.saturating_sub(2).max(5)
                                 } else {
@@ -473,7 +489,6 @@ fn main() {
                                 };
                             }
                             6 => {
-                                // Rotor Grip (0.00..=1.00, step 0.02)
                                 cfg.rotor_grip = if act.left {
                                     cfg.rotor_grip.saturating_sub(2)
                                 } else {
@@ -481,7 +496,6 @@ fn main() {
                                 };
                             }
                             7 => {
-                                // Motor Lag (ms): 5..=45 ms, step 1 ms
                                 cfg.motor_lag_ms = if act.left {
                                     cfg.motor_lag_ms.saturating_sub(1).max(5)
                                 } else {
@@ -489,7 +503,6 @@ fn main() {
                                 };
                             }
                             8 => {
-                                // Throttle Mid (0.20..=0.70, step 0.02)
                                 cfg.thr_mid = if act.left {
                                     cfg.thr_mid.saturating_sub(2).max(20)
                                 } else {
@@ -497,7 +510,6 @@ fn main() {
                                 };
                             }
                             9 => {
-                                // Throttle Expo (0.00..=0.80, step 0.05)
                                 cfg.thr_expo = if act.left {
                                     cfg.thr_expo.saturating_sub(5)
                                 } else {
@@ -512,7 +524,7 @@ fn main() {
                         cfg.save();
                     }
                 }
-                renderer.render_drone_tuning_menu(&cfg, drone_idx);
+                renderer.render_drone_tuning_menu(&cfg, drone_idx, menu_time);
             }
             AppScreen::Flying => {
                 if act.back {
@@ -609,7 +621,8 @@ fn main() {
                                 screen = AppScreen::DroneTuning;
                             }
                             3 => {
-                                settings_idx = 0;
+                                settings_row = 0;
+                                settings_focus_tabs = false;
                                 sub_return = AppScreen::Paused;
                                 screen = AppScreen::Settings;
                             }
@@ -621,124 +634,175 @@ fn main() {
                     }
                 }
                 renderer.render_flight(&quad, &cfg, track, sticks, fps_display, last_render_ms);
-                renderer.render_pause_menu(&cfg, pause_idx);
+                renderer.render_pause_menu(&cfg, &quad, pause_idx);
             }
             AppScreen::Settings => {
-                const NUM_SETTINGS: usize = 20;
                 let imu_mode = input.control_source() == FlightControlSource::ImuSimplified;
                 if act.back {
                     cfg.save();
                     screen = sub_return;
                 } else {
-                    if act.up { settings_idx = (settings_idx + NUM_SETTINGS - 1) % NUM_SETTINGS; }
-                    if act.down { settings_idx = (settings_idx + 1) % NUM_SETTINGS; }
-                    if act.left || act.right || act.select {
-                        match settings_idx {
-                            0 => cfg.game_mode = cfg.game_mode.toggle(),
-                            1 => {
-                                if !imu_mode {
-                                    cfg.flight_mode = if act.left {
-                                        cfg.flight_mode.prev()
+                    if act.tab_prev {
+                        settings_tab = settings_tab.prev();
+                        settings_row = 0;
+                    } else if act.tab_next {
+                        settings_tab = settings_tab.next();
+                        settings_row = 0;
+                    } else if settings_focus_tabs {
+                        if act.left {
+                            settings_tab = settings_tab.prev();
+                            settings_row = 0;
+                        } else if act.right {
+                            settings_tab = settings_tab.next();
+                            settings_row = 0;
+                        } else if act.down || act.select {
+                            settings_focus_tabs = false;
+                            settings_row = 0;
+                        } else if act.up {
+                            settings_focus_tabs = false;
+                            settings_row = settings_tab.row_count().saturating_sub(1);
+                        }
+                    } else {
+                        let rows = settings_tab.row_count();
+                        if act.up {
+                            if settings_row == 0 {
+                                settings_focus_tabs = true;
+                            } else {
+                                settings_row -= 1;
+                            }
+                        } else if act.down {
+                            if settings_row + 1 >= rows {
+                                settings_focus_tabs = true;
+                            } else {
+                                settings_row += 1;
+                            }
+                        } else if act.left || act.right || act.select {
+                            match (settings_tab, settings_row) {
+                                // FLIGHT tab
+                                (SettingsTab::Flight, 0) => cfg.game_mode = cfg.game_mode.toggle(),
+                                (SettingsTab::Flight, 1) => {
+                                    if !imu_mode {
+                                        cfg.flight_mode = if act.left {
+                                            cfg.flight_mode.prev()
+                                        } else {
+                                            cfg.flight_mode.next()
+                                        };
+                                    }
+                                }
+                                (SettingsTab::Flight, 2) => cfg.stick_mode = cfg.stick_mode.toggle(),
+                                (SettingsTab::Flight, 3) => cfg.throttle_mode = cfg.throttle_mode.toggle(),
+
+                                // RATES tab
+                                (SettingsTab::Rates, 0) => {
+                                    let next = if act.left {
+                                        cfg.rates.prev_preset()
                                     } else {
-                                        cfg.flight_mode.next()
+                                        cfg.rates.next_preset()
+                                    };
+                                    cfg.apply_rate_preset(next);
+                                }
+                                (SettingsTab::Rates, 1) => {
+                                    cfg.rate_center = if act.left {
+                                        cfg.rate_center.saturating_sub(10).max(50)
+                                    } else {
+                                        (cfg.rate_center + 10).min(400)
+                                    };
+                                    cfg.rates = RatesPreset::Custom;
+                                }
+                                (SettingsTab::Rates, 2) => {
+                                    cfg.rate_max = if act.left {
+                                        cfg.rate_max.saturating_sub(20).max(300)
+                                    } else {
+                                        (cfg.rate_max + 20).min(1200)
+                                    };
+                                    cfg.rates = RatesPreset::Custom;
+                                }
+                                (SettingsTab::Rates, 3) => {
+                                    cfg.rate_expo = if act.left {
+                                        cfg.rate_expo.saturating_sub(5)
+                                    } else {
+                                        (cfg.rate_expo + 5).min(90)
+                                    };
+                                    cfg.rates = RatesPreset::Custom;
+                                }
+
+                                // CAMERA tab
+                                (SettingsTab::Camera, 0) => {
+                                    if act.left {
+                                        cfg.camera_tilt_deg = cfg.camera_tilt_deg.saturating_sub(5);
+                                    } else {
+                                        cfg.camera_tilt_deg = (cfg.camera_tilt_deg + 5).min(50);
+                                    }
+                                }
+                                (SettingsTab::Camera, 1) => {
+                                    cfg.fov_deg = if act.left {
+                                        cfg.fov_deg.saturating_sub(5).max(75)
+                                    } else {
+                                        (cfg.fov_deg + 5).min(105)
                                     };
                                 }
-                            }
-                            2 => {
-                                let next = cfg.rates.next_preset();
-                                cfg.apply_rate_preset(next);
-                            }
-                            3 => {
-                                cfg.rate_center = if act.left {
-                                    cfg.rate_center.saturating_sub(10).max(50)
-                                } else {
-                                    (cfg.rate_center + 10).min(400)
-                                };
-                                cfg.rates = RatesPreset::Custom;
-                            }
-                            4 => {
-                                cfg.rate_max = if act.left {
-                                    cfg.rate_max.saturating_sub(20).max(300)
-                                } else {
-                                    (cfg.rate_max + 20).min(1200)
-                                };
-                                cfg.rates = RatesPreset::Custom;
-                            }
-                            5 => {
-                                cfg.rate_expo = if act.left {
-                                    cfg.rate_expo.saturating_sub(5)
-                                } else {
-                                    (cfg.rate_expo + 5).min(90)
-                                };
-                                cfg.rates = RatesPreset::Custom;
-                            }
-                            6 => {
-                                if act.left {
-                                    cfg.camera_tilt_deg = cfg.camera_tilt_deg.saturating_sub(5);
-                                } else {
-                                    cfg.camera_tilt_deg = (cfg.camera_tilt_deg + 5).min(50);
+                                (SettingsTab::Camera, 2) => cfg.analog_filter = !cfg.analog_filter,
+                                (SettingsTab::Camera, 3) => {
+                                    cfg.stick_overlay = if act.left {
+                                        cfg.stick_overlay.prev()
+                                    } else {
+                                        cfg.stick_overlay.next()
+                                    };
+                                    renderer.reset_stick_trail();
                                 }
+                                (SettingsTab::Camera, 4) => cfg.debug_osd = !cfg.debug_osd,
+
+                                // SYSTEM tab
+                                (SettingsTab::System, 0) => cfg.ui_theme = cfg.ui_theme.toggle(),
+                                (SettingsTab::System, 1) => cfg.detail_high = !cfg.detail_high,
+                                (SettingsTab::System, 2) => cfg.sky_detail = !cfg.sky_detail,
+                                (SettingsTab::System, 3) => {
+                                    cfg.sound_on = !cfg.sound_on;
+                                    audio.set_enabled(cfg.sound_on);
+                                }
+                                (SettingsTab::System, 4) => {
+                                    cfg.display_output = if act.left {
+                                        cfg.display_output.prev()
+                                    } else {
+                                        cfg.display_output.next()
+                                    };
+                                    display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, true);
+                                    let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
+                                    renderer.set_size(rw, rh);
+                                }
+                                (SettingsTab::System, 5) => {
+                                    cfg.hdmi_resolution = if act.left {
+                                        cfg.hdmi_resolution.prev()
+                                    } else {
+                                        cfg.hdmi_resolution.next()
+                                    };
+                                    let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
+                                    renderer.set_size(rw, rh);
+                                }
+                                (SettingsTab::System, 6) => {
+                                    cfg.hdmi_lcd_backlight = if act.left {
+                                        cfg.hdmi_lcd_backlight.prev()
+                                    } else {
+                                        cfg.hdmi_lcd_backlight.next()
+                                    };
+                                    display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, true);
+                                }
+                                _ => {}
                             }
-                            7 => {
-                                cfg.fov_deg = if act.left {
-                                    cfg.fov_deg.saturating_sub(5).max(75)
-                                } else {
-                                    (cfg.fov_deg + 5).min(105)
-                                };
-                            }
-                            8 => cfg.analog_filter = !cfg.analog_filter,
-                            9 => cfg.ui_theme = cfg.ui_theme.toggle(),
-                            10 => {
-                                cfg.stick_overlay = if act.left {
-                                    cfg.stick_overlay.prev()
-                                } else {
-                                    cfg.stick_overlay.next()
-                                };
-                                renderer.reset_stick_trail();
-                            }
-                            11 => {
-                                cfg.sound_on = !cfg.sound_on;
-                                audio.set_enabled(cfg.sound_on);
-                            }
-                            12 => cfg.debug_osd = !cfg.debug_osd,
-                            13 => cfg.detail_high = !cfg.detail_high,
-                            14 => cfg.sky_detail = !cfg.sky_detail,
-                            15 => cfg.stick_mode = cfg.stick_mode.toggle(),
-                            16 => cfg.throttle_mode = cfg.throttle_mode.toggle(),
-                            17 => {
-                                cfg.display_output = if act.left {
-                                    cfg.display_output.prev()
-                                } else {
-                                    cfg.display_output.next()
-                                };
-                                display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, true);
-                                let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
-                                renderer.set_size(rw, rh);
-                            }
-                            18 => {
-                                cfg.hdmi_resolution = if act.left {
-                                    cfg.hdmi_resolution.prev()
-                                } else {
-                                    cfg.hdmi_resolution.next()
-                                };
-                                let (rw, rh) = display.desired_render_size(cfg.hdmi_resolution);
-                                renderer.set_size(rw, rh);
-                            }
-                            19 => {
-                                cfg.hdmi_lcd_backlight = if act.left {
-                                    cfg.hdmi_lcd_backlight.prev()
-                                } else {
-                                    cfg.hdmi_lcd_backlight.next()
-                                };
-                                display.sync_hotplug(cfg.display_output, cfg.hdmi_lcd_backlight, true);
-                            }
-                            _ => {}
+                            cfg.save();
                         }
-                        cfg.save();
                     }
                 }
                 let settings_hdmi_tag = display.hdmi_compact_tag();
-                renderer.render_settings_menu(&cfg, settings_idx, imu_mode, settings_hdmi_tag.as_deref());
+                renderer.render_settings_menu(
+                    &cfg,
+                    settings_tab,
+                    settings_row,
+                    settings_focus_tabs,
+                    imu_mode,
+                    settings_hdmi_tag.as_deref(),
+                    menu_time,
+                );
             }
             AppScreen::Controller => {
                 if input.calib.is_some() {
@@ -784,7 +848,7 @@ fn main() {
                     cfg.save();
                     input.scan_devices();
                 }
-                renderer.render_controller_screen(&cfg, &input);
+                renderer.render_controller_screen(&cfg, &input, menu_time);
             }
         }
 
