@@ -16,7 +16,7 @@ fi
 rm -rf "$STAGE"
 mkdir -p \
     "$STAGE/DEBIAN" \
-    "$STAGE/etc/udev/rules.d" \
+    "$STAGE/usr/lib/udev/rules.d" \
     "$STAGE/usr/share/APPLaunch/applications" \
     "$STAGE/usr/share/APPLaunch/bin" \
     "$STAGE/usr/share/APPLaunch/share/images" \
@@ -28,14 +28,14 @@ chmod 755 "$STAGE/usr/share/APPLaunch/bin/stickzero"
 cp "$ICON" "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 chmod 644 "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 
-cat > "$STAGE/etc/udev/rules.d/70-stickzero-hidraw.rules" <<'EOF'
+cat > "$STAGE/usr/lib/udev/rules.d/70-stickzero.rules" <<'EOF'
 # Allow StickZero (input group / active seat) to read Bluetooth & ELRS HID raw reports
 # so ExpressLRS BLE Joystick CH8 (duplicate Slider usage 0x36) is exposed as A7+ (SD).
 ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ELRS*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ExpressLRS*", GROUP="input", MODE="0660", TAG+="uaccess"
 EOF
-chmod 644 "$STAGE/etc/udev/rules.d/70-stickzero-hidraw.rules"
+chmod 644 "$STAGE/usr/lib/udev/rules.d/70-stickzero.rules"
 
 cat > "$STAGE/usr/share/APPLaunch/applications/stickzero.desktop" <<'EOF'
 [Desktop Entry]

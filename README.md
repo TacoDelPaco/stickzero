@@ -69,7 +69,7 @@ curl -fLO https://raw.githubusercontent.com/TacoDelPaco/stickzero/main/dist/stic
 
 StickZero drains controller `evdev` + sibling `/dev/hidraw*` packets on a dedicated zero-contention background thread (`poll()` + 256-event batch reads + lock-free `SYN_DROPPED` resync), automatically stops lingering `bluetoothctl` discovery scans when a BT controller connects, and recovers **ExpressLRS BLE CH8 (`SD` / AUX 4)** directly from `/dev/hidraw*` onto **`A7+`** (matching EdgeTX USB) when Linux's `hid-input` drops ExpressLRS's duplicate `Slider` (`0x36`) usage.
 
-Installing the `.deb` package automatically configures `/etc/udev/rules.d/70-stickzero-hidraw.rules` (for non-root `/dev/hidraw*` access) and tunes `/etc/bluetooth/main.conf` (`[LE]` `MinConnectionInterval=6`, `MaxConnectionInterval=9`, `ConnectionLatency=0`). For best wireless responsiveness:
+Installing the `.deb` package automatically configures `/usr/lib/udev/rules.d/70-stickzero.rules` (for non-root `/dev/hidraw*` access) and tunes `/etc/bluetooth/main.conf` (`[LE]` `MinConnectionInterval=6`, `MaxConnectionInterval=9`, `ConnectionLatency=0`). For best wireless responsiveness:
 
 1. **ExpressLRS BLE Joystick (RadioMaster Pocket, etc.)**: Before starting **BLE Joystick**, open `SYS → ExpressLRS` and set **Packet Rate** to **`100Hz Full`** (or `50Hz`). Running 250–500 Hz floods BLE faster than the link can drain and causes intermittent lag spikes.
 2. **Reconnect once after updating `.deb`**: Power-cycle / reconnect your Bluetooth radio so BlueZ negotiates the tightened 7.5–11.25 ms connection interval.
