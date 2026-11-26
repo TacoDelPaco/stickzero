@@ -29,7 +29,7 @@ use input::{FlightControlSource, InputManager};
 use linux_sys::{signal, SIGINT, SIGTERM};
 use math::{Quat, Vec3};
 use physics::{QuadState, StickInput, PHYSICS_DT};
-use renderer::{Renderer, SettingsTab};
+use renderer::{controller_actions, ControllerAction, Renderer, SettingsTab};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -160,9 +160,13 @@ fn generate_screenshots(dir: &Path) -> Result<(), String> {
     renderer.render_flight(&q2, &cfg, bando, sticks2, 60, 1.1);
     png::save_rgb565_png(&dir.join("03-bando-night.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
-    // 4. Controller Monitor & AUX Switch Binder screen (Monokai)
+    // 4. Controller Setup screen (Monokai, connected ELRS radio preview)
     cfg.throttle_mode = ThrottleMode::RcFull;
-    renderer.render_controller_screen(&cfg, &input, 0.8);
+    cfg.aux_arm = AuxBinding::Axis { code: 4, invert: false };
+    cfg.aux_mode = AuxBinding::Axis { code: 5, invert: false };
+    cfg.aux_turtle = AuxBinding::Axis { code: 7, invert: false };
+    let demo_radio = InputManager::demo_radio_for_preview();
+    renderer.render_controller_screen(&cfg, &demo_radio, 0, false, None, 0.8);
     png::save_rgb565_png(&dir.join("04-controller.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     println!("Saved 4 CardputerZero 320x170 screenshots to {}", dir.display());
@@ -173,8 +177,9 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     let mut cfg = Config::default();
     let mut renderer = Renderer::new();
     let input = InputManager::new();
+    let demo_radio = InputManager::demo_radio_for_preview();
 
-    // 1. Monokai Main Menu (Default — Fly Briefing + Minimap)
+    // 1. Monokai Main Menu (Default — stylized STICKZERO logo + Fly Briefing)
     cfg.ui_theme = UiTheme::Monokai;
     renderer.render_main_menu(&cfg, 0, &input, None, 0.8);
     png::save_rgb565_png(&dir.join("monokai-main-menu.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
@@ -207,6 +212,21 @@ fn generate_previews(dir: &Path) -> Result<(), String> {
     // 7. Monokai Settings — Flight Tab
     renderer.render_settings_menu(&cfg, SettingsTab::Flight, 1, false, false, None, 0.8);
     png::save_rgb565_png(&dir.join("monokai-settings.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 8. Controller Setup — No Controller connected (clean onboarding, zero debug clutter)
+    renderer.render_controller_screen(&cfg, &input, 0, false, None, 0.8);
+    png::save_rgb565_png(&dir.join("monokai-controller-none.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 9. Controller Setup — Connected BT/USB Radio (clean gimbals + AUX badges)
+    cfg.aux_arm = AuxBinding::Axis { code: 4, invert: false };
+    cfg.aux_mode = AuxBinding::Axis { code: 5, invert: false };
+    cfg.aux_turtle = AuxBinding::None;
+    renderer.render_controller_screen(&cfg, &demo_radio, 0, false, None, 0.8);
+    png::save_rgb565_png(&dir.join("monokai-controller-radio.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
+
+    // 10. Controller Setup — Connected BT/USB Radio (DEBUG ON: channel bars + raw evdev ABS)
+    renderer.render_controller_screen(&cfg, &demo_radio, 3, true, None, 0.8);
+    png::save_rgb565_png(&dir.join("monokai-controller-debug.png"), SCREEN_W, SCREEN_H, &*renderer.fb)?;
 
     // 4. Clean zero-overlap Wireframe Bando + Trailing Sticks OSD
     cfg.theme = VisualTheme::Wireframe;
@@ -337,6 +357,9 @@ fn main() {
     let mut settings_tab = SettingsTab::Flight;
     let mut settings_row: usize = 0;
     let mut settings_focus_tabs = false;
+    let mut ctrl_idx: usize = 0;
+    let mut ctrl_debug = false;
+    let mut ctrl_note: Option<(&'static str, Instant)> = None;
     let mut menu_time: f32 = 0.0;
     let mut quad = QuadState::spawn(&TRACKS[cfg.track_index], &cfg);
     quad.control_source = input.control_source();
@@ -429,6 +452,8 @@ fn main() {
                         }
                         5 if act.select => {
                             input.scan_devices();
+                            ctrl_idx = 0;
+                            ctrl_note = None;
                             screen = AppScreen::Controller;
                         }
                         _ => {}
@@ -805,50 +830,129 @@ fn main() {
                 );
             }
             AppScreen::Controller => {
+                let ctrl_src = input.control_source();
+                let multi_dev = input.candidate_count > 1;
+                let actions = controller_actions(ctrl_src, multi_dev);
+                if ctrl_idx >= actions.len() {
+                    ctrl_idx = 0;
+                }
+                if ctrl_src == FlightControlSource::None {
+                    ctrl_debug = false;
+                }
+
                 if input.calib.is_some() {
                     if act.back {
                         input.calib = None;
+                        ctrl_note = Some(("Calibration canceled", Instant::now()));
                     } else {
                         input.update_calibration(&mut cfg);
+                        if input.calib.is_none() {
+                            ctrl_note = Some(("Sticks calibrated!", Instant::now()));
+                        }
                     }
                 } else if input.aux_wiz.is_some() {
                     if act.back {
                         input.aux_wiz = None;
+                        ctrl_note = Some(("AUX binding canceled", Instant::now()));
                     } else {
                         input.update_aux_wizard(&mut cfg, act.select);
+                        if input.aux_wiz.is_none() {
+                            ctrl_note = Some(("AUX switches saved!", Instant::now()));
+                        }
                     }
                 } else if act.back {
                     cfg.save();
                     screen = AppScreen::MainMenu;
-                } else if act.calibrate {
-                    if input.has_controller() {
-                        input.start_calibration();
-                    } else if input.has_imu() {
-                        input.recenter_imu();
+                } else {
+                    if act.up {
+                        ctrl_idx = (ctrl_idx + actions.len() - 1) % actions.len();
                     }
-                } else if act.bind_aux {
-                    input.start_aux_wizard(&cfg);
-                } else if act.next_device {
-                    input.cycle_device();
-                } else if act.select || act.left || act.right {
-                    cfg.throttle_mode = cfg.throttle_mode.toggle();
-                    cfg.save();
-                } else if act.respawn {
-                    cfg.axis_thr = None;
-                    cfg.axis_yaw = None;
-                    cfg.axis_pit = None;
-                    cfg.axis_rol = None;
-                    cfg.invert_throttle = false;
-                    cfg.invert_yaw = false;
-                    cfg.invert_pitch = false;
-                    cfg.invert_roll = false;
-                    cfg.aux_arm = AuxBinding::None;
-                    cfg.aux_mode = AuxBinding::None;
-                    cfg.aux_turtle = AuxBinding::None;
-                    cfg.save();
-                    input.scan_devices();
+                    if act.down {
+                        ctrl_idx = (ctrl_idx + 1) % actions.len();
+                    }
+                    let chosen = actions[ctrl_idx];
+                    let toggle_hit = (act.left || act.right)
+                        && matches!(
+                            chosen,
+                            ControllerAction::ToggleThrottleMode | ControllerAction::ToggleRawDebug
+                        );
+                    if act.select || toggle_hit {
+                        match chosen {
+                            ControllerAction::CalibrateSticks => {
+                                if input.has_controller() {
+                                    input.start_calibration();
+                                }
+                            }
+                            ControllerAction::BindAux => {
+                                if input.has_controller() {
+                                    input.start_aux_wizard(&cfg);
+                                }
+                            }
+                            ControllerAction::ToggleThrottleMode => {
+                                cfg.throttle_mode = cfg.throttle_mode.toggle();
+                                cfg.save();
+                            }
+                            ControllerAction::ToggleRawDebug => {
+                                ctrl_debug = !ctrl_debug;
+                            }
+                            ControllerAction::NextDevice => {
+                                input.cycle_device();
+                                ctrl_note = Some(("Switched controller", Instant::now()));
+                            }
+                            ControllerAction::ResetMapping => {
+                                cfg.axis_thr = None;
+                                cfg.axis_yaw = None;
+                                cfg.axis_pit = None;
+                                cfg.axis_rol = None;
+                                cfg.invert_throttle = false;
+                                cfg.invert_yaw = false;
+                                cfg.invert_pitch = false;
+                                cfg.invert_roll = false;
+                                cfg.aux_arm = AuxBinding::None;
+                                cfg.aux_mode = AuxBinding::None;
+                                cfg.aux_turtle = AuxBinding::None;
+                                cfg.save();
+                                input.scan_devices();
+                                ctrl_note = Some(("Mappings reset to Auto", Instant::now()));
+                            }
+                            ControllerAction::ZeroImu => {
+                                input.recenter_imu();
+                                ctrl_note = Some(("IMU level zeroed!", Instant::now()));
+                            }
+                            ControllerAction::ScanDevices => {
+                                input.scan_devices();
+                                ctrl_note = if input.has_controller() {
+                                    Some(("Controller detected!", Instant::now()))
+                                } else {
+                                    Some(("Scan done: no USB/BT", Instant::now()))
+                                };
+                            }
+                            ControllerAction::Back => {
+                                cfg.save();
+                                screen = AppScreen::MainMenu;
+                            }
+                        }
+                    }
                 }
-                renderer.render_controller_screen(&cfg, &input, menu_time);
+
+                let active_note = ctrl_note.and_then(|(msg, ts)| {
+                    if ts.elapsed() < Duration::from_secs(3) {
+                        Some(msg)
+                    } else {
+                        None
+                    }
+                });
+                if active_note.is_none() {
+                    ctrl_note = None;
+                }
+                renderer.render_controller_screen(
+                    &cfg,
+                    &input,
+                    ctrl_idx,
+                    ctrl_debug,
+                    active_note,
+                    menu_time,
+                );
             }
         }
 

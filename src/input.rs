@@ -687,12 +687,60 @@ impl InputManager {
         mgr
     }
 
+    /// Construct a deterministic mock ELRS radio for `--screenshot` / `--preview` UI renders.
+    pub fn demo_radio_for_preview() -> Self {
+        let mut mgr = Self::new();
+        let mut axes = [AxisCal::default(); ABS_MAX + 1];
+        for &(code, val) in &[
+            (ABS_X as usize, 1180),      // Roll slightly right
+            (ABS_Y as usize, 1260),      // Pitch slightly forward
+            (ABS_Z as usize, 980),       // Throttle ~48%
+            (ABS_RX as usize, 1024),     // Yaw centered
+            (ABS_RY as usize, 2047),     // CH5 ARM switch
+            (ABS_RZ as usize, 1024),     // CH6 MODE switch
+            (ABS_RUDDER as usize, 0),    // CH8 TURTLE switch
+        ] {
+            axes[code] = AxisCal {
+                present: true,
+                min: 0,
+                max: 2047,
+                value: val,
+            };
+        }
+        mgr.gamepad = Some(GamepadDevice {
+            shared: Arc::new(Mutex::new(GamepadLiveState {
+                axes,
+                keys_down: [0u64; MAX_KEY_CODE / 64],
+                pressed_buttons: Vec::new(),
+                hat_up: false,
+                hat_down: false,
+                hat_left: false,
+                hat_right: false,
+                disconnected: false,
+            })),
+            stop: Arc::new(AtomicBool::new(true)),
+            reader: None,
+            path: "/dev/input/event0".to_string(),
+            name: "RadioMaster Pocket ELRS".to_string(),
+            kind: ControllerKind::RcRadio,
+            bustype: BUS_BLUETOOTH,
+            axes,
+            keys_down: [0u64; MAX_KEY_CODE / 64],
+            frame_btns_pressed: Vec::new(),
+            frame_btn_pressed: None,
+            last_btn_seen: None,
+        });
+        mgr.candidate_count = 1;
+        mgr
+    }
+
     #[inline]
     pub fn has_controller(&self) -> bool {
         self.gamepad.is_some()
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn has_imu(&self) -> bool {
         self.imu.is_available()
     }

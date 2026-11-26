@@ -108,12 +108,75 @@ impl SettingsTab {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ControllerAction {
+    CalibrateSticks,
+    BindAux,
+    ToggleThrottleMode,
+    ToggleRawDebug,
+    NextDevice,
+    ResetMapping,
+    ZeroImu,
+    ScanDevices,
+    Back,
+}
+
+impl ControllerAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CalibrateSticks => "CALIBRATE",
+            Self::BindAux => "BIND AUX",
+            Self::ToggleThrottleMode => "THROTTLE",
+            Self::ToggleRawDebug => "DEBUG",
+            Self::NextDevice => "NEXT DEV",
+            Self::ResetMapping => "RESET MAP",
+            Self::ZeroImu => "ZERO IMU",
+            Self::ScanDevices => "SCAN DEV",
+            Self::Back => "BACK",
+        }
+    }
+}
+
+/// Returns the contextual action list shown on the Controller Setup screen
+/// so only options relevant to the connected hardware (USB/BT, IMU, or None) appear.
+pub fn controller_actions(ctrl_src: FlightControlSource, multi_dev: bool) -> &'static [ControllerAction] {
+    match ctrl_src {
+        FlightControlSource::Controller if multi_dev => &[
+            ControllerAction::CalibrateSticks,
+            ControllerAction::BindAux,
+            ControllerAction::ToggleThrottleMode,
+            ControllerAction::ToggleRawDebug,
+            ControllerAction::NextDevice,
+            ControllerAction::ResetMapping,
+        ],
+        FlightControlSource::Controller => &[
+            ControllerAction::CalibrateSticks,
+            ControllerAction::BindAux,
+            ControllerAction::ToggleThrottleMode,
+            ControllerAction::ToggleRawDebug,
+            ControllerAction::ResetMapping,
+        ],
+        FlightControlSource::ImuSimplified => &[
+            ControllerAction::ZeroImu,
+            ControllerAction::ScanDevices,
+            ControllerAction::ToggleRawDebug,
+            ControllerAction::Back,
+        ],
+        FlightControlSource::None => &[
+            ControllerAction::ScanDevices,
+            ControllerAction::ResetMapping,
+            ControllerAction::Back,
+        ],
+    }
+}
+
 #[derive(Copy, Clone)]
 struct UiColors {
     bg: u16,
     header_bg: u16,
     header_line: u16,
     title: u16,
+    brand_zero: u16,
     tag: u16,
     sel_bg: u16,
     sel_border: u16,
@@ -135,6 +198,7 @@ fn ui_colors(theme: UiTheme) -> UiColors {
             header_bg: rgb565(29, 30, 26),    // #1D1E1A deeper header bar
             header_line: rgb565(249, 38, 114),// #F92672 Monokai magenta/pink
             title: rgb565(248, 248, 242),     // #F8F8F2 off-white
+            brand_zero: rgb565(249, 38, 114), // #F92672 Monokai pink for "ZERO"
             tag: rgb565(102, 217, 239),       // #66D9EF Monokai cyan
             sel_bg: rgb565(62, 61, 50),       // #3E3D32 Monokai selection
             sel_border: rgb565(230, 219, 116),// #E6DB74 Monokai yellow border
@@ -153,6 +217,7 @@ fn ui_colors(theme: UiTheme) -> UiColors {
             header_bg: rgb565(22, 32, 52),
             header_line: rgb565(65, 140, 240),
             title: rgb565(255, 255, 255),
+            brand_zero: rgb565(120, 220, 255),
             tag: rgb565(120, 220, 255),
             sel_bg: rgb565(36, 66, 118),
             sel_border: rgb565(90, 190, 255),
@@ -1978,7 +2043,16 @@ impl Renderer {
         self.fill_rect_alpha(0, 0, self.w(), bar_h, ui.header_bg, 7);
         self.fill_rect(0, 0, 3 * s, bar_h, ui.header_line);
         self.fill_rect(0, bar_h, self.w(), s, ui.header_line);
-        self.ui_draw_text(8, 3, title, ui.title, 2, false);
+
+        if title == "STICKZERO" {
+            let shadow = rgb565(12, 12, 10);
+            self.ui_draw_text(9, 4, "STICK", shadow, 2, false);
+            self.ui_draw_text(69, 4, "ZERO", shadow, 2, false);
+            self.ui_draw_text(8, 3, "STICK", ui.title, 2, false);
+            self.ui_draw_text(68, 3, "ZERO", ui.brand_zero, 2, false);
+        } else {
+            self.ui_draw_text(8, 3, title, ui.title, 2, false);
+        }
 
         let rw = (right_badge.len() as i32) * 6;
         let pill_w = rw + if dot_col.is_some() { 16 } else { 8 };
@@ -2452,33 +2526,56 @@ impl Renderer {
                 self.ui_draw_text(cx + 6, cy + 5, "RADIO / INPUT", ui.tag, 1, false);
                 self.ui_draw_text(cx + cw - (ctrl_short.len() as i32) * 6 - 5, cy + 5, ctrl_short, ctrl_dot, 1, false);
 
-                let cname: String = input.controller_name().chars().take(30).collect();
-                self.ui_draw_text(cx + 6, cy + 21, &cname, ui.title, 1, false);
+                match input.control_source() {
+                    FlightControlSource::Controller => {
+                        let cname: String = input.controller_name().chars().take(30).collect();
+                        self.ui_draw_text(cx + 6, cy + 21, &cname, ui.title, 1, false);
 
-                let sticks = input.flight_sticks(cfg);
-                let s = self.ui_scale();
-                let (ox, oy) = self.ui_origin();
-                if input.control_source() == FlightControlSource::ImuSimplified {
-                    let thr_pct = (sticks.throttle * 100.0).round() as u8;
-                    self.draw_imu_throttle_bar(ox + (cx + 30) * s, oy + (cy + 36) * s, 16 * s, 44 * s, thr_pct, input.imu_climb_cmd(), false, s);
-                    self.draw_imu_tilt_box(ox + (cx + 88) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, false, s);
-                    self.ui_draw_text(cx + 30, cy + 84, "ALT", ui.muted, 1, false);
-                    self.ui_draw_text(cx + 100, cy + 84, "IMU", ui.tag, 1, false);
-                } else {
-                    self.draw_stick_box(ox + (cx + 30) * s, oy + (cy + 36) * s, 44 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
-                    self.draw_stick_box(ox + (cx + 114) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, s);
-                    self.ui_draw_text(cx + 38, cy + 84, "L-STK", ui.muted, 1, false);
-                    self.ui_draw_text(cx + 122, cy + 84, "R-STK", ui.muted, 1, false);
+                        let sticks = input.flight_sticks(cfg);
+                        let s = self.ui_scale();
+                        let (ox, oy) = self.ui_origin();
+                        self.draw_stick_box(ox + (cx + 30) * s, oy + (cy + 36) * s, 44 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
+                        self.draw_stick_box(ox + (cx + 114) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, s);
+                        self.ui_draw_text(cx + 38, cy + 84, "L-STK", ui.muted, 1, false);
+                        self.ui_draw_text(cx + 122, cy + 84, "R-STK", ui.muted, 1, false);
+
+                        let aux_s = format!(
+                            "ARM:{} MOD:{} TRT:{}",
+                            cfg.aux_arm.short_label(),
+                            cfg.aux_mode.short_label(),
+                            cfg.aux_turtle.short_label()
+                        );
+                        self.ui_draw_text(cx + 6, cy + 97, &aux_s, ui.val, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 111, "ENTER: Calibrate & AUX", ui.sel_label, 1, false);
+                    }
+                    FlightControlSource::ImuSimplified => {
+                        self.ui_draw_text(cx + 6, cy + 21, "CardputerZero IMU", ui.title, 1, false);
+                        let sticks = input.flight_sticks(cfg);
+                        let s = self.ui_scale();
+                        let (ox, oy) = self.ui_origin();
+                        let thr_pct = (sticks.throttle * 100.0).round() as u8;
+                        self.draw_imu_throttle_bar(ox + (cx + 38) * s, oy + (cy + 36) * s, 16 * s, 44 * s, thr_pct, input.imu_climb_cmd(), false, s);
+                        self.draw_imu_tilt_box(ox + (cx + 102) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, false, s);
+                        self.ui_draw_text(cx + 38, cy + 84, "ALT", ui.muted, 1, false);
+                        self.ui_draw_text(cx + 112, cy + 84, "TILT", ui.tag, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 97, "Tilt:Steer | F/X:Alt", ui.val, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 111, "ENTER: IMU & Scan USB/BT", ui.sel_label, 1, false);
+                    }
+                    FlightControlSource::None => {
+                        let hdr = if input.is_cardputer_lite() {
+                            "CardputerZero Lite (No IMU)"
+                        } else {
+                            "No BT/USB Controller"
+                        };
+                        self.ui_draw_text(cx + 6, cy + 24, hdr, ui.warn, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 41, "Plug USB-C ELRS / Radio", ui.title, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 54, "or pair a BT Gamepad.", ui.title, 1, false);
+                        self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 71, ui.muted);
+                        self.ui_draw_text(cx + 6, cy + 79, "Keyboard fallback:", ui.tag, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 91, "FXZC:L-Stk | KBNM:R-Stk", ui.muted, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 111, "ENTER: Controller Setup", ui.sel_label, 1, false);
+                    }
                 }
-
-                let aux_s = format!(
-                    "ARM:{} MOD:{} TRT:{}",
-                    cfg.aux_arm.short_label(),
-                    cfg.aux_mode.short_label(),
-                    cfg.aux_turtle.short_label()
-                );
-                self.ui_draw_text(cx + 6, cy + 97, &aux_s, ui.val, 1, false);
-                self.ui_draw_text(cx + 6, cy + 111, "ENTER: Calibrate & AUX", ui.sel_label, 1, false);
             }
         }
 
@@ -2951,7 +3048,15 @@ impl Renderer {
         self.draw_footer("Settings -> System -> Display / HDMI LCD", None, ui);
     }
 
-    pub fn render_controller_screen(&mut self, cfg: &Config, input: &InputManager, menu_time: f32) {
+    pub fn render_controller_screen(
+        &mut self,
+        cfg: &Config,
+        input: &InputManager,
+        selected: usize,
+        raw_debug: bool,
+        status_note: Option<&str>,
+        menu_time: f32,
+    ) {
         let ui = ui_colors(cfg.ui_theme);
         self.render_menu_backdrop(cfg, menu_time, 5);
 
@@ -2963,105 +3068,318 @@ impl Renderer {
         };
         self.draw_topbar("CONTROLLER", header_tag, Some(dot_col), ui);
 
-        self.ui_draw_panel(6, 24, UI_W - 12, 128, ui.bg, ui.muted, 7);
+        let multi_dev = input.candidate_count > 1;
+        let actions = controller_actions(ctrl_src, multi_dev);
+        let sel = selected.min(actions.len().saturating_sub(1));
+        let wizard_active = input.calib.is_some() || input.aux_wiz.is_some();
 
-        let name: String = input.controller_name().chars().take(36).collect();
-        let dev_tag = match ctrl_src {
-            FlightControlSource::Controller if input.candidate_count > 1 => {
-                format!("{name} [{} devs]", input.candidate_count)
-            }
-            FlightControlSource::ImuSimplified => "CardputerZero IMU (Simplified)".to_string(),
-            FlightControlSource::None if input.is_cardputer_lite() => {
-                "CardputerZero Lite (No IMU)".to_string()
-            }
-            FlightControlSource::None => "No Controller / No IMU".to_string(),
-            _ => name,
-        };
-        let sub_summary = match ctrl_src {
-            FlightControlSource::Controller => format!(
-                "Thr:{} | ARM:{} MOD:{} TRT:{}",
-                cfg.throttle_mode.name(),
-                cfg.aux_arm.short_label(),
-                cfg.aux_mode.short_label(),
-                cfg.aux_turtle.short_label(),
-            ),
-            FlightControlSource::ImuSimplified => "Tilt:Steer | F/X:Alt | Z/C:Yaw".to_string(),
-            FlightControlSource::None => "F/X/Z/C:L-Stk | K/B/N/M:R-Stk".to_string(),
-        };
+        // --- Left Action Rail ---
+        let nav_x = 6;
+        let nav_y = 24;
+        let nav_w = 108;
+        let nav_h = 128;
+        self.ui_draw_panel(nav_x, nav_y, nav_w, nav_h, ui.bg, ui.muted, 7);
 
-        let dev_col = if ctrl_src == FlightControlSource::None { ui.warn } else { ui.sel_label };
-        self.ui_draw_text(12, 28, &dev_tag, dev_col, 1, false);
-        self.ui_draw_text(12, 38, &sub_summary, ui.tag, 1, false);
+        let compact = actions.len() >= 6;
+        let row_step = if compact { 20 } else { 23 };
+        let row_h = if compact { 17 } else { 19 };
+        let start_y = nav_y + 4;
 
-        if let Some(ref wiz) = input.calib {
-            self.ui_fill_rect(14, 50, UI_W - 28, 70, ui.header_bg);
-            self.ui_draw_rect(14, 50, UI_W - 28, 70, ui.accent);
-            self.ui_draw_text(22, 57, "CALIBRATE STICKS", ui.tag, 1, false);
-            self.ui_draw_text(22, 72, wiz.step_prompt(), ui.sel_label, 1, false);
-            let msg: String = wiz.message.chars().take(42).collect();
-            self.ui_draw_text(22, 89, &msg, ui.ok, 1, false);
-            self.ui_draw_text(22, 105, "Esc: Cancel Calibration", ui.muted, 1, false);
-        } else if let Some(ref aw) = input.aux_wiz {
-            self.ui_fill_rect(14, 50, UI_W - 28, 70, ui.header_bg);
-            self.ui_draw_rect(14, 50, UI_W - 28, 70, ui.ok);
-            self.ui_draw_text(22, 57, "BIND RADIO AUX SWITCHES", ui.ok, 1, false);
-            self.ui_draw_text(22, 72, aw.step_prompt(), ui.sel_label, 1, false);
-            let msg: String = aw.message.chars().take(42).collect();
-            self.ui_draw_text(22, 89, &msg, ui.tag, 1, false);
-            self.ui_draw_text(22, 105, "Enter: Skip Step | Esc: Cancel", ui.muted, 1, false);
-        } else {
-            let sticks = input.flight_sticks(cfg);
-            let bars: [(&str, f32); 4] = [
-                ("THR", sticks.throttle * 2.0 - 1.0),
-                ("YAW", sticks.yaw),
-                ("PIT", sticks.pitch),
-                ("ROL", sticks.roll),
-            ];
-
-            for (i, (lbl, val)) in bars.iter().enumerate() {
-                let y = 51 + (i as i32) * 16;
-                self.ui_draw_text(12, y + 2, lbl, ui.label, 1, false);
-                let bx = 40;
-                let bw = 148;
-                self.ui_fill_rect(bx, y, bw, 10, ui.header_bg);
-                self.ui_draw_rect(bx, y, bw, 10, ui.muted);
-                let mid = bx + bw / 2;
-                self.ui_draw_vline(mid, y + 1, y + 8, ui.muted);
-                let pos = bx + ((clampf(*val, -1.0, 1.0) + 1.0) * 0.5 * (bw - 4) as f32) as i32;
-                self.ui_fill_rect(pos, y + 2, 4, 6, ui.ok);
-            }
-
-            let s = self.ui_scale();
-            let (ox, oy) = self.ui_origin();
-            if ctrl_src == FlightControlSource::ImuSimplified {
-                let thr_pct = (sticks.throttle * 100.0).round() as u8;
-                self.draw_imu_throttle_bar(ox + 200 * s, oy + 52 * s, 18 * s, 46 * s, thr_pct, input.imu_climb_cmd(), false, s);
-                self.draw_imu_tilt_box(ox + 256 * s, oy + 52 * s, 46 * s, sticks.roll, sticks.pitch, false, s);
-                self.ui_draw_text(200, 102, "ALT", ui.muted, 1, false);
-                self.ui_draw_text(270, 102, "IMU", ui.tag, 1, false);
+        for (i, &act) in actions.iter().enumerate() {
+            let y = start_y + (i as i32) * row_step;
+            let is_sel = !wizard_active && i == sel;
+            let is_primary = i == 0 && ctrl_src != FlightControlSource::Controller;
+            let bg = if is_sel && is_primary {
+                blend_rgb565(ui.sel_bg, ui.ok, 2)
+            } else if is_sel {
+                ui.sel_bg
             } else {
-                self.draw_stick_box(ox + 200 * s, oy + 52 * s, 46 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
-                self.draw_stick_box(ox + 256 * s, oy + 52 * s, 46 * s, sticks.roll, sticks.pitch, s);
-                self.ui_draw_text(210, 102, "L-STK", ui.muted, 1, false);
-                self.ui_draw_text(266, 102, "R-STK", ui.muted, 1, false);
+                ui.header_bg
+            };
+            let border = if is_sel && is_primary {
+                ui.ok
+            } else if is_sel {
+                ui.sel_border
+            } else {
+                blend_rgb565(ui.bg, ui.muted, 4)
+            };
+            self.ui_fill_rect(nav_x + 4, y, nav_w - 8, row_h, bg);
+            self.ui_draw_rect(nav_x + 4, y, nav_w - 8, row_h, border);
+            if is_sel {
+                self.ui_fill_rect(
+                    nav_x + 4,
+                    y,
+                    3,
+                    row_h,
+                    if is_primary { ui.ok } else { ui.header_line },
+                );
+            }
+
+            let ty = y + (row_h - 8) / 2;
+            let lcol = if is_sel {
+                if is_primary { ui.title } else { ui.sel_label }
+            } else if is_primary {
+                ui.ok
+            } else {
+                ui.label
+            };
+            self.ui_draw_text(nav_x + 11, ty, act.label(), lcol, 1, false);
+
+            match act {
+                ControllerAction::ToggleThrottleMode => {
+                    let badge = match cfg.throttle_mode {
+                        crate::config::ThrottleMode::RcFull => "RC",
+                        crate::config::ThrottleMode::GamepadCenter => "PAD",
+                    };
+                    let bx = nav_x + nav_w - 9 - (badge.len() as i32) * 6;
+                    self.ui_draw_text(bx, ty, badge, if is_sel { ui.sel_val } else { ui.tag }, 1, false);
+                }
+                ControllerAction::ToggleRawDebug => {
+                    let badge = if raw_debug { "ON" } else { "OFF" };
+                    let bcol = if raw_debug { ui.ok } else { ui.muted };
+                    let bx = nav_x + nav_w - 9 - (badge.len() as i32) * 6;
+                    self.ui_draw_text(bx, ty, badge, bcol, 1, false);
+                }
+                _ => {}
             }
         }
 
-        let raw = match ctrl_src {
-            FlightControlSource::Controller => format!("ABS {}", input.raw_axes_summary()),
-            FlightControlSource::ImuSimplified => format!("IMU {}", input.imu.summary()),
-            FlightControlSource::None => input.imu.summary(),
-        };
-        let raw_trim: String = raw.chars().take(48).collect();
-        self.ui_draw_text(12, 124, &raw_trim, if ctrl_src == FlightControlSource::None { ui.warn } else { ui.ok }, 1, false);
+        // --- Right Contextual Setup / Monitor Card ---
+        let cx = 120;
+        let cy = 24;
+        let cw = 194;
+        let ch = 128;
+        self.ui_draw_panel(cx, cy, cw, ch, ui.bg, ui.muted, 7);
+        self.ui_fill_rect_alpha(cx + 1, cy + 1, cw - 2, 15, ui.header_bg, 7);
+        self.ui_draw_hline(cx + 1, cx + cw - 2, cy + 16, ui.muted);
 
-        let action_line = match ctrl_src {
-            FlightControlSource::Controller => "C:Calibrate | B:Bind AUX | Ent:RC/Pad | N:Dev",
-            FlightControlSource::ImuSimplified => "C:Zero IMU | F/X:Alt | R:Rescan BT/USB",
-            FlightControlSource::None => "Connect USB-C Host or BT Controller | R:Rescan",
+        if let Some(ref wiz) = input.calib {
+            self.ui_draw_text(cx + 6, cy + 5, "STICK CALIBRATION", ui.tag, 1, false);
+            let step_tag = format!("{}/4", (wiz.step + 1).min(4));
+            self.ui_draw_text(cx + cw - (step_tag.len() as i32) * 6 - 6, cy + 5, &step_tag, ui.sel_border, 1, false);
+
+            // 4-step segmented progress bar
+            for s_idx in 0..4 {
+                let sx = cx + 7 + (s_idx as i32) * 46;
+                let col = if s_idx < wiz.step {
+                    ui.ok
+                } else if s_idx == wiz.step {
+                    ui.sel_border
+                } else {
+                    ui.header_bg
+                };
+                self.ui_fill_rect(sx, cy + 22, 42, 5, col);
+                self.ui_draw_rect(sx, cy + 22, 42, 5, ui.muted);
+            }
+
+            self.ui_draw_text(cx + 7, cy + 36, wiz.step_prompt(), ui.sel_label, 1, false);
+            self.ui_fill_rect(cx + 7, cy + 52, cw - 14, 44, ui.header_bg);
+            self.ui_draw_rect(cx + 7, cy + 52, cw - 14, 44, ui.accent);
+            let m1: String = wiz.message.chars().take(28).collect();
+            let m2: String = wiz.message.chars().skip(28).take(28).collect();
+            self.ui_draw_text(cx + 12, cy + 61, &m1, ui.ok, 1, false);
+            if !m2.is_empty() {
+                self.ui_draw_text(cx + 12, cy + 74, &m2, ui.ok, 1, false);
+            }
+            self.ui_draw_text(cx + 7, cy + 106, "Push stick fully to detect", ui.title, 1, false);
+            self.ui_draw_text(cx + 7, cy + 117, "Esc: Cancel Calibration", ui.muted, 1, false);
+        } else if let Some(ref aw) = input.aux_wiz {
+            self.ui_draw_text(cx + 6, cy + 5, "AUX SWITCH BINDER", ui.ok, 1, false);
+            let step_tag = format!("{}/3", (aw.step + 1).min(3));
+            self.ui_draw_text(cx + cw - (step_tag.len() as i32) * 6 - 6, cy + 5, &step_tag, ui.sel_border, 1, false);
+
+            // 3-step segmented progress bar
+            for s_idx in 0..3 {
+                let sx = cx + 7 + (s_idx as i32) * 61;
+                let col = if s_idx < aw.step {
+                    ui.ok
+                } else if s_idx == aw.step {
+                    ui.sel_border
+                } else {
+                    ui.header_bg
+                };
+                self.ui_fill_rect(sx, cy + 22, 57, 5, col);
+                self.ui_draw_rect(sx, cy + 22, 57, 5, ui.muted);
+            }
+
+            self.ui_draw_text(cx + 7, cy + 36, aw.step_prompt(), ui.sel_label, 1, false);
+            self.ui_fill_rect(cx + 7, cy + 52, cw - 14, 44, ui.header_bg);
+            self.ui_draw_rect(cx + 7, cy + 52, cw - 14, 44, ui.ok);
+            let m1: String = aw.message.chars().take(28).collect();
+            let m2: String = aw.message.chars().skip(28).take(28).collect();
+            self.ui_draw_text(cx + 12, cy + 61, &m1, ui.tag, 1, false);
+            if !m2.is_empty() {
+                self.ui_draw_text(cx + 12, cy + 74, &m2, ui.tag, 1, false);
+            }
+            self.ui_draw_text(cx + 7, cy + 106, "Flip radio switch or button", ui.title, 1, false);
+            self.ui_draw_text(cx + 7, cy + 117, "Enter: Skip | Esc: Cancel", ui.muted, 1, false);
+        } else {
+            match ctrl_src {
+                FlightControlSource::Controller if raw_debug => {
+                    self.ui_draw_text(cx + 6, cy + 5, "RAW DIAGNOSTICS", ui.tag, 1, false);
+                    let dev_tag = if multi_dev {
+                        format!("{} DEVS", input.candidate_count)
+                    } else {
+                        "EVDEV".to_string()
+                    };
+                    self.ui_draw_text(cx + cw - (dev_tag.len() as i32) * 6 - 6, cy + 5, &dev_tag, ui.ok, 1, false);
+
+                    let sticks = input.flight_sticks(cfg);
+                    let bars: [(&str, f32, String); 4] = [
+                        ("THR", sticks.throttle * 2.0 - 1.0, format!("{:3.0}%", sticks.throttle * 100.0)),
+                        ("YAW", sticks.yaw, format!("{:+3.0}%", sticks.yaw * 100.0)),
+                        ("PIT", sticks.pitch, format!("{:+3.0}%", sticks.pitch * 100.0)),
+                        ("ROL", sticks.roll, format!("{:+3.0}%", sticks.roll * 100.0)),
+                    ];
+                    for (i, (lbl, val, pct)) in bars.iter().enumerate() {
+                        let y = cy + 21 + (i as i32) * 14;
+                        self.ui_draw_text(cx + 6, y + 1, lbl, ui.label, 1, false);
+                        let bx = cx + 28;
+                        let bw = 122;
+                        self.ui_fill_rect(bx, y, bw, 9, ui.header_bg);
+                        self.ui_draw_rect(bx, y, bw, 9, ui.muted);
+                        self.ui_draw_vline(bx + bw / 2, y + 1, y + 7, ui.muted);
+                        let pos = bx + ((clampf(*val, -1.0, 1.0) + 1.0) * 0.5 * (bw - 4) as f32) as i32;
+                        self.ui_fill_rect(pos, y + 2, 4, 5, ui.ok);
+                        self.ui_draw_text(cx + 154, y + 1, pct, ui.title, 1, false);
+                    }
+
+                    self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 79, ui.muted);
+                    self.ui_draw_text(cx + 6, cy + 83, "RAW EVDEV ABS:", ui.tag, 1, false);
+                    let raw = input.raw_axes_summary();
+                    let l1: String = raw.chars().take(30).collect();
+                    let l2: String = raw.chars().skip(30).take(30).collect();
+                    self.ui_draw_text(cx + 6, cy + 94, &l1, ui.ok, 1, false);
+                    if !l2.is_empty() {
+                        self.ui_draw_text(cx + 6, cy + 104, &l2, ui.ok, 1, false);
+                    }
+                    let note = status_note.unwrap_or("Toggle DEBUG off for Gimbals");
+                    self.ui_draw_text(cx + 6, cy + 116, note, ui.muted, 1, false);
+                }
+                FlightControlSource::Controller => {
+                    let cname: String = input.controller_name().chars().take(24).collect();
+                    self.ui_draw_text(cx + 6, cy + 5, &cname, ui.sel_label, 1, false);
+                    if multi_dev {
+                        let dt = format!("[{}]", input.candidate_count);
+                        self.ui_draw_text(cx + cw - (dt.len() as i32) * 6 - 6, cy + 5, &dt, ui.tag, 1, false);
+                    }
+
+                    let sticks = input.flight_sticks(cfg);
+                    let s = self.ui_scale();
+                    let (ox, oy) = self.ui_origin();
+                    self.draw_stick_box(ox + (cx + 26) * s, oy + (cy + 22) * s, 48 * s, sticks.yaw, sticks.throttle * 2.0 - 1.0, s);
+                    self.draw_stick_box(ox + (cx + 116) * s, oy + (cy + 22) * s, 48 * s, sticks.roll, sticks.pitch, s);
+                    self.ui_draw_text(cx + 35, cy + 73, "L-STK", ui.muted, 1, false);
+                    self.ui_draw_text(cx + 125, cy + 73, "R-STK", ui.muted, 1, false);
+
+                    let thr_txt = match cfg.throttle_mode {
+                        crate::config::ThrottleMode::RcFull => "Throttle: RC Full (0-100%)",
+                        crate::config::ThrottleMode::GamepadCenter => "Throttle: Gamepad (Spring)",
+                    };
+                    self.ui_draw_text(cx + 6, cy + 86, thr_txt, ui.title, 1, false);
+
+                    // 3 clean AUX switch status pills
+                    let pills = [
+                        ("ARM", cfg.aux_arm),
+                        ("MOD", cfg.aux_mode),
+                        ("TRT", cfg.aux_turtle),
+                    ];
+                    for (i, (lbl, binding)) in pills.iter().enumerate() {
+                        let px = cx + 6 + (i as i32) * 62;
+                        let py = cy + 98;
+                        let bound = *binding != AuxBinding::None;
+                        let pbg = if bound { blend_rgb565(ui.header_bg, ui.ok, 2) } else { ui.header_bg };
+                        let pbd = if bound { ui.ok } else { ui.muted };
+                        self.ui_fill_rect(px, py, 58, 13, pbg);
+                        self.ui_draw_rect(px, py, 58, 13, pbd);
+                        let txt = format!("{}:{}", lbl, binding.short_label());
+                        let trim: String = txt.chars().take(9).collect();
+                        self.ui_draw_text(px + 3, py + 3, &trim, if bound { ui.title } else { ui.muted }, 1, false);
+                    }
+
+                    let note = status_note.unwrap_or("Move sticks to test response");
+                    let ncol = if status_note.is_some() { ui.ok } else { ui.muted };
+                    self.ui_draw_text(cx + 6, cy + 116, note, ncol, 1, false);
+                }
+                FlightControlSource::ImuSimplified if raw_debug => {
+                    self.ui_draw_text(cx + 6, cy + 5, "IMU DIAGNOSTICS", ui.tag, 1, false);
+                    self.ui_draw_text(cx + cw - 42, cy + 5, "SENSOR", ui.ok, 1, false);
+
+                    let sticks = input.flight_sticks(cfg);
+                    let s = self.ui_scale();
+                    let (ox, oy) = self.ui_origin();
+                    let thr_pct = (sticks.throttle * 100.0).round() as u8;
+                    self.draw_imu_throttle_bar(ox + (cx + 40) * s, oy + (cy + 22) * s, 16 * s, 40 * s, thr_pct, input.imu_climb_cmd(), false, s);
+                    self.draw_imu_tilt_box(ox + (cx + 108) * s, oy + (cy + 22) * s, 40 * s, sticks.roll, sticks.pitch, false, s);
+
+                    let num = format!("R:{:+.2} P:{:+.2} A:{:3}%", sticks.roll, sticks.pitch, thr_pct);
+                    self.ui_draw_text(cx + 6, cy + 68, &num, ui.title, 1, false);
+                    self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 79, ui.muted);
+                    self.ui_draw_text(cx + 6, cy + 84, "RAW IIO SENSOR:", ui.tag, 1, false);
+                    let raw = input.imu.summary();
+                    let l1: String = raw.chars().take(30).collect();
+                    let l2: String = raw.chars().skip(30).take(30).collect();
+                    self.ui_draw_text(cx + 6, cy + 95, &l1, ui.ok, 1, false);
+                    if !l2.is_empty() {
+                        self.ui_draw_text(cx + 6, cy + 105, &l2, ui.ok, 1, false);
+                    }
+                    let note = status_note.unwrap_or("ZERO IMU to re-level");
+                    self.ui_draw_text(cx + 6, cy + 116, note, ui.muted, 1, false);
+                }
+                FlightControlSource::ImuSimplified => {
+                    self.ui_draw_text(cx + 6, cy + 5, "BUILT-IN IMU", ui.tag, 1, false);
+                    self.ui_draw_text(cx + cw - 36, cy + 5, "READY", ui.ok, 1, false);
+
+                    let sticks = input.flight_sticks(cfg);
+                    let s = self.ui_scale();
+                    let (ox, oy) = self.ui_origin();
+                    let thr_pct = (sticks.throttle * 100.0).round() as u8;
+                    self.draw_imu_throttle_bar(ox + (cx + 38) * s, oy + (cy + 23) * s, 18 * s, 48 * s, thr_pct, input.imu_climb_cmd(), false, s);
+                    self.draw_imu_tilt_box(ox + (cx + 104) * s, oy + (cy + 23) * s, 48 * s, sticks.roll, sticks.pitch, false, s);
+                    self.ui_draw_text(cx + 38, cy + 74, "ALT", ui.muted, 1, false);
+                    self.ui_draw_text(cx + 116, cy + 74, "TILT", ui.tag, 1, false);
+
+                    self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 86, ui.muted);
+                    self.ui_draw_text(cx + 6, cy + 92, "Tilt: Pitch/Roll | Z/C: Yaw", ui.title, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 104, "F/X: Alt | Plug BT/USB anytime", ui.muted, 1, false);
+                    if let Some(note) = status_note {
+                        self.ui_draw_text(cx + 6, cy + 116, note, ui.ok, 1, false);
+                    } else {
+                        self.ui_draw_text(cx + 6, cy + 116, "ZERO IMU sets level hover", ui.sel_label, 1, false);
+                    }
+                }
+                FlightControlSource::None => {
+                    self.ui_draw_text(cx + 6, cy + 5, "CONNECT CONTROLLER", ui.tag, 1, false);
+                    self.ui_draw_text(cx + cw - 30, cy + 5, "NONE", ui.warn, 1, false);
+
+                    let reason = if input.is_cardputer_lite() {
+                        "CardputerZero Lite (No IMU)"
+                    } else {
+                        "No BT/USB Controller Found"
+                    };
+                    self.ui_draw_text(cx + 6, cy + 23, reason, ui.warn, 1, false);
+
+                    self.ui_draw_text(cx + 6, cy + 39, "1. USB-C: Plug ELRS / Radio", ui.title, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 52, "2. BT: Pair Gamepad / Radio", ui.title, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 65, "3. Press SCAN DEV on left", ui.sel_label, 1, false);
+
+                    self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 80, ui.muted);
+                    self.ui_draw_text(cx + 6, cy + 86, "Keyboard Fallback (Mode 2):", ui.tag, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 98, "FXZC: Thr/Yaw | KBNM: Pit/Rol", ui.muted, 1, false);
+
+                    if let Some(note) = status_note {
+                        self.ui_draw_text(cx + 6, cy + 115, note, ui.ok, 1, false);
+                    }
+                }
+            }
+        }
+
+        let footer = if wizard_active {
+            "Follow prompt above | Esc: Cancel Wizard"
+        } else {
+            "F/X:Nav | Ent:Activate | Z/C:Toggle | Esc:Back"
         };
-        self.ui_draw_text(12, 138, action_line, ui.sel_val, 1, false);
-        self.draw_footer("R:Reset Auto | N:NextDev | Esc:Back", Some(dot_col), ui);
+        self.draw_footer(footer, Some(dot_col), ui);
     }
 }
 
@@ -3091,6 +3409,27 @@ mod tests {
     }
 
     #[test]
+    fn test_controller_actions_adapt_to_hardware() {
+        let none_acts = controller_actions(FlightControlSource::None, false);
+        assert!(!none_acts.contains(&ControllerAction::ToggleRawDebug));
+        assert!(!none_acts.contains(&ControllerAction::CalibrateSticks));
+        assert!(none_acts.contains(&ControllerAction::ScanDevices));
+
+        let imu_acts = controller_actions(FlightControlSource::ImuSimplified, false);
+        assert!(imu_acts.contains(&ControllerAction::ZeroImu));
+        assert!(imu_acts.contains(&ControllerAction::ToggleRawDebug));
+        assert!(!imu_acts.contains(&ControllerAction::BindAux));
+
+        let ctrl_single = controller_actions(FlightControlSource::Controller, false);
+        assert!(ctrl_single.contains(&ControllerAction::CalibrateSticks));
+        assert!(ctrl_single.contains(&ControllerAction::BindAux));
+        assert!(!ctrl_single.contains(&ControllerAction::NextDevice));
+
+        let ctrl_multi = controller_actions(FlightControlSource::Controller, true);
+        assert!(ctrl_multi.contains(&ControllerAction::NextDevice));
+    }
+
+    #[test]
     fn test_steam_sim_menus_render_across_resolutions() {
         let mut cfg = Config::default();
         let input = InputManager::new();
@@ -3116,7 +3455,8 @@ mod tests {
                     r.render_drone_tuning_menu(&cfg, row, 0.5);
                 }
                 r.render_pause_menu(&cfg, &quad, 0);
-                r.render_controller_screen(&cfg, &input, 0.5);
+                r.render_controller_screen(&cfg, &input, 0, false, None, 0.5);
+                r.render_controller_screen(&cfg, &input, 0, true, Some("Devices rescanned"), 0.5);
             }
             assert!(r.fb.iter().any(|&px| px != r.fb[0]));
         }
