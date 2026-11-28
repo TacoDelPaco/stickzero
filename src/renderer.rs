@@ -1304,7 +1304,25 @@ impl Renderer {
                         rgb565(48, 30, 10),
                         rgb565(34, 22, 8),
                         rgb565(24, 14, 6),
-                        rgb565(255, 188, 68), // Neon Amber barriers
+                        rgb565(255, 188, 68), // Neon Amber barns/crates
+                    ),
+                    StructureColor::DarkWood => (
+                        rgb565(38, 22, 12),
+                        rgb565(28, 16, 8),
+                        rgb565(20, 11, 6),
+                        rgb565(225, 138, 72), // Warm copper trunks/fences
+                    ),
+                    StructureColor::Foliage => (
+                        rgb565(14, 52, 26),
+                        rgb565(10, 38, 18),
+                        rgb565(6, 26, 12),
+                        rgb565(90, 255, 130), // Neon Emerald tree canopies
+                    ),
+                    StructureColor::Hay => (
+                        rgb565(56, 44, 12),
+                        rgb565(42, 32, 8),
+                        rgb565(30, 22, 6),
+                        rgb565(255, 228, 88), // Neon Gold hay bales
                     ),
                 }
             } else {
@@ -1333,12 +1351,49 @@ impl Renderer {
                         rgb565(112, 80, 46),
                         rgb565(72, 50, 28),
                     ),
+                    StructureColor::DarkWood => (
+                        rgb565(126, 88, 54),
+                        rgb565(98, 66, 38),
+                        rgb565(76, 50, 28),
+                        rgb565(48, 32, 18),
+                    ),
+                    StructureColor::Foliage => (
+                        rgb565(72, 156, 68),
+                        rgb565(48, 122, 46),
+                        rgb565(34, 92, 34),
+                        rgb565(22, 60, 22),
+                    ),
+                    StructureColor::Hay => (
+                        rgb565(228, 196, 86),
+                        rgb565(202, 166, 62),
+                        rgb565(168, 134, 46),
+                        rgb565(112, 86, 26),
+                    ),
                 }
             }
         };
 
+        let struct_in_frustum = |s: &crate::tracks::Structure| -> bool {
+            let c = s.center();
+            let hx = (s.max.x - s.min.x) * 0.5;
+            let hy = (s.max.y - s.min.y) * 0.5;
+            let hz = (s.max.z - s.min.z) * 0.5;
+            let rad = (hx * hx + hy * hy + hz * hz).sqrt();
+            let rel = cam_inv.rotate(c.sub(cam_pos));
+            if rel.z + rad < 0.05 || rel.z - rad > 185.0 {
+                return false;
+            }
+            if rel.z > 0.0 && rel.x.abs() - rad > rel.z * 1.55 {
+                return false;
+            }
+            true
+        };
+
         // Pass 3A: Rasterize all visible structure faces into framebuffer + Z-buffer
         for s in track.structures {
+            if !struct_in_frustum(s) {
+                continue;
+            }
             let (c_top, c_side_a, c_side_b, _) = struct_colors(s.color, pal.wireframe);
             let (x0, y0, z0) = (s.min.x, s.min.y, s.min.z);
             let (x1, y1, z1) = (s.max.x, s.max.y, s.max.z);
@@ -1382,6 +1437,9 @@ impl Renderer {
 
         // Pass 3B: Draw all visible structure edges strictly occluded against the completed Z-buffer
         for s in track.structures {
+            if !struct_in_frustum(s) {
+                continue;
+            }
             let (_, _, _, c_edge) = struct_colors(s.color, pal.wireframe);
             let (x0, y0, z0) = (s.min.x, s.min.y, s.min.z);
             let (x1, y1, z1) = (s.max.x, s.max.y, s.max.z);
@@ -2174,6 +2232,9 @@ impl Renderer {
         self.ui_draw_vline(x + w / 2, y + 2, y + h - 3, blend_rgb565(ui.header_bg, ui.muted, 2));
 
         let struct_col = blend_rgb565(ui.header_bg, ui.muted, 4);
+        let tree_col = blend_rgb565(ui.header_bg, rgb565(70, 165, 70), 5);
+        let hay_col = blend_rgb565(ui.header_bg, rgb565(220, 185, 70), 5);
+        let fence_col = blend_rgb565(ui.header_bg, rgb565(150, 105, 65), 4);
         for s in track.structures {
             let (sx0, sy1) = map_pt(s.min.x, s.min.z);
             let (sx1, sy0) = map_pt(s.max.x, s.max.z);
@@ -2181,7 +2242,13 @@ impl Renderer {
             let ry = sy0.min(sy1);
             let rw = (sx1 - sx0).abs().max(2);
             let rh = (sy1 - sy0).abs().max(2);
-            self.ui_fill_rect(rx, ry, rw, rh, struct_col);
+            let col = match s.color {
+                StructureColor::Foliage => tree_col,
+                StructureColor::Hay => hay_col,
+                StructureColor::Wood | StructureColor::DarkWood => fence_col,
+                _ => struct_col,
+            };
+            self.ui_fill_rect(rx, ry, rw, rh, col);
         }
 
         let path_col = blend_rgb565(ui.header_bg, ui.tag, 4);
