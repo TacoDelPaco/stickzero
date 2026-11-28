@@ -71,7 +71,7 @@ impl QuadClass {
                 rotor_grip: 34,   // 0.34
                 motor_lag_ms: 15, // 15 ms
                 thr_mid: 38,      // 0.38
-                idle_accel: 0.75,
+                idle_accel: 0.22,
                 dry_mass_g: 21.0,
                 ref_batt_g: 13.5,
                 mah: 450.0,
@@ -84,7 +84,7 @@ impl QuadClass {
                 rotor_grip: 38,   // 0.38
                 motor_lag_ms: 17, // 17 ms
                 thr_mid: 38,      // 0.38
-                idle_accel: 0.75,
+                idle_accel: 0.22,
                 dry_mass_g: 31.0,
                 ref_batt_g: 13.5,
                 mah: 550.0,
@@ -97,7 +97,7 @@ impl QuadClass {
                 rotor_grip: 42,   // 0.42
                 motor_lag_ms: 21, // 21 ms
                 thr_mid: 40,      // 0.40
-                idle_accel: 0.65,
+                idle_accel: 0.18,
                 dry_mass_g: 18.0,
                 ref_batt_g: 8.5,
                 mah: 300.0,
@@ -106,11 +106,11 @@ impl QuadClass {
             // 3" Sub-120g Toothpick (~68g dry + 36g 2S/3S = 104g AUW)
             Self::Toothpick3 => QuadParams {
                 thrust_g: 540,
-                air_drag: 36,     // 0.36
+                air_drag: 32,     // 0.32
                 rotor_grip: 28,   // 0.28
                 motor_lag_ms: 14, // 14 ms
                 thr_mid: 34,      // 0.34
-                idle_accel: 1.4,
+                idle_accel: 0.26,
                 dry_mass_g: 68.0,
                 ref_batt_g: 36.0,
                 mah: 450.0,
@@ -123,7 +123,7 @@ impl QuadClass {
                 rotor_grip: 26,   // 0.26
                 motor_lag_ms: 16, // 16 ms
                 thr_mid: 30,      // 0.30
-                idle_accel: 1.8,
+                idle_accel: 0.32,
                 dry_mass_g: 410.0,
                 ref_batt_g: 220.0,
                 mah: 1300.0,
@@ -136,7 +136,7 @@ impl QuadClass {
                 rotor_grip: 24,   // 0.24
                 motor_lag_ms: 12, // 12 ms
                 thr_mid: 26,      // 0.26
-                idle_accel: 2.0,
+                idle_accel: 0.35,
                 dry_mass_g: 320.0,
                 ref_batt_g: 210.0,
                 mah: 1300.0,

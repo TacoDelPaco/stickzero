@@ -637,28 +637,34 @@ impl QuadState {
         } else {
             1.0
         };
+        let idle_thrust_est = if !self.armed || self.turtle_active {
+            0.0
+        } else {
+            (params.idle_accel / mass_ratio) * sag_factor * ge
+        };
         let base_thrust = if !self.armed || self.turtle_active {
             0.0
         } else {
-            ((params.idle_accel / mass_ratio) * self.motor_thr.signum() + max_accel * thr_curve)
-                * sag_factor
-                * ge
+            idle_thrust_est + max_accel * thr_curve * sag_factor * ge
         };
 
-        // StickTime-inspired axial inflow damping & translational lift:
-        // Makes hovering feel naturally planted instead of slippery!
-        let inflow_factor = if v_up > 0.0 {
-            // Climbing through air reduces effective prop angle of attack -> self-damps upward drift
-            1.0 / (1.0 + v_up * 0.045)
+        // Scale axial inflow damping & translational lift with active prop throttle so
+        // 0% throttle drops, powerloop coasts, and zero-throttle dives fall freely with no cushion.
+        let active_prop = (self.motor_thr * 4.0).clamp(0.0, 1.0);
+        let raw_inflow = if v_up > 0.0 {
+            // Climbing through air reduces effective prop angle of attack gently
+            1.0 / (1.0 + v_up * 0.028)
         } else {
-            // Gentle descent cushions thrust slightly (peaks near -2.5 m/s), fades in fast dives
+            // Mild descent cushion only when actively applying throttle (fades in fast dives)
             let sink = -v_up;
             let x = (sink / 5.5).min(1.8);
-            let cushion = 1.0 + 0.10 * (2.0 * x - x * x).max(-0.12);
-            cushion.clamp(0.88, 1.11)
+            let cushion = 1.0 + 0.08 * (2.0 * x - x * x).max(-0.12);
+            cushion.clamp(0.88, 1.09)
         };
-        // Translational lift when flying forward/edgewise
-        let trans_lift = 1.0 + 0.11 * (edge_sq / (edge_sq + 36.0)) * (1.0 - 0.5 * self.motor_thr.powi(3));
+        let inflow_factor = 1.0 + active_prop * (raw_inflow - 1.0);
+        // Translational lift when flying forward/edgewise under active throttle
+        let trans_lift =
+            1.0 + active_prop * 0.10 * (edge_sq / (edge_sq + 36.0)) * (1.0 - 0.5 * self.motor_thr.powi(3));
 
         // Smooth prop wash buildup (0.2s lag when descending vertically at low edgewise speed)
         let target_wash = match cfg.prop_wash {
@@ -948,16 +954,29 @@ impl QuadState {
                     thrust_accel = thrust_accel.sub(self.wall_normal.scale(tn));
                 }
             }
-            let speed = self.vel.len();
-            let eff_drag = (cfg.air_drag as f32) / 1000.0; // e.g. 29 (0.29) -> 0.029
-            let drag_accel = self.vel.scale(-eff_drag * speed - eff_drag * 1.4);
-
-            // In-plane rotor H-force grip (carves turns cleanly without icy drift)
+            let v_axial = up_now.scale(self.vel.dot(up_now));
             let v_plane = right_now
                 .scale(self.vel.dot(right_now))
                 .add(fwd_now.scale(self.vel.dot(fwd_now)));
-            let eff_grip = (cfg.rotor_grip as f32) / 100.0; // e.g. 34 -> 0.34
-            let grip_coeff = eff_grip * ((thrust_mag / (5.0 * GRAVITY) + 0.04).sqrt());
+            let speed = self.vel.len();
+
+            // Mass-scaled quadratic aerodynamic drag (square-cube area/mass scaling across
+            // quad classes + exact 1/mass_ratio inertia scaling when tuning Weight in Workbench).
+            // No syrupy linear drag term so punchouts, dives, and zero-throttle arcs carry momentum.
+            let area_to_mass = (35.0 / ref_auw_g).cbrt() / mass_ratio;
+            let k_edge = (cfg.air_drag as f32 / 100.0) * 0.048 * area_to_mass;
+            let k_axial = k_edge * 1.25;
+            let drag_accel = v_plane
+                .scale(-k_edge * speed)
+                .add(v_axial.scale(-k_axial * speed));
+
+            // In-plane rotor H-force scales linearly with active rotor thrust (zero at 0% throttle
+            // so coasting, turns, and zero-throttle dives never artificially air-brake) and
+            // inversely with quad inertia.
+            let active_thrust_ratio =
+                ((thrust_mag - idle_thrust_est).max(0.0) / (4.5 * GRAVITY)).clamp(0.0, 1.4);
+            let eff_grip = (cfg.rotor_grip as f32) / 100.0;
+            let grip_coeff = eff_grip * 0.40 * active_thrust_ratio / mass_ratio.sqrt();
             let grip_accel = v_plane.scale(-grip_coeff);
 
             let gravity_accel = Vec3::new(0.0, -GRAVITY, 0.0);
@@ -1832,5 +1851,85 @@ mod tests {
         q.control_source = FlightControlSource::Controller;
         q.apply_aux(aux_switch, sticks, &mut cfg);
         assert_eq!(cfg.flight_mode, FlightMode::Angle, "mode_switch should work in Controller mode");
+    }
+
+    #[test]
+    fn test_zero_throttle_freefall_and_punchout_ballistic_momentum() {
+        use crate::config::QuadClass;
+
+        let track = &TRACKS[0];
+        let zero = StickInput { throttle: 0.0, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+
+        // 1. Air75 II falling from rest at 0% throttle must accelerate near full gravity (~9.6+ m/s after 1s)
+        let mut cfg_whoop = Config::default();
+        cfg_whoop.set_quad(QuadClass::Air75II);
+        let mut q_whoop = QuadState::spawn(track, &cfg_whoop);
+        q_whoop.pos = Vec3::new(0.0, 200.0, 0.0);
+        q_whoop.on_ground = false;
+        for _ in 0..240 {
+            q_whoop.step(zero, &mut cfg_whoop, track);
+        }
+        assert!(
+            q_whoop.vel.y < -9.3,
+            "Zero-throttle freefall after 1s should accelerate with real gravity, got vy={:.2}",
+            q_whoop.vel.y
+        );
+
+        // Continue to near-terminal velocity (3s total): must not float down slowly
+        for _ in 0..480 {
+            q_whoop.step(zero, &mut cfg_whoop, track);
+        }
+        let whoop_dive_vy = q_whoop.vel.y;
+        assert!(whoop_dive_vy < -20.0, "Whoop dive speed should exceed 20 m/s, got {:.2}", whoop_dive_vy);
+
+        // 2. Heavier 5" Freestyle quad must fall faster and carry more momentum than a 35g whoop
+        let mut cfg_5 = Config::default();
+        cfg_5.set_quad(QuadClass::Freestyle5);
+        let mut q_5 = QuadState::spawn(track, &cfg_5);
+        q_5.pos = Vec3::new(0.0, 300.0, 0.0);
+        q_5.on_ground = false;
+        for _ in 0..720 {
+            q_5.step(zero, &mut cfg_5, track);
+        }
+        assert!(
+            q_5.vel.y < whoop_dive_vy - 4.0,
+            "630g 5-inch quad ({:.2} m/s) must dive significantly faster than 35g whoop ({:.2} m/s)",
+            q_5.vel.y,
+            whoop_dive_vy
+        );
+
+        // 3. High-speed punchout -> cut throttle + yaw/roll turn must preserve forward momentum (no mid-air brake)
+        let mut q_coast = QuadState::spawn(track, &cfg_5);
+        q_coast.pos = Vec3::new(0.0, 80.0, 0.0);
+        q_coast.vel = Vec3::new(0.0, 0.0, 20.0);
+        q_coast.on_ground = false;
+        let turn_zero = StickInput { throttle: 0.0, yaw: 0.7, pitch: 0.2, roll: 0.6 };
+        for _ in 0..240 {
+            q_coast.step(turn_zero, &mut cfg_5, track);
+        }
+        let horiz_speed = (q_coast.vel.x * q_coast.vel.x + q_coast.vel.z * q_coast.vel.z).sqrt();
+        assert!(
+            horiz_speed > 16.0,
+            "5-inch quad coasting & turning at 0% throttle should retain momentum (>16 m/s from 20 m/s), got {:.2}",
+            horiz_speed
+        );
+
+        // 4. Vertical power punch -> chop throttle carries substantial ballistic upward coast before falling
+        let mut q_punch = QuadState::spawn(track, &cfg_whoop);
+        let full_thr = StickInput { throttle: 1.0, yaw: 0.0, pitch: 0.0, roll: 0.0 };
+        for _ in 0..144 {
+            q_punch.step(full_thr, &mut cfg_whoop, track);
+        }
+        let y_at_cut = q_punch.pos.y;
+        let mut peak_y = y_at_cut;
+        for _ in 0..360 {
+            q_punch.step(zero, &mut cfg_whoop, track);
+            peak_y = peak_y.max(q_punch.pos.y);
+        }
+        assert!(
+            peak_y - y_at_cut > 5.0,
+            "Punchout -> 0% throttle should carry >5m ballistic coast upward, got +{:.2}m",
+            peak_y - y_at_cut
+        );
     }
 }
