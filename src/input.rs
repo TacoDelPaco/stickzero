@@ -407,6 +407,184 @@ fn gamepad_reader_thread(
     unsafe { close(fd) };
 }
 
+/// Apply one Linux `joydev` (`/dev/input/js*`) event into local axis/button state.
+/// Maps `js` axis indices through `axmap` so evdev `ABS_*` codes match 1-to-1.
+fn apply_joydev_event(
+    ev: JsEvent,
+    axmap: &[u8; 64],
+    local_axes: &mut [AxisCal; ABS_MAX + 1],
+    local_keys_down: &mut [u64; MAX_KEY_CODE / 64],
+    local_pressed: &mut Vec<u16>,
+    hat_up: &mut bool,
+    hat_down: &mut bool,
+    hat_left: &mut bool,
+    hat_right: &mut bool,
+) -> bool {
+    let is_init = (ev.type_ & JS_EVENT_INIT) != 0;
+    let kind = ev.type_ & !JS_EVENT_INIT;
+    match kind {
+        JS_EVENT_AXIS => {
+            let idx = ev.number as usize;
+            let code = if idx < axmap.len() {
+                axmap[idx] as usize
+            } else {
+                idx
+            };
+            if code <= ABS_MAX {
+                local_axes[code] = AxisCal {
+                    present: true,
+                    min: -32767,
+                    max: 32767,
+                    value: ev.value as i32,
+                };
+            }
+            if !is_init {
+                if code == ABS_HAT0Y as usize {
+                    if ev.value < -16000 {
+                        *hat_up = true;
+                    } else if ev.value > 16000 {
+                        *hat_down = true;
+                    }
+                } else if code == ABS_HAT0X as usize {
+                    if ev.value < -16000 {
+                        *hat_left = true;
+                    } else if ev.value > 16000 {
+                        *hat_right = true;
+                    }
+                }
+            }
+            true
+        }
+        JS_EVENT_BUTTON => {
+            let code = BTN_TRIGGER.saturating_add(ev.number as u16);
+            let held = ev.value != 0;
+            set_key_bit(local_keys_down, code, held);
+            if held && !is_init && local_pressed.len() < 32 {
+                local_pressed.push(code);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Dedicated zero-contention background reader for Linux `/dev/input/js*` fallback.
+/// Used whenever a USB/BT controller's `/dev/input/event*` node is unavailable or
+/// unreadable due to permissions while `/dev/input/js*` (`MODE="0664"`) is accessible.
+fn joydev_reader_thread(
+    fd: i32,
+    axmap: [u8; 64],
+    mut local_axes: [AxisCal; ABS_MAX + 1],
+    mut local_keys_down: [u64; MAX_KEY_CODE / 64],
+    shared: Arc<Mutex<GamepadLiveState>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut ev_buf = [JsEvent::default(); 256];
+    let ev_size = std::mem::size_of::<JsEvent>();
+    let buf_bytes = ev_buf.len() * ev_size;
+    let mut local_pressed: Vec<u16> = Vec::with_capacity(16);
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let pr = unsafe { poll(&mut pfd as *mut PollFd, 1, 15) };
+        if pr < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == 4 {
+                continue;
+            }
+            if let Ok(mut st) = shared.lock() {
+                st.disconnected = true;
+            }
+            break;
+        }
+        if pr == 0 {
+            continue;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 && (pfd.revents & POLLIN) == 0 {
+            if let Ok(mut st) = shared.lock() {
+                st.disconnected = true;
+            }
+            break;
+        }
+
+        let mut disconnected = false;
+        let mut dirty = false;
+        let mut hat_up = false;
+        let mut hat_down = false;
+        let mut hat_left = false;
+        let mut hat_right = false;
+        local_pressed.clear();
+
+        if (pfd.revents & POLLIN) != 0 {
+            loop {
+                let n = unsafe { read(fd, ev_buf.as_mut_ptr() as *mut std::ffi::c_void, buf_bytes) };
+                if n > 0 {
+                    let count = (n as usize) / ev_size;
+                    for &ev in &ev_buf[..count] {
+                        if apply_joydev_event(
+                            ev,
+                            &axmap,
+                            &mut local_axes,
+                            &mut local_keys_down,
+                            &mut local_pressed,
+                            &mut hat_up,
+                            &mut hat_down,
+                            &mut hat_left,
+                            &mut hat_right,
+                        ) {
+                            dirty = true;
+                        }
+                    }
+                    if count < ev_buf.len() {
+                        break;
+                    }
+                } else if n == 0 {
+                    disconnected = true;
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if err == 11 || err == 4 {
+                        break;
+                    }
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if dirty || disconnected {
+            if let Ok(mut st) = shared.lock() {
+                if dirty {
+                    st.axes = local_axes;
+                    st.keys_down = local_keys_down;
+                    for &code in &local_pressed {
+                        if st.pressed_buttons.len() < 32 {
+                            st.pressed_buttons.push(code);
+                        }
+                    }
+                    st.hat_up |= hat_up;
+                    st.hat_down |= hat_down;
+                    st.hat_left |= hat_left;
+                    st.hat_right |= hat_right;
+                }
+                if disconnected {
+                    st.disconnected = true;
+                }
+            }
+        }
+
+        if disconnected {
+            break;
+        }
+    }
+
+    unsafe { close(fd) };
+}
+
 pub struct GamepadDevice {
     shared: Arc<Mutex<GamepadLiveState>>,
     stop: Arc<AtomicBool>,
@@ -414,7 +592,6 @@ pub struct GamepadDevice {
     pub path: String,
     pub name: String,
     pub kind: ControllerKind,
-    #[allow(dead_code)]
     pub bustype: u16,
     pub axes: [AxisCal; ABS_MAX + 1],
     /// Bitset of currently held EV_KEY button codes (0..768)
@@ -478,6 +655,53 @@ impl GamepadDevice {
         let bg_stop = Arc::clone(&stop);
         let reader = thread::spawn(move || {
             gamepad_reader_thread(fd, hidraw, axes, keys_down, bg_shared, bg_stop)
+        });
+
+        Self {
+            shared,
+            stop,
+            reader: Some(reader),
+            path,
+            name,
+            kind,
+            bustype,
+            axes,
+            keys_down,
+            frame_btns_pressed: Vec::with_capacity(8),
+            frame_btn_pressed: None,
+            last_btn_seen: None,
+        }
+    }
+
+    fn spawn_joydev(
+        fd: i32,
+        path: String,
+        name: String,
+        kind: ControllerKind,
+        bustype: u16,
+        axes: [AxisCal; ABS_MAX + 1],
+        axmap: [u8; 64],
+    ) -> Self {
+        let keys_down = [0u64; MAX_KEY_CODE / 64];
+        if bustype == BUS_BLUETOOTH {
+            stop_bt_discovery_async();
+        }
+
+        let shared = Arc::new(Mutex::new(GamepadLiveState {
+            axes,
+            keys_down,
+            pressed_buttons: Vec::with_capacity(8),
+            hat_up: false,
+            hat_down: false,
+            hat_left: false,
+            hat_right: false,
+            disconnected: false,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let bg_shared = Arc::clone(&shared);
+        let bg_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || {
+            joydev_reader_thread(fd, axmap, axes, keys_down, bg_shared, bg_stop)
         });
 
         Self {
@@ -605,6 +829,106 @@ fn is_hat_axis(code: usize) -> bool {
     code == ABS_HAT0X as usize || code == ABS_HAT0Y as usize
 }
 
+/// Returns true if `word` appears as a whole alphanumeric token in lowercase `haystack`.
+/// Prevents substring false positives like `"imu"` matching `"simulator"`.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == word)
+}
+
+fn is_ignored_input_name(lower: &str) -> bool {
+    contains_word(lower, "imu")
+        || lower.contains("accel")
+        || lower.contains("gyro")
+        || lower.contains("bmi270")
+        || lower.contains("touchpad")
+        || lower.contains("motion")
+        || lower.contains("sensor")
+        || lower.contains("mouse")
+        || lower.contains("tca8418")
+}
+
+fn is_rc_controller_name(lower: &str) -> bool {
+    lower.contains("edgetx")
+        || lower.contains("opentx")
+        || lower.contains("radiomaster")
+        || lower.contains("elrs")
+        || lower.contains("expresslrs")
+        || lower.contains("frsky")
+        || lower.contains("jumper")
+        || lower.contains("tbs")
+        || lower.contains("betaflight")
+        || lower.contains("betafpv")
+        || lower.contains("literadio")
+        || lower.contains("flysky")
+        || lower.contains("spektrum")
+        || lower.contains("iflight")
+        || lower.contains("commando")
+        || lower.contains("dji")
+}
+
+fn is_gamepad_name(lower: &str) -> bool {
+    lower.contains("xbox")
+        || lower.contains("wireless controller")
+        || lower.contains("dualsense")
+        || lower.contains("dualshock")
+        || lower.contains("8bitdo")
+        || lower.contains("pro controller")
+        || lower.contains("gamepad")
+        || lower.contains("joystick")
+        || lower.contains("simulator")
+}
+
+fn score_controller(
+    stick_axes: i32,
+    is_rc: bool,
+    is_pad: bool,
+    has_key: bool,
+    bustype: u16,
+    is_joydev: bool,
+) -> i32 {
+    let mut score = stick_axes * 10;
+    if stick_axes >= 4 {
+        score += 50;
+    }
+    if is_rc || is_pad {
+        score += 40;
+    }
+    if has_key {
+        score += 15;
+    }
+    if bustype == BUS_USB {
+        score += 30;
+    }
+    if is_joydev {
+        score -= 5;
+    }
+    score
+}
+
+/// Canonical sysfs input device path for `/dev/input/eventN` or `/dev/input/jsN`,
+/// used to deduplicate `js*` fallback nodes against already-discovered `event*` nodes.
+fn sysfs_input_device_key(dev_path: &str) -> Option<String> {
+    let node = Path::new(dev_path).file_name()?.to_str()?;
+    let link = format!("/sys/class/input/{node}/device");
+    fs::canonicalize(&link)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Read hex `id/bustype` (e.g. `0003` for USB, `0005` for Bluetooth) from sysfs.
+fn read_sysfs_bustype(dev_path: &str) -> u16 {
+    let Some(node) = Path::new(dev_path).file_name().and_then(|s| s.to_str()) else {
+        return 0;
+    };
+    let path = format!("/sys/class/input/{node}/device/id/bustype");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    u16::from_str_radix(raw.trim().trim_start_matches("0x"), 16).unwrap_or(0)
+}
+
 #[inline]
 fn set_dir_bit(mask: &mut u8, bit: u8, held: bool) {
     if held {
@@ -618,6 +942,7 @@ pub struct InputManager {
     pub gamepad: Option<GamepadDevice>,
     pub imu: ImuSensor,
     keyboards: Vec<(i32, String)>,
+    known_controller_paths: Vec<String>,
     last_scan: Instant,
     device_skip_idx: usize,
     pub candidate_count: usize,
@@ -659,6 +984,7 @@ impl InputManager {
             gamepad: None,
             imu,
             keyboards: Vec::new(),
+            known_controller_paths: Vec::new(),
             last_scan: Instant::now() - Duration::from_secs(10),
             device_skip_idx: 0,
             candidate_count: 0,
@@ -831,7 +1157,17 @@ impl InputManager {
         }
     }
 
-    /// Cycle to the next detected evdev controller.
+    /// Compact transport badge (`USB-C`, `BLUETOOTH`, or `CTRL OK`) for the Controller screen header.
+    pub fn controller_bus_tag(&self) -> &'static str {
+        match &self.gamepad {
+            Some(g) if g.bustype == BUS_USB => "USB-C",
+            Some(g) if g.bustype == BUS_BLUETOOTH => "BLUETOOTH",
+            Some(_) => "CTRL OK",
+            None => "NO INPUT",
+        }
+    }
+
+    /// Cycle to the next detected evdev/joydev controller.
     pub fn cycle_device(&mut self) {
         self.device_skip_idx = self.device_skip_idx.wrapping_add(1);
         self.gamepad = None;
@@ -875,7 +1211,7 @@ impl InputManager {
             baseline,
             stick_axes,
             step_started: Instant::now(),
-            message: "Flip switch to ON, press btn, or Enter=Skip".to_string(),
+            message: "Flip switch ON, press btn, or [Ent] Skip".to_string(),
         });
     }
 
@@ -1083,9 +1419,18 @@ impl InputManager {
         }
     }
 
-    /// Scan `/dev/input/event*` for gamepads/RC radios and CardputerZero keyboard.
+    /// Scan `/dev/input/event*` (and `/dev/input/js*` fallback) for USB/BT controllers and CardputerZero keyboard.
     pub fn scan_devices(&mut self) {
         self.last_scan = Instant::now();
+
+        // Drop active gamepad immediately if its device node disappeared from /dev/input.
+        if let Some(ref gp) = self.gamepad {
+            if !Path::new(&gp.path).exists() {
+                self.gamepad = None;
+                self.calib = None;
+                self.aux_wiz = None;
+            }
+        }
 
         if self.keyboards.is_empty() {
             let cardputer_kb = "/dev/input/by-path/platform-3f804000.i2c-event";
@@ -1097,18 +1442,18 @@ impl InputManager {
         }
 
         let Ok(entries) = fs::read_dir("/dev/input") else { return };
-        let mut paths: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("event") {
-                    Some(format!("/dev/input/{name}"))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        paths.sort();
+        let mut event_paths: Vec<String> = Vec::new();
+        let mut js_paths: Vec<String> = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("event") {
+                event_paths.push(format!("/dev/input/{name}"));
+            } else if name.starts_with("js") {
+                js_paths.push(format!("/dev/input/{name}"));
+            }
+        }
+        event_paths.sort();
+        js_paths.sort();
 
         struct Candidate {
             score: i32,
@@ -1118,11 +1463,19 @@ impl InputManager {
             kind: ControllerKind,
             bustype: u16,
             axes: [AxisCal; ABS_MAX + 1],
+            joydev_axmap: Option<[u8; 64]>,
         }
 
         let mut candidates: Vec<Candidate> = Vec::new();
+        let mut evdev_sysfs_keys: Vec<String> = Vec::new();
+        if let Some(ref gp) = self.gamepad {
+            if let Some(key) = sysfs_input_device_key(&gp.path) {
+                evdev_sysfs_keys.push(key);
+            }
+        }
 
-        for path in paths {
+        // 1. Primary scan: Linux evdev (`/dev/input/event*`)
+        for path in event_paths {
             if let Some(ref gp) = self.gamepad {
                 if gp.path == path {
                     continue;
@@ -1146,17 +1499,12 @@ impl InputManager {
             let has_key = (ev_bits[0] & (1 << EV_KEY)) != 0;
 
             let lower = name.to_ascii_lowercase();
-            let is_ignored = lower.contains("imu")
-                || lower.contains("accel")
-                || lower.contains("gyro")
-                || lower.contains("bmi270")
-                || lower.contains("touchpad")
-                || lower.contains("motion")
-                || lower.contains("sensor")
-                || lower.contains("mouse")
-                || lower.contains("tca8418");
+            let is_ignored = is_ignored_input_name(&lower);
 
-            if has_abs && !is_ignored && self.gamepad.is_none() {
+            if has_abs && !is_ignored {
+                let is_rc = is_rc_controller_name(&lower);
+                let is_pad = is_gamepad_name(&lower);
+
                 let mut abs_bits = [0u8; 8];
                 let _ = unsafe { ioctl(fd, eviocgbit(EV_ABS as u32, abs_bits.len()), abs_bits.as_mut_ptr()) };
                 let mut axes = [AxisCal::default(); ABS_MAX + 1];
@@ -1165,16 +1513,23 @@ impl InputManager {
                     if (abs_bits[code / 8] & (1 << (code % 8))) != 0 {
                         let mut info = InputAbsInfo::default();
                         if unsafe { ioctl(fd, eviocgabs(code as u32), &mut info) } >= 0 {
-                            if info.maximum > info.minimum {
-                                axes[code] = AxisCal {
-                                    present: true,
-                                    min: info.minimum,
-                                    max: info.maximum,
-                                    value: info.value,
-                                };
-                                if !is_hat_axis(code) {
-                                    stick_axes += 1;
-                                }
+                            let (min, max) = if info.maximum > info.minimum {
+                                (info.minimum, info.maximum)
+                            } else if info.maximum < info.minimum {
+                                (info.maximum, info.minimum)
+                            } else if is_rc || is_pad {
+                                (-32768, 32767)
+                            } else {
+                                continue;
+                            };
+                            axes[code] = AxisCal {
+                                present: true,
+                                min,
+                                max,
+                                value: info.value,
+                            };
+                            if !is_hat_axis(code) {
+                                stick_axes += 1;
                             }
                         }
                     }
@@ -1183,38 +1538,26 @@ impl InputManager {
                 if stick_axes >= 2 {
                     let mut id = InputId::default();
                     let _ = unsafe { ioctl(fd, eviocgid(), &mut id) };
+                    let bustype = if id.bustype != 0 {
+                        id.bustype
+                    } else {
+                        read_sysfs_bustype(&path)
+                    };
 
-                    let is_rc = lower.contains("edgetx")
-                        || lower.contains("opentx")
-                        || lower.contains("radiomaster")
-                        || lower.contains("elrs")
-                        || lower.contains("expresslrs")
-                        || lower.contains("frsky")
-                        || lower.contains("jumper")
-                        || lower.contains("tbs")
-                        || lower.contains("betaflight");
-                    let is_pad = lower.contains("xbox")
-                        || lower.contains("wireless controller")
-                        || lower.contains("dualsense")
-                        || lower.contains("dualshock")
-                        || lower.contains("8bitdo")
-                        || lower.contains("pro controller")
-                        || lower.contains("gamepad")
-                        || lower.contains("joystick");
+                    if let Some(key) = sysfs_input_device_key(&path) {
+                        evdev_sysfs_keys.push(key);
+                    }
 
-                    let mut score = stick_axes * 10;
-                    if stick_axes >= 4 { score += 50; }
-                    if is_rc || is_pad { score += 40; }
-                    if has_key { score += 15; }
-
+                    let score = score_controller(stick_axes, is_rc, is_pad, has_key, bustype, false);
                     candidates.push(Candidate {
                         score,
                         fd,
                         path,
                         name,
                         kind: if is_rc { ControllerKind::RcRadio } else { ControllerKind::Gamepad },
-                        bustype: id.bustype,
+                        bustype,
                         axes,
+                        joydev_axmap: None,
                     });
                     continue;
                 }
@@ -1230,28 +1573,165 @@ impl InputManager {
             unsafe { close(fd) };
         }
 
+        // 2. Fallback scan: Linux joydev (`/dev/input/js*`, world-readable MODE=0664 by default).
+        //    Only used for controllers whose `/dev/input/event*` node could not be opened
+        //    (e.g. missing uaccess ACL on USB RC radios) and deduplicated via sysfs.
+        for path in js_paths {
+            if let Some(ref gp) = self.gamepad {
+                if gp.path == path {
+                    continue;
+                }
+            }
+            if let Some(key) = sysfs_input_device_key(&path) {
+                if evdev_sysfs_keys.iter().any(|k| k == &key) {
+                    continue;
+                }
+            }
+
+            let Some(fd) = Self::open_nonblock(&path) else { continue };
+
+            let mut name_buf = [0u8; 128];
+            let r = unsafe { ioctl(fd, jsiocgname(name_buf.len()), name_buf.as_mut_ptr()) };
+            let name = if r > 0 {
+                let end = name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
+                String::from_utf8_lossy(&name_buf[..end]).trim().to_string()
+            } else {
+                path.clone()
+            };
+
+            let lower = name.to_ascii_lowercase();
+            if is_ignored_input_name(&lower) {
+                unsafe { close(fd) };
+                continue;
+            }
+
+            let mut num_axes: u8 = 0;
+            let mut num_btns: u8 = 0;
+            let _ = unsafe { ioctl(fd, jsiocgaxes(), &mut num_axes) };
+            let _ = unsafe { ioctl(fd, jsiocgbuttons(), &mut num_btns) };
+
+            let mut axmap = [0u8; 64];
+            for (i, slot) in axmap.iter_mut().enumerate() {
+                *slot = i as u8;
+            }
+            let _ = unsafe { ioctl(fd, jsiocgaxmap(), axmap.as_mut_ptr()) };
+
+            let mut axes = [AxisCal::default(); ABS_MAX + 1];
+            let mut stick_axes = 0i32;
+            for idx in 0..(num_axes as usize).min(axmap.len()) {
+                let code = axmap[idx] as usize;
+                if code <= ABS_MAX {
+                    axes[code] = AxisCal {
+                        present: true,
+                        min: -32767,
+                        max: 32767,
+                        value: 0,
+                    };
+                    if !is_hat_axis(code) {
+                        stick_axes += 1;
+                    }
+                }
+            }
+
+            if stick_axes >= 2 {
+                let bustype = read_sysfs_bustype(&path);
+                let is_rc = is_rc_controller_name(&lower);
+                let is_pad = is_gamepad_name(&lower);
+                let score = score_controller(stick_axes, is_rc, is_pad, num_btns > 0, bustype, true);
+                candidates.push(Candidate {
+                    score,
+                    fd,
+                    path,
+                    name,
+                    kind: if is_rc { ControllerKind::RcRadio } else { ControllerKind::Gamepad },
+                    bustype,
+                    axes,
+                    joydev_axmap: Some(axmap),
+                });
+                continue;
+            }
+
+            unsafe { close(fd) };
+        }
+
+        // Track total live controller count (including currently active gamepad)
+        // and remember discovered paths to detect newly hotplugged USB controllers.
+        let active_count = usize::from(self.gamepad.is_some());
+        self.candidate_count = candidates.len() + active_count;
+
+        let mut current_paths: Vec<String> = Vec::with_capacity(self.candidate_count);
+        if let Some(ref gp) = self.gamepad {
+            current_paths.push(gp.path.clone());
+        }
+        for c in &candidates {
+            current_paths.push(c.path.clone());
+        }
+
+        let spawn_candidate = |chosen: Candidate| -> GamepadDevice {
+            if let Some(axmap) = chosen.joydev_axmap {
+                GamepadDevice::spawn_joydev(
+                    chosen.fd,
+                    chosen.path,
+                    chosen.name,
+                    chosen.kind,
+                    chosen.bustype,
+                    chosen.axes,
+                    axmap,
+                )
+            } else {
+                GamepadDevice::spawn(
+                    chosen.fd,
+                    chosen.path,
+                    chosen.name,
+                    chosen.kind,
+                    chosen.bustype,
+                    chosen.axes,
+                )
+            }
+        };
+
         if self.gamepad.is_none() && !candidates.is_empty() {
-            candidates.sort_by(|a, b| b.score.cmp(&a.score));
-            self.candidate_count = candidates.len();
+            candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
             let pick = self.device_skip_idx % candidates.len();
             let chosen = candidates.swap_remove(pick);
             for c in candidates {
                 unsafe { close(c.fd) };
             }
-            self.gamepad = Some(GamepadDevice::spawn(
-                chosen.fd,
-                chosen.path,
-                chosen.name,
-                chosen.kind,
-                chosen.bustype,
-                chosen.axes,
-            ));
-        } else if self.gamepad.is_none() && !self.imu.is_available() && !self.imu.is_lite {
-            let probed = ImuSensor::probe_default();
-            if probed.is_available() {
-                self.imu = probed;
+            self.gamepad = Some(spawn_candidate(chosen));
+        } else if let Some(ref gp) = self.gamepad {
+            // If currently on wireless/non-USB (e.g. Bluetooth) and a brand-new wired USB
+            // controller was just plugged in, automatically switch to the wired USB device.
+            let mut hotplug_usb_idx: Option<usize> = None;
+            if gp.bustype != BUS_USB {
+                candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+                hotplug_usb_idx = candidates.iter().position(|c| {
+                    c.bustype == BUS_USB && !self.known_controller_paths.iter().any(|p| p == &c.path)
+                });
+            }
+            if let Some(idx) = hotplug_usb_idx {
+                let chosen = candidates.swap_remove(idx);
+                for c in candidates {
+                    unsafe { close(c.fd) };
+                }
+                self.gamepad = Some(spawn_candidate(chosen));
+            } else {
+                for c in candidates {
+                    unsafe { close(c.fd) };
+                }
+            }
+        } else {
+            for c in candidates {
+                unsafe { close(c.fd) };
+            }
+            if !self.imu.is_available() && !self.imu.is_lite {
+                let probed = ImuSensor::probe_default();
+                if probed.is_available() {
+                    self.imu = probed;
+                }
             }
         }
+
+        self.known_controller_paths = current_paths;
     }
 
     fn open_nonblock(path: &str) -> Option<i32> {
@@ -1273,7 +1753,7 @@ impl InputManager {
         self.kb_mode_toggle = false;
         self.kb_turtle_toggle = false;
 
-        if self.gamepad.is_none() && self.last_scan.elapsed() > Duration::from_millis(1500) {
+        if (self.gamepad.is_none() || in_menu) && self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan_devices();
         }
 
@@ -1987,5 +2467,84 @@ mod tests {
 
         mgr.gamepad.as_mut().unwrap().axes[7].value = 0;
         assert_eq!(mgr.aux_inputs(&cfg).turtle_switch, Some(false));
+    }
+
+    #[test]
+    fn test_usb_filtering_scoring_and_joydev_event_mapping() {
+        // Word-boundary IMU filter must ignore BMI270/IMU sensors without blocking "Simulator" USB radios.
+        assert!(is_ignored_input_name("bmi270 imu"));
+        assert!(is_ignored_input_name("imu-sensor"));
+        assert!(is_ignored_input_name("sony wireless controller motion sensors"));
+        assert!(!is_ignored_input_name("edgetx radiomaster pocket joystick"));
+        assert!(!is_ignored_input_name("fpv usb simulator"));
+        assert!(!is_ignored_input_name("frsky simulator"));
+        assert!(is_rc_controller_name("betafpv literadio 3"));
+
+        // Wired USB controller must outrank an otherwise identical Bluetooth controller.
+        let usb_score = score_controller(8, true, false, true, BUS_USB, false);
+        let bt_score = score_controller(8, true, false, true, BUS_BLUETOOTH, false);
+        assert!(usb_score > bt_score, "usb={usb_score} should beat bt={bt_score}");
+
+        // Evdev outranks joydev for the same bus so evdev stays primary when readable.
+        let usb_js_score = score_controller(8, true, false, true, BUS_USB, true);
+        assert!(usb_score > usb_js_score);
+        assert!(usb_js_score > bt_score);
+
+        // Joydev fallback maps axis indices through axmap into evdev ABS_* slots.
+        let mut axmap = [0u8; 64];
+        for (i, slot) in axmap.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        axmap[6] = ABS_THROTTLE as u8;
+        axmap[7] = ABS_RUDDER as u8;
+
+        let mut axes = [AxisCal::default(); ABS_MAX + 1];
+        let mut keys = [0u64; MAX_KEY_CODE / 64];
+        let mut pressed = Vec::new();
+        let (mut hu, mut hd, mut hl, mut hr) = (false, false, false, false);
+
+        // Axis 7 (SD switch) full high via joydev -> ABS_RUDDER (7)
+        assert!(apply_joydev_event(
+            JsEvent { time: 0, value: 32767, type_: JS_EVENT_AXIS, number: 7 },
+            &axmap,
+            &mut axes,
+            &mut keys,
+            &mut pressed,
+            &mut hu,
+            &mut hd,
+            &mut hl,
+            &mut hr,
+        ));
+        assert!(axes[ABS_RUDDER as usize].present);
+        assert!(axes[ABS_RUDDER as usize].raw_norm() > 0.99);
+
+        // JS_EVENT_INIT button updates held bitset without firing a spurious edge press.
+        assert!(apply_joydev_event(
+            JsEvent { time: 0, value: 1, type_: JS_EVENT_BUTTON | JS_EVENT_INIT, number: 0 },
+            &axmap,
+            &mut axes,
+            &mut keys,
+            &mut pressed,
+            &mut hu,
+            &mut hd,
+            &mut hl,
+            &mut hr,
+        ));
+        assert!(pressed.is_empty());
+        assert_ne!(keys[BTN_TRIGGER as usize / 64] & (1u64 << (BTN_TRIGGER as usize % 64)), 0);
+
+        // Live button press records edge press for AUX wizard & menu select.
+        assert!(apply_joydev_event(
+            JsEvent { time: 10, value: 1, type_: JS_EVENT_BUTTON, number: 1 },
+            &axmap,
+            &mut axes,
+            &mut keys,
+            &mut pressed,
+            &mut hu,
+            &mut hd,
+            &mut hl,
+            &mut hr,
+        ));
+        assert_eq!(pressed, vec![BTN_THUMB]);
     }
 }

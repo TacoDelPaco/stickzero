@@ -142,6 +142,31 @@ pub const BTN_THUMB: u16 = 0x121;   // Generic joystick button 1
 // Linux hidraw constants & ioctls (linux/hidraw.h)
 pub const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 
+// Linux joydev constants & ioctls (linux/joystick.h)
+pub const JS_EVENT_BUTTON: u8 = 0x01;
+pub const JS_EVENT_AXIS: u8 = 0x02;
+pub const JS_EVENT_INIT: u8 = 0x80;
+
+#[inline]
+pub const fn jsiocgaxes() -> u64 {
+    (2u64 << 30) | (1u64 << 16) | ((b'j' as u64) << 8) | 0x11
+}
+
+#[inline]
+pub const fn jsiocgbuttons() -> u64 {
+    (2u64 << 30) | (1u64 << 16) | ((b'j' as u64) << 8) | 0x12
+}
+
+#[inline]
+pub const fn jsiocgname(len: usize) -> u64 {
+    (2u64 << 30) | ((len as u64) << 16) | ((b'j' as u64) << 8) | 0x13
+}
+
+#[inline]
+pub const fn jsiocgaxmap() -> u64 {
+    (2u64 << 30) | (64u64 << 16) | ((b'j' as u64) << 8) | 0x32
+}
+
 #[inline]
 pub const fn eviocgid() -> u64 {
     (2u64 << 30) | (8u64 << 16) | ((b'E' as u64) << 8) | 0x02
@@ -258,6 +283,15 @@ pub struct InputEvent {
     pub type_: u16,
     pub code: u16,
     pub value: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct JsEvent {
+    pub time: u32,
+    pub value: i16,
+    pub type_: u8,
+    pub number: u8,
 }
 
 #[repr(C)]
@@ -530,5 +564,10 @@ mod tests {
         assert_eq!(size_of::<Iovec>(), 16);
         assert_eq!(size_of::<Msghdr>(), 56);
         assert_eq!(size_of::<Cmsghdr>(), 16);
+        assert_eq!(size_of::<JsEvent>(), 8);
+        assert_eq!(jsiocgaxes(), 0x8001_6a11);
+        assert_eq!(jsiocgbuttons(), 0x8001_6a12);
+        assert_eq!(jsiocgname(128), 0x8080_6a13);
+        assert_eq!(jsiocgaxmap(), 0x8040_6a32);
     }
 }

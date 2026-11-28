@@ -30,9 +30,25 @@ cp "$ICON" "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 chmod 644 "$STAGE/usr/share/APPLaunch/share/images/stickzero_100.png"
 
 cat > "$STAGE/usr/lib/udev/rules.d/70-stickzero.rules" <<'EOF'
-# Allow StickZero (input group / active seat) to read Bluetooth & ELRS HID raw reports
-# so ExpressLRS BLE Joystick CH8 (duplicate Slider usage 0x36) is exposed as A7+ (SD).
+# Allow StickZero (input group / active seat) to read USB & Bluetooth RC radios / gamepads
+# on both evdev (/dev/input/event*) and hidraw (/dev/hidraw*, e.g. ExpressLRS BLE CH8 -> A7+).
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*EdgeTX*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*OpenTX*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*RadioMaster*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*Radiomaster*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*ELRS*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*ExpressLRS*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*FrSky*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*BETAFPV*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*Jumper*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*TBS*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*Joystick*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*Gamepad*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0003:*", ATTRS{name}=="*EdgeTX*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0003:*", ATTRS{name}=="*OpenTX*", GROUP="input", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0003:*", ATTRS{name}=="*RadioMaster*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ELRS*", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{name}=="*ExpressLRS*", GROUP="input", MODE="0660", TAG+="uaccess"
 EOF
@@ -58,9 +74,10 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 
-# 1. Reload udev rules so /dev/hidraw* gets input-group read access immediately
+# 1. Reload udev rules so USB/BT controllers (/dev/input/event*, /dev/hidraw*) get access immediately
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=input >/dev/null 2>&1 || true
     udevadm trigger --subsystem-match=hidraw >/dev/null 2>&1 || true
 fi
 

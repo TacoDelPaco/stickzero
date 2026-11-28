@@ -1728,7 +1728,7 @@ impl Renderer {
             match quad.control_source {
                 FlightControlSource::ImuSimplified => {
                     self.draw_text(cx - 15 * s, cy - 22 * s, "READY", green, s, true);
-                    let hint = "F/UP:FLY TILT:STEER SPC:ZERO";
+                    let hint = "[F/UP] FLY  TILT STEER  [SPC] ZERO";
                     self.draw_text(cx - (hint.len() as i32) * 3 * s, cy - 11 * s, hint, white, s, true);
                 }
                 FlightControlSource::None => {
@@ -1748,7 +1748,7 @@ impl Renderer {
             } else if quad.turtle_aux_connected {
                 "RELEASE CRASH FLIP"
             } else {
-                "PRESS T TO EXIT"
+                "PRESS [T] TO EXIT"
             };
             self.draw_text(cx - (sub.len() as i32) * 3 * s, cy - 11 * s, sub, if quad.inverted { white } else { green }, s, true);
         } else if quad.combo_timer > 0.0 && !quad.combo_text.is_empty() {
@@ -1830,11 +1830,11 @@ impl Renderer {
         }
 
         let footer = if quad.battery_empty {
-            "R: FRESH PACK | ESC: MENU"
+            "[R] FRESH PACK | [ESC] MENU"
         } else if quad.arm_aux_connected {
-            "ARM:FLY | R:PACK | ESC:MENU"
+            "[ARM] FLY | [R] PACK | [ESC] MENU"
         } else {
-            "R: FRESH PACK | ESC: MENU"
+            "[R] FRESH PACK | [ESC] MENU"
         };
         self.ui_draw_text(UI_W / 2 - (footer.len() as i32) * 3, my + mh - 14, footer, ui.tag, 1, false);
     }
@@ -2428,7 +2428,7 @@ impl Renderer {
 
                 self.ui_fill_rect(cx + 6, cy + 106, cw - 12, 13, blend_rgb565(ui.header_bg, ui.ok, 2));
                 self.ui_draw_rect(cx + 6, cy + 106, cw - 12, 13, ui.ok);
-                self.ui_draw_text(cx + 30, cy + 109, "ENTER: LAUNCH FLIGHT", ui.title, 1, false);
+                self.ui_draw_text(cx + 34, cy + 109, "[ENTER] LAUNCH FLIGHT", ui.title, 1, false);
             }
             1 => {
                 self.ui_draw_text(cx + 6, cy + 5, "TRACK SELECTOR", ui.tag, 1, false);
@@ -2439,7 +2439,7 @@ impl Renderer {
                 let sub: String = track.subtitle.chars().take(30).collect();
                 self.ui_draw_text(cx + 6, cy + 31, &sub, ui.val, 1, false);
                 self.draw_track_minimap(cx + 6, cy + 42, cw - 12, 64, track, ui);
-                self.ui_draw_text(cx + 6, cy + 111, "< Z/C > Switch Track", ui.sel_label, 1, false);
+                self.ui_draw_text(cx + 6, cy + 111, "[Z/C] Switch Track", ui.sel_label, 1, false);
                 let mode_lbl = cfg.game_mode.name();
                 self.ui_draw_text(cx + cw - (mode_lbl.len() as i32) * 6 - 6, cy + 111, mode_lbl, ui.tag, 1, false);
             }
@@ -2463,7 +2463,7 @@ impl Renderer {
                     self.draw_slider_bar(cx + 38, sy, 102, 7, *frac, *col, ui, false);
                     self.ui_draw_text(cx + 146, sy, val, ui.title, 1, false);
                 }
-                self.ui_draw_text(cx + 6, cy + 111, "<Z/C> Quad | ENT: Tune", ui.sel_label, 1, false);
+                self.ui_draw_text(cx + 6, cy + 111, "[Z/C] Quad | [Ent] Tune", ui.sel_label, 1, false);
             }
             3 => {
                 self.ui_draw_text(cx + 6, cy + 5, "ENVIRONMENT", ui.tag, 1, false);
@@ -2496,7 +2496,7 @@ impl Renderer {
                 self.ui_draw_text(cx + 6, cy + 86, &cam, ui.val, 1, false);
                 let fx = format!("Analog FX: {} | Sky: {}", if cfg.analog_filter { "ON" } else { "OFF" }, if cfg.sky_detail { "ON" } else { "OFF" });
                 self.ui_draw_text(cx + 6, cy + 98, &fx, ui.muted, 1, false);
-                self.ui_draw_text(cx + 6, cy + 111, "< Z/C > Cycle Env Theme", ui.sel_label, 1, false);
+                self.ui_draw_text(cx + 6, cy + 111, "[Z/C] Cycle Env Theme", ui.sel_label, 1, false);
             }
             4 => {
                 self.ui_draw_text(cx + 6, cy + 5, "SIM SETTINGS", ui.tag, 1, false);
@@ -2520,7 +2520,7 @@ impl Renderer {
                     let vt: String = v.chars().take(20).collect();
                     self.ui_draw_text(cx + 52, ry + 2, &vt, ui.title, 1, false);
                 }
-                self.ui_draw_text(cx + 6, cy + 111, "ENTER: Open Settings", ui.sel_label, 1, false);
+                self.ui_draw_text(cx + 6, cy + 111, "[Enter] Open Settings", ui.sel_label, 1, false);
             }
             _ => {
                 self.ui_draw_text(cx + 6, cy + 5, "RADIO / INPUT", ui.tag, 1, false);
@@ -2546,7 +2546,7 @@ impl Renderer {
                             cfg.aux_turtle.short_label()
                         );
                         self.ui_draw_text(cx + 6, cy + 97, &aux_s, ui.val, 1, false);
-                        self.ui_draw_text(cx + 6, cy + 111, "ENTER: Calibrate & AUX", ui.sel_label, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 111, "[Enter] Calibrate & AUX", ui.sel_label, 1, false);
                     }
                     FlightControlSource::ImuSimplified => {
                         self.ui_draw_text(cx + 6, cy + 21, "CardputerZero IMU", ui.title, 1, false);
@@ -2558,8 +2558,8 @@ impl Renderer {
                         self.draw_imu_tilt_box(ox + (cx + 102) * s, oy + (cy + 36) * s, 44 * s, sticks.roll, sticks.pitch, false, s);
                         self.ui_draw_text(cx + 38, cy + 84, "ALT", ui.muted, 1, false);
                         self.ui_draw_text(cx + 112, cy + 84, "TILT", ui.tag, 1, false);
-                        self.ui_draw_text(cx + 6, cy + 97, "Tilt:Steer | F/X:Alt", ui.val, 1, false);
-                        self.ui_draw_text(cx + 6, cy + 111, "ENTER: IMU & Scan USB/BT", ui.sel_label, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 97, "Tilt Steer | [F/X] Alt", ui.val, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 111, "[Enter] IMU & Scan USB/BT", ui.sel_label, 1, false);
                     }
                     FlightControlSource::None => {
                         let hdr = if input.is_cardputer_lite() {
@@ -2572,17 +2572,17 @@ impl Renderer {
                         self.ui_draw_text(cx + 6, cy + 54, "or pair a BT Gamepad.", ui.title, 1, false);
                         self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 71, ui.muted);
                         self.ui_draw_text(cx + 6, cy + 79, "Keyboard fallback:", ui.tag, 1, false);
-                        self.ui_draw_text(cx + 6, cy + 91, "FXZC:L-Stk | KBNM:R-Stk", ui.muted, 1, false);
-                        self.ui_draw_text(cx + 6, cy + 111, "ENTER: Controller Setup", ui.sel_label, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 91, "[FXZC] L-Stk | [KBNM] R-Stk", ui.muted, 1, false);
+                        self.ui_draw_text(cx + 6, cy + 111, "[Enter] Controller Setup", ui.sel_label, 1, false);
                     }
                 }
             }
         }
 
         let footer = match input.control_source() {
-            FlightControlSource::Controller => "F/X:Nav | Z/C:Cycle | Ent:Select | Hold Esc:Exit",
-            FlightControlSource::ImuSimplified => "IMU Ready | F/X:Nav | Ent:Select | Hold Esc:Exit",
-            FlightControlSource::None => "Connect USB/BT Ctrl | Ent:Select | Hold Esc:Exit",
+            FlightControlSource::Controller => "[F/X] Nav | [Z/C] Opt | [Ent] OK | [Hold Esc] Exit",
+            FlightControlSource::ImuSimplified => "IMU | [F/X] Nav | [Ent] Select | [Hold Esc] Exit",
+            FlightControlSource::None => "Plug USB/BT | [Ent] Select | [Hold Esc] Exit",
         };
         self.draw_footer(footer, Some(ctrl_dot), ui);
     }
@@ -2635,7 +2635,7 @@ impl Renderer {
         self.ui_draw_text(cx - (l4.len() as i32) * 3, my + 86, l4, ui.tag, 1, false);
 
         self.ui_draw_hline(mx + 10, mx + mw - 11, my + 103, ui.muted);
-        let footer = "Enter/Esc: Continue | Hold Esc: Exit";
+        let footer = "[Ent/Esc] Continue | [Hold Esc] Exit";
         self.ui_draw_text(cx - (footer.len() as i32) * 3, my + 111, footer, ui.sel_label, 1, false);
     }
 
@@ -2657,7 +2657,7 @@ impl Renderer {
             ("Motor Lag", format!("{}ms", cfg.motor_lag_ms), Some(((cfg.motor_lag_ms as f32 - 5.0) / 40.0).clamp(0.0, 1.0))),
             ("Thr Mid", format!("{:.2}", cfg.thr_mid as f32 / 100.0), Some(((cfg.thr_mid as f32 - 20.0) / 50.0).clamp(0.0, 1.0))),
             ("Thr Expo", format!("{:.2}", cfg.thr_expo as f32 / 100.0), Some((cfg.thr_expo as f32 / 80.0).clamp(0.0, 1.0))),
-            ("Reset", "Enter -> Stock".to_string(), None),
+            ("Reset", "[Enter] Stock".to_string(), None),
         ];
 
         let lx = 6;
@@ -2726,7 +2726,7 @@ impl Renderer {
         self.ui_draw_text(rx + 6, ry + 57, "THR CURVE", ui.tag, 1, false);
         self.draw_throttle_curve(rx + 6, ry + 68, rw - 12, 54, cfg, ui);
 
-        self.draw_footer("F/X:Scroll | Z/C:Tune | Ent:Reset | Esc:Save", None, ui);
+        self.draw_footer("[F/X] Nav | [Z/C] Tune | [Ent] Reset | [Esc] Save", None, ui);
     }
 
     pub fn render_pause_menu(&mut self, cfg: &Config, quad: &QuadState, selected: usize) {
@@ -2769,7 +2769,7 @@ impl Renderer {
             self.ui_draw_text(mx + 20, y + 2, label, col, 1, false);
         }
 
-        self.ui_draw_text(mx + 34, my + mh - 11, "Esc: Resume | Ent: Select", ui.muted, 1, false);
+        self.ui_draw_text(mx + 27, my + mh - 11, "[Esc] Resume | [Ent] Select", ui.muted, 1, false);
     }
 
     pub fn render_settings_menu(
@@ -2851,7 +2851,7 @@ impl Renderer {
                 }
                 self.ui_draw_panel(6, 128, UI_W - 12, 24, ui.header_bg, ui.muted, 7);
                 let desc = if focus_tabs {
-                    "Z/C: Switch category tab | Down/Enter: Edit items"
+                    "[Z/C] Switch tab | [X/Ent] Edit items"
                 } else {
                     rows[row.min(rows.len() - 1)].2
                 };
@@ -3007,9 +3007,9 @@ impl Renderer {
         }
 
         let footer = if focus_tabs {
-            "Z/C:Switch Tab | X/Ent:Edit | Tab:Next | Esc:Save"
+            "[Z/C] Tab | [X/Ent] Edit | [Tab] Next | [Esc] Save"
         } else {
-            "Tab:NextTab | F/X:Nav | Z/C:Adjust | Esc:Save"
+            "[Tab] Next | [F/X] Nav | [Z/C] Edit | [Esc] Save"
         };
         self.draw_footer(footer, None, ui);
     }
@@ -3062,7 +3062,7 @@ impl Renderer {
 
         let ctrl_src = input.control_source();
         let (dot_col, header_tag) = match ctrl_src {
-            FlightControlSource::Controller => (ui.ok, "BT / USB-C"),
+            FlightControlSource::Controller => (ui.ok, input.controller_bus_tag()),
             FlightControlSource::ImuSimplified => (ui.tag, "IMU EASY"),
             FlightControlSource::None => (ui.warn, "NO INPUT"),
         };
@@ -3182,7 +3182,7 @@ impl Renderer {
                 self.ui_draw_text(cx + 12, cy + 74, &m2, ui.ok, 1, false);
             }
             self.ui_draw_text(cx + 7, cy + 106, "Push stick fully to detect", ui.title, 1, false);
-            self.ui_draw_text(cx + 7, cy + 117, "Esc: Cancel Calibration", ui.muted, 1, false);
+            self.ui_draw_text(cx + 7, cy + 117, "[Esc] Cancel Calibration", ui.muted, 1, false);
         } else if let Some(ref aw) = input.aux_wiz {
             self.ui_draw_text(cx + 6, cy + 5, "AUX SWITCH BINDER", ui.ok, 1, false);
             let step_tag = format!("{}/3", (aw.step + 1).min(3));
@@ -3212,7 +3212,7 @@ impl Renderer {
                 self.ui_draw_text(cx + 12, cy + 74, &m2, ui.tag, 1, false);
             }
             self.ui_draw_text(cx + 7, cy + 106, "Flip radio switch or button", ui.title, 1, false);
-            self.ui_draw_text(cx + 7, cy + 117, "Enter: Skip | Esc: Cancel", ui.muted, 1, false);
+            self.ui_draw_text(cx + 7, cy + 117, "[Ent] Skip | [Esc] Cancel", ui.muted, 1, false);
         } else {
             match ctrl_src {
                 FlightControlSource::Controller if raw_debug => {
@@ -3340,8 +3340,8 @@ impl Renderer {
                     self.ui_draw_text(cx + 116, cy + 74, "TILT", ui.tag, 1, false);
 
                     self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 86, ui.muted);
-                    self.ui_draw_text(cx + 6, cy + 92, "Tilt: Pitch/Roll | Z/C: Yaw", ui.title, 1, false);
-                    self.ui_draw_text(cx + 6, cy + 104, "F/X: Alt | Plug BT/USB anytime", ui.muted, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 92, "Tilt Pitch/Roll | [Z/C] Yaw", ui.title, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 104, "[F/X] Alt | Plug USB/BT radio", ui.muted, 1, false);
                     if let Some(note) = status_note {
                         self.ui_draw_text(cx + 6, cy + 116, note, ui.ok, 1, false);
                     } else {
@@ -3365,7 +3365,7 @@ impl Renderer {
 
                     self.ui_draw_hline(cx + 6, cx + cw - 7, cy + 80, ui.muted);
                     self.ui_draw_text(cx + 6, cy + 86, "Keyboard Fallback (Mode 2):", ui.tag, 1, false);
-                    self.ui_draw_text(cx + 6, cy + 98, "FXZC: Thr/Yaw | KBNM: Pit/Rol", ui.muted, 1, false);
+                    self.ui_draw_text(cx + 6, cy + 98, "[FXZC] Thr/Yaw [KBNM] Pit/Rol", ui.muted, 1, false);
 
                     if let Some(note) = status_note {
                         self.ui_draw_text(cx + 6, cy + 115, note, ui.ok, 1, false);
@@ -3375,9 +3375,9 @@ impl Renderer {
         }
 
         let footer = if wizard_active {
-            "Follow prompt above | Esc: Cancel Wizard"
+            "Follow prompt above | [Esc] Cancel Wizard"
         } else {
-            "F/X:Nav | Ent:Activate | Z/C:Toggle | Esc:Back"
+            "[F/X] Nav | [Ent] OK | [Z/C] Opt | [Esc] Back"
         };
         self.draw_footer(footer, Some(dot_col), ui);
     }
